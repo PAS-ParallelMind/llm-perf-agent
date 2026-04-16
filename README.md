@@ -7,26 +7,57 @@ backend.
 ## Project structure
 
 ```
+agent.yaml               # agent config (model + agent settings, shared across benchmarks)
 agent/
   adapters/
-    base.py          # AgentTask, AgentResult, BenchmarkAdapter ABC
-    pareval.py       # ParEval adapter (ingest + normalize + export)
-  config.py          # YAML-based RunConfig
-  engine.py          # OpenAI-compatible client
-  loop.py            # tool-calling agent loop → AgentResult
-  batch.py           # adapter-driven batch runner
-  main.py            # interactive CLI
-  prompts.py         # system prompt
+    base.py              # AgentTask, AgentResult, BenchmarkAdapter ABC
+    pareval.py           # ParEval adapter (ingest + normalize + export)
+  config.py              # YAML config loaders
+  engine.py              # OpenAI-compatible client
+  loop.py                # tool-calling agent loop → AgentResult
+  batch.py               # adapter-driven batch runner
+  main.py                # interactive CLI
+  prompts.py             # system prompt
   tools/
-    base.py          # @tool registry + JSON schema export
-    fs.py            # read / write / edit / glob / grep
-    bash.py          # sandboxed shell exec
-    parallel.py      # nvcc_build / omp_build / mpi_build (compile + run)
-    submit.py        # submit_solution (terminates agent loop)
+    base.py              # @tool registry + JSON schema export
+    fs.py                # read / write / edit / glob / grep
+    bash.py              # sandboxed shell exec
+    parallel.py          # nvcc_build / omp_build / mpi_build (compile + run)
+    submit.py            # submit_solution (terminates agent loop)
 scripts/
-  run_pareval.py     # end-to-end: agent → eval → metrics
-benchmarks/          # clone benchmark repos here (gitignored)
-runs/                # experiment outputs + per-run config (gitignored)
+  run_pareval.py         # end-to-end: agent → eval → metrics
+benchmarks/              # clone benchmark repos here (gitignored)
+runs/                    # experiment outputs (gitignored)
+  <run-name>/
+    config.yaml          # benchmark-specific config for this run
+```
+
+## Configuration
+
+Two YAML files:
+
+**`agent.yaml`** (project root) — shared across all benchmarks:
+```yaml
+model:
+  name: openai/gpt-oss-120b
+  base_url: http://140.112.90.38:8001/v1
+  api_key: EMPTY
+  temperature: 0.0
+  max_tokens: 2048
+
+agent:
+  max_steps: 15
+  time_budget: 300
+  workers: 10
+```
+
+**`runs/<run-name>/config.yaml`** — benchmark-specific:
+```yaml
+# ParEval example
+problem_set: omp
+launch_configs: benchmarks/ParEval/drivers/launch-configs.json
+build_timeout: 30
+run_timeout: 120
 ```
 
 ## Quick start
@@ -48,9 +79,6 @@ uv run python -m agent.main \
 
 ## Running a benchmark
 
-Each benchmark has an adapter and a run script. Config lives inside
-`runs/<run-name>/config.yaml`.
-
 ### ParEval
 
 ```bash
@@ -60,38 +88,26 @@ git clone <pareval-repo> benchmarks/ParEval
 # 2. create a run
 mkdir -p runs/my_run
 cat > runs/my_run/config.yaml << 'EOF'
-model:
-  name: openai/gpt-oss-120b
-  base_url: http://140.112.90.38:8001/v1
-  api_key: EMPTY
-  temperature: 0.0
-  max_tokens: 2048
-
-agent:
-  max_steps: 15
-  time_budget: 300
-  workers: 10
-
-eval:
-  launch_configs: benchmarks/ParEval/drivers/launch-configs.json
-  build_timeout: 30
-  run_timeout: 120
+problem_set: omp
+launch_configs: benchmarks/ParEval/drivers/launch-configs.json
+build_timeout: 30
+run_timeout: 120
 EOF
 
 # 3. run (agent → eval → metrics, all in one)
-uv run python scripts/run_pareval.py --run-name my_run --problem-set omp
+uv run python scripts/run_pareval.py --run-name my_run
 
 # re-run only metrics
-uv run python scripts/run_pareval.py --run-name my_run --problem-set omp --skip-agent --skip-eval
+uv run python scripts/run_pareval.py --run-name my_run --skip-agent --skip-eval
 
 # debug: first 3 problems only
-uv run python scripts/run_pareval.py --run-name my_run --problem-set omp --limit 3
+uv run python scripts/run_pareval.py --run-name my_run --limit 3
 ```
 
 Output:
 ```
 runs/my_run/
-  config.yaml        # frozen config for this run
+  config.yaml         # benchmark config for this run
   agent_output.json   # agent output (normalized)
   results.json        # ParEval eval results
   results.csv         # dataframe
@@ -106,5 +122,6 @@ runs/my_run/
 2. Write an adapter in `agent/adapters/<name>.py` implementing `BenchmarkAdapter`
    - `load()`: benchmark prompts → `list[AgentTask]`
    - `export()`: `list[AgentResult]` → benchmark evaluation format
-3. Register it in `agent/batch.py` `ADAPTERS` dict
-4. Write a run script in `scripts/run_<name>.py`
+3. Add a benchmark config dataclass in `agent/config.py`
+4. Register the adapter in `agent/batch.py` `ADAPTERS` dict
+5. Write a run script in `scripts/run_<name>.py`

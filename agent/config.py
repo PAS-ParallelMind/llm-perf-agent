@@ -1,12 +1,15 @@
-"""YAML-based agent configuration."""
+"""YAML-based configuration: agent config + benchmark config."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import yaml
 
+
+# ---------------------------------------------------------------------------
+# Agent config (shared across all benchmarks)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ModelConfig:
@@ -18,31 +21,41 @@ class ModelConfig:
 
 
 @dataclass
-class AgentConfig:
+class AgentSettings:
     max_steps: int = 15
     time_budget: int = 300
     workers: int = 1
 
 
 @dataclass
-class EvalConfig:
-    launch_configs: str | None = None   # None = use benchmark default
+class AgentConfig:
+    """Loaded from agent.yaml at project root."""
+
+    model: ModelConfig
+    agent: AgentSettings = field(default_factory=AgentSettings)
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> AgentConfig:
+        raw = yaml.safe_load(Path(path).read_text())
+        model = ModelConfig(**raw["model"])
+        agent = AgentSettings(**raw.get("agent", {}))
+        return cls(model=model, agent=agent)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark config (per-run, benchmark-specific)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParevalBenchmarkConfig:
+    """Loaded from runs/<run-name>/config.yaml for ParEval runs."""
+
+    problem_set: str = "omp"
+    launch_configs: str | None = None
     build_timeout: int = 30
     run_timeout: int = 120
 
-
-@dataclass
-class RunConfig:
-    """Top-level config loaded from YAML."""
-
-    model: ModelConfig
-    agent: AgentConfig = field(default_factory=AgentConfig)
-    eval: EvalConfig = field(default_factory=EvalConfig)
-
     @classmethod
-    def from_yaml(cls, path: str | Path) -> RunConfig:
+    def from_yaml(cls, path: str | Path) -> ParevalBenchmarkConfig:
         raw = yaml.safe_load(Path(path).read_text())
-        model = ModelConfig(**raw["model"])
-        agent = AgentConfig(**raw.get("agent", {}))
-        eval_ = EvalConfig(**raw.get("eval", {}))
-        return cls(model=model, agent=agent, eval=eval_)
+        return cls(**raw)

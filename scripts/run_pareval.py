@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """End-to-end ParEval benchmark script.
 
-Config lives at runs/<run-name>/config.yaml.
+Reads two configs:
+  - agent.yaml             (project root) — model + agent settings
+  - runs/<run-name>/config.yaml           — benchmark-specific settings
 
 Usage:
-  uv run python3 scripts/run_pareval.py --run-name test --problem-set omp --limit 3
-  uv run python3 scripts/run_pareval.py --run-name test --problem-set omp --skip-agent --skip-eval
+  uv run python3 scripts/run_pareval.py --run-name test
+  uv run python3 scripts/run_pareval.py --run-name test --limit 3
+  uv run python3 scripts/run_pareval.py --run-name test --skip-agent --skip-eval
 """
 from __future__ import annotations
 
@@ -16,13 +19,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agent.config import RunConfig
+from agent.config import AgentConfig, ParevalBenchmarkConfig
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+AGENT_YAML = PROJECT_ROOT / "agent.yaml"
 PAREVAL_ROOT = PROJECT_ROOT / "benchmarks" / "ParEval"
 PROMPTS_JSON = PAREVAL_ROOT / "prompts" / "generation-prompts.json"
 DRIVERS_DIR = PAREVAL_ROOT / "drivers"
@@ -61,27 +65,28 @@ def patch_csv_num_procs(csv_path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="End-to-end ParEval benchmark: agent → eval → metrics. "
-                    "Reads config from runs/<run-name>/config.yaml."
+        description="End-to-end ParEval benchmark: agent → eval → metrics."
     )
     ap.add_argument("--run-name", required=True, help="Run directory name under runs/")
-    ap.add_argument("--problem-set", required=True,
-                    choices=["omp", "mpi", "cuda", "serial", "hip", "kokkos", "mpi+omp"],
-                    help="ParEval problem set (parallelism model)")
     ap.add_argument("--limit", type=int, default=None, help="Only run first N problems")
     ap.add_argument("--skip-agent", action="store_true")
     ap.add_argument("--skip-eval", action="store_true")
     ap.add_argument("--skip-metrics", action="store_true")
     args = ap.parse_args()
 
-    # --- Run directory & config ---
+    # --- Load configs ---
+    if not AGENT_YAML.exists():
+        sys.exit(f"ERROR: {AGENT_YAML} not found")
+
     run_dir = RUNS_DIR / args.run_name
-    config_path = run_dir / "config.yaml"
-    if not config_path.exists():
-        sys.exit(f"ERROR: {config_path} not found. Create it first.")
+    bench_yaml = run_dir / "config.yaml"
+    if not bench_yaml.exists():
+        sys.exit(f"ERROR: {bench_yaml} not found. Create it first.")
 
-    cfg = RunConfig.from_yaml(config_path)
+    acfg = AgentConfig.from_yaml(AGENT_YAML)
+    bcfg = ParevalBenchmarkConfig.from_yaml(bench_yaml)
 
+    # --- Directories ---
     batch_dir = run_dir / "batch"
     batch_dir.mkdir(exist_ok=True)
     scratch_dir = run_dir / "scratch"
@@ -93,28 +98,28 @@ def main() -> None:
     metrics_csv = run_dir / "metrics.csv"
 
     print(f"Run directory: {run_dir}")
-    print(f"Model:         {cfg.model.name}")
-    print(f"Problem set:   {args.problem_set}")
+    print(f"Model:         {acfg.model.name}")
+    print(f"Problem set:   {bcfg.problem_set}")
 
     # --- Stage 1: Agent ---
     if not args.skip_agent:
         print("\n[1/3] Running agent...")
-        adapter_args = json.dumps({"parallelism": args.problem_set})
+        adapter_args = json.dumps({"parallelism": bcfg.problem_set})
         cmd = [
             sys.executable, "-m", "agent.batch",
             "--adapter", "pareval",
             "--adapter-args", adapter_args,
             "--prompts", str(PROMPTS_JSON),
             "--output", str(agent_output),
-            "--model", cfg.model.name,
-            "--base-url", cfg.model.base_url,
-            "--api-key", cfg.model.api_key,
-            "--temperature", str(cfg.model.temperature),
-            "--max-tokens", str(cfg.model.max_tokens),
-            "--max-steps", str(cfg.agent.max_steps),
-            "--time-budget", str(cfg.agent.time_budget),
+            "--model", acfg.model.name,
+            "--base-url", acfg.model.base_url,
+            "--api-key", acfg.model.api_key,
+            "--temperature", str(acfg.model.temperature),
+            "--max-tokens", str(acfg.model.max_tokens),
+            "--max-steps", str(acfg.agent.max_steps),
+            "--time-budget", str(acfg.agent.time_budget),
             "--workspace-root", str(batch_dir),
-            "--workers", str(cfg.agent.workers),
+            "--workers", str(acfg.agent.workers),
         ]
         if args.limit:
             cmd += ["--limit", str(args.limit)]
@@ -126,8 +131,8 @@ def main() -> None:
 
     # --- Stage 2: Eval ---
     launch_configs = str(
-        PROJECT_ROOT / cfg.eval.launch_configs
-    ) if cfg.eval.launch_configs else str(DRIVERS_DIR / "launch-configs.json")
+        PROJECT_ROOT / bcfg.launch_configs
+    ) if bcfg.launch_configs else str(DRIVERS_DIR / "launch-configs.json")
 
     if not args.skip_eval:
         print("\n[2/3] Running ParEval eval...")
@@ -137,9 +142,9 @@ def main() -> None:
             "-o", str(results_json),
             "--scratch-dir", str(scratch_dir),
             "--launch-configs", launch_configs,
-            "--include-models", args.problem_set,
-            "--build-timeout", str(cfg.eval.build_timeout),
-            "--run-timeout", str(cfg.eval.run_timeout),
+            "--include-models", bcfg.problem_set,
+            "--build-timeout", str(bcfg.build_timeout),
+            "--run-timeout", str(bcfg.run_timeout),
             "--yes-to-all",
             "--overwrite",
         ]
