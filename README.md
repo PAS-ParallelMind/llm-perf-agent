@@ -79,13 +79,13 @@ eval:
 EOF
 
 # 3. run (agent → eval → metrics, all in one)
-uv run python scripts/run_pareval.py --run-name my_run
+uv run python scripts/run_pareval.py --run-name my_run --problem-set omp
 
 # re-run only metrics
-uv run python scripts/run_pareval.py --run-name my_run --skip-agent --skip-eval
+uv run python scripts/run_pareval.py --run-name my_run --problem-set omp --skip-agent --skip-eval
 
 # debug: first 3 problems only
-uv run python scripts/run_pareval.py --run-name my_run --limit 3
+uv run python scripts/run_pareval.py --run-name my_run --problem-set omp --limit 3
 ```
 
 Output:

@@ -4,8 +4,8 @@
 Config lives at runs/<run-name>/config.yaml.
 
 Usage:
-  uv run python3 scripts/run_pareval.py --run-name test --limit 3
-  uv run python3 scripts/run_pareval.py --run-name test --skip-agent --skip-eval
+  uv run python3 scripts/run_pareval.py --run-name test --problem-set omp --limit 3
+  uv run python3 scripts/run_pareval.py --run-name test --problem-set omp --skip-agent --skip-eval
 """
 from __future__ import annotations
 
@@ -65,8 +65,9 @@ def main() -> None:
                     "Reads config from runs/<run-name>/config.yaml."
     )
     ap.add_argument("--run-name", required=True, help="Run directory name under runs/")
-    ap.add_argument("--parallelism", default="omp",
-                    choices=["omp", "mpi", "cuda", "serial", "hip", "kokkos", "mpi+omp"])
+    ap.add_argument("--problem-set", required=True,
+                    choices=["omp", "mpi", "cuda", "serial", "hip", "kokkos", "mpi+omp"],
+                    help="ParEval problem set (parallelism model)")
     ap.add_argument("--limit", type=int, default=None, help="Only run first N problems")
     ap.add_argument("--skip-agent", action="store_true")
     ap.add_argument("--skip-eval", action="store_true")
@@ -93,12 +94,12 @@ def main() -> None:
 
     print(f"Run directory: {run_dir}")
     print(f"Model:         {cfg.model.name}")
-    print(f"Parallelism:   {args.parallelism}")
+    print(f"Problem set:   {args.problem_set}")
 
     # --- Stage 1: Agent ---
     if not args.skip_agent:
         print("\n[1/3] Running agent...")
-        adapter_args = json.dumps({"parallelism": args.parallelism})
+        adapter_args = json.dumps({"parallelism": args.problem_set})
         cmd = [
             sys.executable, "-m", "agent.batch",
             "--adapter", "pareval",
@@ -136,7 +137,7 @@ def main() -> None:
             "-o", str(results_json),
             "--scratch-dir", str(scratch_dir),
             "--launch-configs", launch_configs,
-            "--include-models", args.parallelism,
+            "--include-models", args.problem_set,
             "--build-timeout", str(cfg.eval.build_timeout),
             "--run-timeout", str(cfg.eval.run_timeout),
             "--yes-to-all",
