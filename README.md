@@ -7,7 +7,6 @@ backend.
 ## Project structure
 
 ```
-agent.yaml               # agent config (model + agent settings, shared across benchmarks)
 agent/
   adapters/
     base.py              # AgentTask, AgentResult, BenchmarkAdapter ABC
@@ -27,16 +26,14 @@ agent/
 scripts/
   run_pareval.py         # end-to-end: agent → eval → metrics
 benchmarks/              # clone benchmark repos here (gitignored)
-runs/                    # experiment outputs (gitignored)
-  <run-name>/
-    config.yaml          # benchmark-specific config for this run
+runs/                    # experiment runs (gitignored)
 ```
 
 ## Configuration
 
-Two YAML files:
+Each run has two YAML files under `runs/<run-name>/`:
 
-**`agent.yaml`** (project root) — shared across all benchmarks:
+**`agent.yaml`** — model + agent settings (same across benchmarks):
 ```yaml
 model:
   name: openai/gpt-oss-120b
@@ -51,7 +48,7 @@ agent:
   workers: 10
 ```
 
-**`runs/<run-name>/config.yaml`** — benchmark-specific:
+**`config.yaml`** — benchmark-specific settings:
 ```yaml
 # ParEval example
 problem_set: omp
@@ -87,6 +84,21 @@ git clone <pareval-repo> benchmarks/ParEval
 
 # 2. create a run
 mkdir -p runs/my_run
+
+cat > runs/my_run/agent.yaml << 'EOF'
+model:
+  name: openai/gpt-oss-120b
+  base_url: http://140.112.90.38:8001/v1
+  api_key: EMPTY
+  temperature: 0.0
+  max_tokens: 2048
+
+agent:
+  max_steps: 15
+  time_budget: 300
+  workers: 10
+EOF
+
 cat > runs/my_run/config.yaml << 'EOF'
 problem_set: omp
 launch_configs: benchmarks/ParEval/drivers/launch-configs.json
@@ -107,6 +119,7 @@ uv run python scripts/run_pareval.py --run-name my_run --limit 3
 Output:
 ```
 runs/my_run/
+  agent.yaml          # agent config for this run
   config.yaml         # benchmark config for this run
   agent_output.json   # agent output (normalized)
   results.json        # ParEval eval results

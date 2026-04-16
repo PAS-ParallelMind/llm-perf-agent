@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """End-to-end ParEval benchmark script.
 
-Reads two configs:
-  - agent.yaml             (project root) — model + agent settings
-  - runs/<run-name>/config.yaml           — benchmark-specific settings
+Reads two configs from runs/<run-name>/:
+  - agent.yaml   — model + agent settings
+  - config.yaml  — benchmark-specific settings
 
 Usage:
   uv run python3 scripts/run_pareval.py --run-name test
@@ -26,7 +26,6 @@ from agent.config import AgentConfig, ParevalBenchmarkConfig
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-AGENT_YAML = PROJECT_ROOT / "agent.yaml"
 PAREVAL_ROOT = PROJECT_ROOT / "benchmarks" / "ParEval"
 PROMPTS_JSON = PAREVAL_ROOT / "prompts" / "generation-prompts.json"
 DRIVERS_DIR = PAREVAL_ROOT / "drivers"
@@ -75,15 +74,15 @@ def main() -> None:
     args = ap.parse_args()
 
     # --- Load configs ---
-    if not AGENT_YAML.exists():
-        sys.exit(f"ERROR: {AGENT_YAML} not found")
-
     run_dir = RUNS_DIR / args.run_name
+    agent_yaml = run_dir / "agent.yaml"
     bench_yaml = run_dir / "config.yaml"
+    if not agent_yaml.exists():
+        sys.exit(f"ERROR: {agent_yaml} not found. Create it first.")
     if not bench_yaml.exists():
         sys.exit(f"ERROR: {bench_yaml} not found. Create it first.")
 
-    acfg = AgentConfig.from_yaml(AGENT_YAML)
+    acfg = AgentConfig.from_yaml(agent_yaml)
     bcfg = ParevalBenchmarkConfig.from_yaml(bench_yaml)
 
     # --- Directories ---
