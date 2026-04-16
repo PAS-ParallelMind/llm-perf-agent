@@ -1,0 +1,33 @@
+# Claude Code project config
+.claude/
+
+# Benchmarks (cloned repos, large data)
+benchmarks/
+
+# Run outputs (traces, results, binaries)
+runs/
+
+# Agent workspace (scratch files, binaries)
+workspace/
+
+# Agent memory (per-instance)
+memory/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
