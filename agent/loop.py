@@ -63,7 +63,10 @@ class Agent:
                     msg, "reasoning_content", None
                 )
                 if reasoning:
-                    content = f"<thinking>\n{reasoning}\n</thinking>\n{content}"
+                    content = (
+                        f"[previous analysis]\n{reasoning}\n[/previous analysis]\n"
+                        f"{content}"
+                    )
             asst: dict[str, Any] = {"role": "assistant", "content": content}
             if getattr(msg, "tool_calls", None):
                 asst["tool_calls"] = [
