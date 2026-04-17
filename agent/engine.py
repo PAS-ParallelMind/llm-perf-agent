@@ -14,6 +14,7 @@ class Engine:
     api_key: str = "EMPTY"
     temperature: float = 0.2
     max_tokens: int = 2048
+    reasoning: bool = False
 
     def __post_init__(self) -> None:
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)

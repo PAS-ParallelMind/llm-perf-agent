@@ -41,6 +41,7 @@ model:
   api_key: EMPTY
   temperature: 0.0
   max_tokens: 2048
+  reasoning: true   # echo model's chain-of-thought back each turn (gpt-oss etc.)
 
 agent:
   max_steps: 15
@@ -92,6 +93,7 @@ model:
   api_key: EMPTY
   temperature: 0.0
   max_tokens: 2048
+  reasoning: true   # echo model's chain-of-thought back each turn (gpt-oss etc.)
 
 agent:
   max_steps: 15

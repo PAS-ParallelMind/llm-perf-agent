@@ -142,6 +142,8 @@ def main() -> None:
     ap.add_argument("--api-key", default="EMPTY")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--reasoning", action="store_true",
+                    help="Model emits a reasoning trace; echo it back each turn")
     # agent
     ap.add_argument("--max-steps", type=int, default=15)
     ap.add_argument("--time-budget", type=int, default=300,
@@ -196,6 +198,7 @@ def main() -> None:
         api_key=args.api_key,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        reasoning=args.reasoning,
     )
 
     # --- Run ---

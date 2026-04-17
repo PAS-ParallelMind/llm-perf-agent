@@ -57,7 +57,14 @@ class Agent:
 
             msg = self.engine.chat(self.messages, tools=tool_schemas)
 
-            asst: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+            content = msg.content or ""
+            if self.engine.reasoning:
+                reasoning = getattr(msg, "reasoning", None) or getattr(
+                    msg, "reasoning_content", None
+                )
+                if reasoning:
+                    content = f"<thinking>\n{reasoning}\n</thinking>\n{content}"
+            asst: dict[str, Any] = {"role": "assistant", "content": content}
             if getattr(msg, "tool_calls", None):
                 asst["tool_calls"] = [
                     {

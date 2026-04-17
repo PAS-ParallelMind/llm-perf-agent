@@ -18,6 +18,7 @@ class ModelConfig:
     api_key: str = "EMPTY"
     temperature: float = 0.0
     max_tokens: int = 2048
+    reasoning: bool = False
 
 
 @dataclass

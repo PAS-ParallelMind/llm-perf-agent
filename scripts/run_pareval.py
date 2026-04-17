@@ -115,6 +115,7 @@ def main() -> None:
             "--api-key", acfg.model.api_key,
             "--temperature", str(acfg.model.temperature),
             "--max-tokens", str(acfg.model.max_tokens),
+            *(["--reasoning"] if acfg.model.reasoning else []),
             "--max-steps", str(acfg.agent.max_steps),
             "--time-budget", str(acfg.agent.time_budget),
             "--workspace-root", str(batch_dir),

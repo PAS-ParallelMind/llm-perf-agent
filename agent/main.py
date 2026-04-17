@@ -23,6 +23,8 @@ def main() -> None:
     ap.add_argument("--api-key", default="EMPTY")
     ap.add_argument("--max-steps", type=int, default=20)
     ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--reasoning", action="store_true",
+                    help="Model emits a reasoning trace; echo it back each turn")
     ap.add_argument(
         "--workspace",
         default=str(DEFAULT_ROOT),
@@ -47,6 +49,7 @@ def main() -> None:
             base_url=args.base_url,
             api_key=args.api_key,
             temperature=args.temperature,
+            reasoning=args.reasoning,
         )
     agent = Agent(engine, max_steps=args.max_steps)
 
