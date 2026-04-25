@@ -65,7 +65,16 @@ def schemas() -> list[dict[str, Any]]:
 def dispatch(name: str, arguments: str | dict) -> str:
     if name not in TOOLS:
         return f"ERROR: unknown tool {name!r}"
-    args = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
+    if isinstance(arguments, str):
+        try:
+            args = json.loads(arguments)
+        except json.JSONDecodeError as e:
+            return (
+                f"ERROR: malformed tool arguments JSON: {e}. "
+                f"Arguments received (truncated): {arguments[:200]!r}"
+            )
+    else:
+        args = arguments or {}
     try:
         result = TOOLS[name]["fn"](**args)
     except Exception as e:  # surface errors back to the model

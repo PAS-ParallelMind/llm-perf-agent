@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -25,6 +26,11 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--reasoning", action="store_true",
                     help="Model emits a reasoning trace; echo it back each turn")
+    ap.add_argument(
+        "--system-prompt-file",
+        default=None,
+        help="Path to a text file with the task-specific system prompt",
+    )
     ap.add_argument(
         "--workspace",
         default=str(DEFAULT_ROOT),
@@ -51,7 +57,11 @@ def main() -> None:
             temperature=args.temperature,
             reasoning=args.reasoning,
         )
-    agent = Agent(engine, max_steps=args.max_steps)
+    system_prompt = (
+        Path(args.system_prompt_file).read_text()
+        if args.system_prompt_file else None
+    )
+    agent = Agent(engine, max_steps=args.max_steps, system_prompt=system_prompt)
 
     console.print(
         Panel.fit(

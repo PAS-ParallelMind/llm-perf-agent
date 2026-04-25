@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trace Viewer</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --head-bg: #fbfbfc;
+    --border: #e1e4e8;
+    --text: #24292e;
+    --muted: #6a737d;
+    --sys: #8a4b9e;
+    --user: #0366d6;
+    --asst: #2b8a3e;
+    --tool: #b35c00;
+    --code-bg: #f6f8fa;
+    --tc-bg: #fffaf0;
+    --tc-head-bg: #fff3e0;
+    --hover: #eef;
+    --input-bg: #ffffff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  html[data-theme="dark"] {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --head-bg: #1c222b;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --sys: #d2a8ff;
+    --user: #79c0ff;
+    --asst: #7ee787;
+    --tool: #ffa657;
+    --code-bg: #0d1117;
+    --tc-bg: #1a1410;
+    --tc-head-bg: #2a1d10;
+    --hover: #21262d;
+    --input-bg: #0d1117;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  body.sidebar-collapsed { grid-template-columns: 1fr; }
+  body.sidebar-collapsed aside { display: none; }
+
+  aside {
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    padding: 12px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+
+  #sidebar-toggle {
+    position: fixed; top: 8px; left: 8px; z-index: 10;
+    width: 28px; height: 28px; padding: 0;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    border-radius: 4px; cursor: pointer; font-size: 14px; line-height: 1;
+    display: none;
+  }
+  body.sidebar-collapsed #sidebar-toggle { display: block; }
+  aside h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 16px 0 6px; letter-spacing: 0.05em; }
+  aside h1 { font-size: 15px; margin: 0 0 10px; }
+  .outline a {
+    display: block; padding: 4px 6px; margin: 1px 0; border-radius: 4px;
+    text-decoration: none; color: var(--text); font-size: 12px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .outline a:hover { background: var(--hover); }
+  .outline .r { display: inline-block; width: 46px; font-weight: 600; }
+  .outline .r-system { color: var(--sys); }
+  .outline .r-user { color: var(--user); }
+  .outline .r-assistant { color: var(--asst); }
+  .outline .r-tool { color: var(--tool); }
+
+  main { padding: 16px 24px; max-width: 1100px; }
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 40px;
+    text-align: center; color: var(--muted); margin: 40px auto; max-width: 600px;
+  }
+  .dropzone.drag { border-color: var(--user); background: var(--hover); color: var(--user); }
+  .dropzone input { display: block; margin: 12px auto 0; }
+  .dropzone.hidden { display: none; }
+
+  .meta {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    margin: 0 0 12px;
+  }
+
+  .msg {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    margin-bottom: 12px; overflow: hidden;
+  }
+  .msg-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+    background: var(--head-bg); font-size: 12px;
+  }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-weight: 600; font-size: 11px; color: #fff;
+  }
+  .badge-system { background: var(--sys); }
+  .badge-user { background: var(--user); }
+  .badge-assistant { background: var(--asst); }
+  .badge-tool { background: var(--tool); }
+  .idx { color: var(--muted); font-family: var(--mono); }
+  .tcid { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-left: auto; }
+
+  .msg-body { padding: 12px; }
+  .msg-body pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 10px 12px; overflow-x: auto; font-family: var(--mono); font-size: 12px;
+    margin: 6px 0; white-space: pre; tab-size: 4;
+  }
+  .text { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 13px; }
+
+  .toolcall {
+    margin: 10px 0; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--tc-bg);
+  }
+  .toolcall-head {
+    padding: 6px 10px; background: var(--tc-head-bg); border-bottom: 1px solid var(--border);
+    display: flex; gap: 10px; align-items: center; font-size: 12px;
+  }
+  .tool-name { font-family: var(--mono); font-weight: 600; color: var(--tool); }
+  .toolcall-body { padding: 8px 10px; }
+  .arg-label { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 6px; }
+  .arg-label:first-child { margin-top: 0; }
+
+  details { margin: 4px 0; }
+  details > summary {
+    cursor: pointer; color: var(--muted); font-size: 12px;
+    padding: 4px 0; list-style: none;
+  }
+  details > summary::before { content: "▸ "; }
+  details[open] > summary::before { content: "▾ "; }
+
+  .copy-btn {
+    float: right; font-size: 10px; padding: 2px 6px; margin-left: 8px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 3px; cursor: pointer;
+    color: var(--muted);
+  }
+  .copy-btn:hover { color: var(--text); }
+
+  .truncated { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+  .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .controls button, .controls label {
+    font-size: 12px; padding: 4px 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); border-radius: 4px; cursor: pointer;
+  }
+  .status { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<aside>
+  <h1>Trace Viewer</h1>
+  <div class="controls">
+    <label>Load<input type="file" id="file-input" accept=".json,.jsonl" style="display:none"></label>
+    <button id="expand-all">Expand</button>
+    <button id="collapse-all">Collapse</button>
+    <button id="clear-cache" title="Clear saved trace">Clear</button>
+    <button id="theme-toggle" title="Toggle dark mode">🌓</button>
+    <button id="sidebar-hide" title="Hide sidebar">◀</button>
+  </div>
+  <div style="margin:8px 0">
+    <input type="text" id="path-input" placeholder="runs/.../trace.json"
+      style="width:100%;font:12px var(--mono);padding:4px 6px;border:1px solid var(--border);background:var(--input-bg);color:var(--text);border-radius:4px;box-sizing:border-box">
+    <button id="path-load" style="width:100%;margin-top:4px;padding:4px;font-size:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:4px;cursor:pointer">Fetch path</button>
+  </div>
+  <div class="status" id="status"></div>
+  <h2>Messages</h2>
+  <nav class="outline" id="outline"></nav>
+</aside>
+
+<main id="main">
+  <button id="sidebar-toggle" title="Show sidebar">▶</button>
+  <div id="content">
+    <div class="dropzone" id="dropzone">
+      <strong>Load a trace.json</strong><br>
+      <span>Drag &amp; drop here, click to pick a file, or paste a path in the sidebar and click "Fetch path".<br>
+      URL form: <code>?file=runs/.../trace.json</code> (relative to HTTP root).</span>
+    </div>
+  </div>
+</main>
+
+<script>
+(function(){
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('file-input');
+  const main = document.getElementById('main');
+  const content = document.getElementById('content');
+  const outline = document.getElementById('outline');
+  const status = document.getElementById('status');
+
+  // drag & drop
+  ['dragover','dragenter'].forEach(ev => dropzone.addEventListener(ev, e => {
+    e.preventDefault(); dropzone.classList.add('drag');
+  }));
+  ['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, e => {
+    e.preventDefault(); dropzone.classList.remove('drag');
+  }));
+  dropzone.addEventListener('drop', e => {
+    const f = e.dataTransfer.files[0];
+    if (f) loadFile(f);
+  });
+  dropzone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (f) loadFile(f);
+  });
+
+  function loadFile(file) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const raw = e.target.result;
+        const data = parseMaybeJsonl(raw);
+        render(data, file.name);
+        persist(raw, file.name);
+      } catch (err) {
+        status.textContent = 'Parse error: ' + err.message;
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // Persist the loaded trace across VS Code Live Preview reloads.
+  // Live Preview reloads the page whenever any workspace file changes,
+  // which would otherwise wipe the dropped file.
+  function persist(text, name) {
+    try {
+      sessionStorage.setItem('trace-viewer-raw', text);
+      sessionStorage.setItem('trace-viewer-name', name);
+    } catch (e) {
+      // Quota exceeded for very large traces — silently skip.
+    }
+  }
+  function restore() {
+    try {
+      const text = sessionStorage.getItem('trace-viewer-raw');
+      const name = sessionStorage.getItem('trace-viewer-name');
+      if (text && name) {
+        render(parseMaybeJsonl(text), name + ' (restored)');
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function parseMaybeJsonl(text) {
+    text = text.trim();
+    if (text.startsWith('[')) return JSON.parse(text);
+    // jsonl
+    return text.split('\n').filter(Boolean).map(JSON.parse);
+  }
+
+  // Try the path as-is, then progressively strip leading path segments
+  // so that /mnt/data1/.../parallelmind_agent/runs/x/trace.json auto-resolves
+  // to runs/x/trace.json when the HTTP root is the repo dir.
+  async function fetchPath(path) {
+    status.textContent = 'Fetching ' + path + ' ...';
+    const segs = path.split('/').filter(Boolean);
+    const candidates = [];
+    if (path.startsWith('/')) {
+      for (let i = 0; i < segs.length; i++) {
+        candidates.push('/' + segs.slice(i).join('/'));
+      }
+    } else {
+      candidates.push(path);
+    }
+    for (const c of candidates) {
+      try {
+        const r = await fetch(c);
+        if (r.ok) {
+          const t = await r.text();
+          render(parseMaybeJsonl(t), c);
+          persist(t, c);
+          return;
+        }
+      } catch (e) {}
+    }
+    status.textContent = 'Fetch error: could not load ' + path +
+      ' (tried ' + candidates.length + ' candidate' + (candidates.length === 1 ? '' : 's') + ')';
+  }
+
+  document.getElementById('path-load').addEventListener('click', () => {
+    const p = document.getElementById('path-input').value.trim();
+    if (p) fetchPath(p);
+  });
+  document.getElementById('path-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('path-load').click();
+  });
+
+  // ?file=... (relative path served by HTTP server, e.g. VS Code Live Preview)
+  const params = new URLSearchParams(location.search);
+  if (params.has('file')) {
+    fetchPath(params.get('file'));
+  } else {
+    // Auto-restore across Live Preview reloads
+    restore();
+  }
+
+  // -----------------------------------------------------------------------
+  // Rendering
+  // -----------------------------------------------------------------------
+
+  function render(messages, name) {
+    dropzone.classList.add('hidden');
+    content.innerHTML = '';
+    outline.innerHTML = '';
+    status.textContent = `${messages.length} messages · ${name}`;
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = name;
+    content.appendChild(meta);
+
+    messages.forEach((m, i) => {
+      const card = renderMessage(m, i, messages);
+      content.appendChild(card);
+
+      const a = document.createElement('a');
+      a.href = '#msg-' + i;
+      const role = m.role || 'unknown';
+      const label = summarize(m);
+      a.innerHTML = `<span class="r r-${role}">${role.slice(0,4)}</span> ${escapeHtml(label)}`;
+      outline.appendChild(a);
+    });
+  }
+
+  function summarize(m) {
+    if (m.tool_calls && m.tool_calls.length) {
+      return m.tool_calls.map(t => t.function?.name).join(',');
+    }
+    if (m.role === 'tool') return 'result';
+    const txt = (m.content || '').trim().replace(/\s+/g, ' ');
+    return txt.slice(0, 40);
+  }
+
+  function renderMessage(m, i, allMessages) {
+    const div = document.createElement('section');
+    div.className = 'msg';
+    div.id = 'msg-' + i;
+
+    const role = m.role || 'unknown';
+    const head = document.createElement('div');
+    head.className = 'msg-head';
+    head.innerHTML = `
+      <span class="idx">#${i}</span>
+      <span class="badge badge-${role}">${role}</span>
+    `;
+    if (m.tool_call_id) {
+      const t = document.createElement('span');
+      t.className = 'tcid';
+      t.textContent = m.tool_call_id;
+      head.appendChild(t);
+    }
+    div.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+
+    // content
+    if (m.content && String(m.content).length) {
+      body.appendChild(renderContent(String(m.content), role));
+    }
+
+    // tool_calls on assistant
+    if (m.tool_calls && m.tool_calls.length) {
+      m.tool_calls.forEach(tc => {
+        body.appendChild(renderToolCall(tc));
+      });
+    }
+
+    div.appendChild(body);
+    return div;
+  }
+
+  function renderContent(text, role) {
+    // assistant reasoning often wrapped in [previous analysis] ... [/previous analysis]
+    const wrapper = document.createElement('div');
+    const m = text.match(/^\[previous analysis\]([\s\S]*?)\[\/previous analysis\]\s*([\s\S]*)$/);
+    if (m && role === 'assistant') {
+      const det = document.createElement('details');
+      const sum = document.createElement('summary');
+      sum.textContent = 'previous analysis (' + m[1].trim().length + ' chars)';
+      det.appendChild(sum);
+      const pre = document.createElement('div');
+      pre.className = 'text';
+      pre.textContent = m[1].trim();
+      det.appendChild(pre);
+      wrapper.appendChild(det);
+
+      if (m[2].trim().length) {
+        const rest = document.createElement('div');
+        rest.className = 'text';
+        rest.textContent = m[2].trim();
+        wrapper.appendChild(rest);
+      }
+    } else {
+      const d = document.createElement('div');
+      d.className = 'text';
+      d.textContent = text;
+      wrapper.appendChild(d);
+    }
+    return wrapper;
+  }
+
+  function renderToolCall(tc) {
+    const fn = tc.function || {};
+    const name = fn.name || '?';
+    let args = fn.arguments || '{}';
+    let parsed = null;
+    try { parsed = JSON.parse(args); } catch(e) {}
+
+    const box = document.createElement('div');
+    box.className = 'toolcall';
+
+    const head = document.createElement('div');
+    head.className = 'toolcall-head';
+    head.innerHTML = `
+      <span class="tool-name">${escapeHtml(name)}()</span>
+      <span class="tcid">${escapeHtml(tc.id || '')}</span>
+    `;
+    box.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'toolcall-body';
+
+    if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed)) {
+        const lab = document.createElement('div');
+        lab.className = 'arg-label';
+        lab.textContent = k;
+        body.appendChild(lab);
+
+        const pre = document.createElement('pre');
+        const btn = document.createElement('button');
+        btn.className = 'copy-btn';
+        btn.textContent = 'copy';
+        const val = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+        btn.addEventListener('click', () => {
+          navigator.clipboard.writeText(val);
+          btn.textContent = 'copied';
+          setTimeout(() => btn.textContent = 'copy', 1000);
+        });
+        pre.appendChild(btn);
+        pre.appendChild(document.createTextNode(val));
+        body.appendChild(pre);
+      }
+    } else {
+      const pre = document.createElement('pre');
+      pre.textContent = args;
+      body.appendChild(pre);
+    }
+    box.appendChild(body);
+    return box;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // expand/collapse all
+  document.getElementById('expand-all').addEventListener('click', () => {
+    document.querySelectorAll('details').forEach(d => d.open = true);
+  });
+  document.getElementById('collapse-all').addEventListener('click', () => {
+    document.querySelectorAll('details').forEach(d => d.open = false);
+  });
+  document.getElementById('clear-cache').addEventListener('click', () => {
+    sessionStorage.removeItem('trace-viewer-raw');
+    sessionStorage.removeItem('trace-viewer-name');
+    location.reload();
+  });
+
+  // theme
+  const savedTheme = localStorage.getItem('trace-viewer-theme');
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const initialTheme = savedTheme || (prefersDark ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-theme', initialTheme);
+  document.getElementById('theme-toggle').addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('trace-viewer-theme', next);
+  });
+
+  // sidebar
+  if (localStorage.getItem('trace-viewer-sidebar') === 'collapsed') {
+    document.body.classList.add('sidebar-collapsed');
+  }
+  document.getElementById('sidebar-hide').addEventListener('click', () => {
+    document.body.classList.add('sidebar-collapsed');
+    localStorage.setItem('trace-viewer-sidebar', 'collapsed');
+  });
+  document.getElementById('sidebar-toggle').addEventListener('click', () => {
+    document.body.classList.remove('sidebar-collapsed');
+    localStorage.setItem('trace-viewer-sidebar', 'expanded');
+  });
+})();
+</script>
+</body>
+</html>

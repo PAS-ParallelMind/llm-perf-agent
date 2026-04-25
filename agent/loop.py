@@ -15,21 +15,38 @@ from .tools.base import dispatch, schemas
 
 console = Console()
 
+# If the model produces this many consecutive turns with no tool_calls and
+# no submission, give up. Prevents runaway loops when the model stalls.
+_MAX_IDLE_TURNS = 3
+
+_IDLE_NUDGE = (
+    "You did not call any tool. Remember: only tool calls affect the "
+    "workspace. If you believe you are done, call `submit_solution` now; "
+    "otherwise continue using the tools."
+)
+
 
 class Agent:
-    def __init__(self, engine: Engine, max_steps: int = 20) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        max_steps: int = 20,
+        system_prompt: str | None = None,
+    ) -> None:
         self.engine = engine
         self.max_steps = max_steps
+        self.system_prompt = system_prompt
         self.step_count = 0
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": build_system_prompt(load_index())}
+            {"role": "system", "content": build_system_prompt(
+                load_index(), self.system_prompt)}
         ]
         self.tool_call_log: list[dict[str, Any]] = []
 
     def refresh_system(self) -> None:
         self.messages[0] = {
             "role": "system",
-            "content": build_system_prompt(load_index()),
+            "content": build_system_prompt(load_index(), self.system_prompt),
         }
 
     def run(
@@ -47,6 +64,7 @@ class Agent:
         start = time.monotonic()
 
         final_reply = ""
+        idle_streak = 0
 
         for step in range(self.max_steps):
             self.step_count = step + 1
@@ -63,10 +81,7 @@ class Agent:
                     msg, "reasoning_content", None
                 )
                 if reasoning:
-                    content = (
-                        f"[previous analysis]\n{reasoning}\n[/previous analysis]\n"
-                        f"{content}"
-                    )
+                    content = f"{reasoning}\n{content}" if content else reasoning
             asst: dict[str, Any] = {"role": "assistant", "content": content}
             if getattr(msg, "tool_calls", None):
                 asst["tool_calls"] = [
@@ -83,8 +98,16 @@ class Agent:
             self.messages.append(asst)
 
             if not getattr(msg, "tool_calls", None):
-                final_reply = msg.content or ""
-                break
+                idle_streak += 1
+                if idle_streak >= _MAX_IDLE_TURNS:
+                    final_reply = (
+                        f"[stopped after {idle_streak} consecutive turns with "
+                        f"no tool call]"
+                    )
+                    break
+                self.messages.append({"role": "user", "content": _IDLE_NUDGE})
+                continue
+            idle_streak = 0
 
             for tc in msg.tool_calls:
                 name = tc.function.name
@@ -95,8 +118,8 @@ class Agent:
                 result = dispatch(name, args)
                 tc_elapsed = time.monotonic() - tc_start
 
-                if len(result) > 8000:
-                    result = result[:8000] + "\n... [truncated observation]"
+                if len(result) > 16000:
+                    result = result[:16000] + "\n... [truncated observation]"
                 preview = "\n".join(result.splitlines()[:10])
                 console.print(f"[dim]  \u21b3 {preview}[/]")
 

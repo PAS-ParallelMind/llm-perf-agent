@@ -2,7 +2,7 @@
 
 Usage example (ParEval OMP):
   python -m agent.batch \
-    --adapter pareval --adapter-args '{"parallelism": "omp"}' \
+    --adapter pareval --adapter-args '{"problem_set": "omp"}' \
     --prompts ParEval/prompts/generation-prompts.json \
     --output runs/my_run/results.json \
     --model openai/gpt-oss-120b \
@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -24,6 +25,7 @@ from rich.console import Console
 
 from . import memory, submission  # noqa: F401  registers memory tools
 from .adapters.base import AgentResult, AgentTask, BenchmarkAdapter
+from .adapters.hecbench import HeCBenchAdapter
 from .adapters.pareval import ParevalAdapter
 from .engine import Engine
 from .loop import Agent
@@ -38,6 +40,7 @@ console = Console()
 
 ADAPTERS: dict[str, type[BenchmarkAdapter]] = {
     "pareval": ParevalAdapter,
+    "hecbench": HeCBenchAdapter,
 }
 
 # ---------------------------------------------------------------------------
@@ -62,9 +65,10 @@ def run_one(
     *,
     max_steps: int,
     time_budget: int,
+    system_prompt: str | None = None,
 ) -> AgentResult:
     submission.reset()
-    agent = Agent(engine, max_steps=max_steps)
+    agent = Agent(engine, max_steps=max_steps, system_prompt=system_prompt)
 
     try:
         result = agent.run(task, time_budget_s=time_budget)
@@ -144,6 +148,9 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--reasoning", action="store_true",
                     help="Model emits a reasoning trace; echo it back each turn")
+    ap.add_argument("--system-prompt-file", default=None,
+                    help="Path to a text file containing the task-specific "
+                         "system prompt (prepended before the memory block)")
     # agent
     ap.add_argument("--max-steps", type=int, default=15)
     ap.add_argument("--time-budget", type=int, default=300,
@@ -201,15 +208,31 @@ def main() -> None:
         reasoning=args.reasoning,
     )
 
+    # --- Task-specific system prompt ---
+    system_prompt: str | None = None
+    if args.system_prompt_file:
+        system_prompt = Path(args.system_prompt_file).read_text()
+
     # --- Run ---
     results_lock = threading.Lock()
 
     def _run_task(idx: int, task: AgentTask) -> AgentResult:
-        set_root(ws_base / task.id)
+        root = ws_base / task.id
+        root.mkdir(parents=True, exist_ok=True)
+        # Optionally pre-seed the workspace with files the task declares
+        # it needs (e.g. HeCBench reference.h). Copy is shallow — hidden
+        # files (.meta.json etc.) are skipped.
+        seed_dir = task.metadata.get("seed_dir")
+        if seed_dir:
+            for p in Path(seed_dir).iterdir():
+                if p.is_file() and not p.name.startswith("."):
+                    shutil.copy2(p, root / p.name)
+        set_root(root)
         console.print(f"[bold][{idx+1}/{len(tasks)}] start {task.id}[/]")
         result = run_one(engine, task,
                          max_steps=args.max_steps,
-                         time_budget=args.time_budget)
+                         time_budget=args.time_budget,
+                         system_prompt=system_prompt)
         console.print(
             f"[{idx+1}/{len(tasks)}] {task.id} "
             f"submitted={result.submitted} "

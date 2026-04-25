@@ -41,7 +41,7 @@ def _build_instruction(entry: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Export / normalize helpers  (ported from scripts/normalize_outputs.py)
+# Export / normalize helpers
 # ---------------------------------------------------------------------------
 
 _CODE_BLOCK = re.compile(r"```(?:cpp|c\+\+|c)?\s*\n?(.*?)```", re.S)
@@ -63,10 +63,68 @@ def _signature_head(prompt: str) -> str:
     return last
 
 
+def _match_template(s: str, i: int) -> int:
+    """If ``s[i]`` is ``<``, return index just past the matching ``>``.
+    Otherwise return ``i``.  Handles nested templates like ``<vector<T>>``."""
+    if i >= len(s) or s[i] != "<":
+        return i
+    depth = 0
+    j = i
+    while j < len(s):
+        if s[j] == "<":
+            depth += 1
+        elif s[j] == ">":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return i  # unbalanced
+
+
+def _east_const(s: str) -> str:
+    """Rewrite ``const T&`` -> ``T const&`` (handles nested templates)."""
+    out = []
+    i = 0
+    while i < len(s):
+        m = re.match(r'\bconst\s+', s[i:])
+        if not m:
+            out.append(s[i])
+            i += 1
+            continue
+        start_type = i + m.end()
+        # parse type: word with :: and optional nested template
+        tm = re.match(r'(\w[\w:]*)', s[start_type:])
+        if not tm:
+            out.append(s[i])
+            i += 1
+            continue
+        type_end = start_type + tm.end()
+        # optional whitespace then nested template
+        k = type_end
+        while k < len(s) and s[k].isspace():
+            k += 1
+        if k < len(s) and s[k] == "<":
+            k = _match_template(s, k)
+        # expect optional whitespace then '&'
+        amp = k
+        while amp < len(s) and s[amp].isspace():
+            amp += 1
+        if amp < len(s) and s[amp] == "&":
+            type_text = s[start_type:k]
+            out.append(f"{type_text} const&")
+            i = amp + 1
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def _canonicalize(s: str) -> str:
     """Collapse whitespace and normalise ``const T &`` <-> ``T const&``."""
     s = " ".join(s.split())
-    s = re.sub(r'\bconst\s+(\w[\w:]*(?:\s*<[^>]*>)?)\s*&', r'\1 const&', s)
+    s = _east_const(s)
+    s = re.sub(r'\bstd::size_t\b', 'size_t', s)   # std::size_t -> size_t
+    s = re.sub(r'\s*,\s*', ',', s)   # normalise comma spacing
     s = re.sub(r'\s*([&*])\s*', r'\1', s)
     return s
 
@@ -129,14 +187,14 @@ class ParevalAdapter(BenchmarkAdapter):
         self,
         path: str,
         *,
-        parallelism: str | None = None,
+        problem_set: str | None = None,
         limit: int | None = None,
         **kwargs: Any,
     ) -> list[AgentTask]:
         data = json.loads(Path(path).read_text())
 
-        if parallelism:
-            data = [e for e in data if e.get("parallelism_model") == parallelism]
+        if problem_set:
+            data = [e for e in data if e.get("parallelism_model") == problem_set]
         if limit:
             data = data[:limit]
 

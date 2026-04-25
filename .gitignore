@@ -31,3 +31,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Personal dev log (not part of the public repo)
+DEV_NOTES.md

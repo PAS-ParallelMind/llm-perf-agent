@@ -46,7 +46,7 @@ def _rel(p: str) -> str:
     flags="Extra nvcc flags (e.g. '-O3 -arch=sm_80')",
     args="Args to pass to the binary (space-separated, default empty)",
 )
-def nvcc_build(src: str, out: str, flags: str = "-O3", args: str = "") -> str:
+def nvcc_build_and_run(src: str, out: str, flags: str = "-O3", args: str = "") -> str:
     cmd = ["nvcc", *flags.split(), _rel(src), "-o", _rel(out)]
     build_out, rc = _run(cmd, timeout=300)
     if rc != 0:
@@ -65,8 +65,8 @@ def nvcc_build(src: str, out: str, flags: str = "-O3", args: str = "") -> str:
     threads="OMP_NUM_THREADS value (default 4)",
     args="Args to pass to the binary (space-separated, default empty)",
 )
-def omp_build(src: str, out: str, compiler: str = "gcc",
-              threads: int = 4, args: str = "") -> str:
+def omp_build_and_run(src: str, out: str, compiler: str = "gcc",
+                      threads: int = 4, args: str = "") -> str:
     cmd = [compiler, "-O3", "-fopenmp", _rel(src), "-o", _rel(out)]
     build_out, rc = _run(cmd)
     if rc != 0:
@@ -87,8 +87,8 @@ def omp_build(src: str, out: str, compiler: str = "gcc",
     nprocs="Number of MPI ranks (default 2)",
     args="Args to pass to the binary (space-separated, default empty)",
 )
-def mpi_build(src: str, out: str, compiler: str = "mpicc",
-              nprocs: int = 2, args: str = "") -> str:
+def mpi_build_and_run(src: str, out: str, compiler: str = "mpicc",
+                      nprocs: int = 2, args: str = "") -> str:
     cmd = [compiler, "-O3", _rel(src), "-o", _rel(out)]
     build_out, rc = _run(cmd)
     if rc != 0:
@@ -96,3 +96,49 @@ def mpi_build(src: str, out: str, compiler: str = "mpicc",
     run_cmd = ["mpirun", "-n", str(nprocs), "./" + _rel(out), *args.split()] if args else ["mpirun", "-n", str(nprocs), "./" + _rel(out)]
     run_out, _ = _run(run_cmd)
     return build_out + "\n" + run_out
+
+
+def _probe(cmd: list[str], timeout: int = 5) -> str | None:
+    """Run ``cmd`` and return the output if it succeeded, else None."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    return (p.stdout or p.stderr).strip()
+
+
+@tool(
+    "Inspect the host's parallel-compute setup: available GPUs (name, "
+    "compute capability, memory), CUDA/HIP toolchain versions, and host "
+    "C/C++ compilers. Call this once before choosing compile flags so you "
+    "target the right arch (e.g. ``-arch=sm_89`` vs ``sm_80``). Takes no "
+    "arguments."
+)
+def hardware_info() -> str:
+    parts: list[str] = []
+
+    gpus = _probe([
+        "nvidia-smi",
+        "--query-gpu=index,name,compute_cap,memory.total,driver_version",
+        "--format=csv,noheader",
+    ])
+    parts.append("=== GPUs (nvidia-smi) ===\n" + (gpus or "nvidia-smi unavailable"))
+
+    rocm = _probe(["rocm-smi", "--showproductname"])
+    if rocm:
+        parts.append("=== GPUs (rocm-smi) ===\n" + rocm)
+
+    nvcc = _probe(["nvcc", "--version"])
+    parts.append("=== nvcc ===\n" + (
+        nvcc.splitlines()[-1] if nvcc else "not on PATH"
+    ))
+
+    for comp in ("g++", "clang++", "icpx", "hipcc", "mpicc", "mpicxx"):
+        v = _probe([comp, "--version"])
+        if v:
+            parts.append(f"=== {comp} ===\n" + v.splitlines()[0])
+
+    parts.append(f"=== CPU ===\nlogical cores: {os.cpu_count()}")
+    return "\n\n".join(parts)

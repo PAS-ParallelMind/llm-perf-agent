@@ -8,25 +8,33 @@ import re
 from ..workspace import get_root, resolve
 from .base import tool
 
-MAX_READ = 200_000  # bytes
-
-
 @tool(
-    "Read a text file (relative to workspace) and return contents with "
-    "1-indexed line numbers.",
+    "Read a text file (relative to workspace) with 1-indexed line numbers. "
+    "Supports line-based pagination so large files can be read in multiple "
+    "calls. The tool observation is capped at ~8KB by the agent loop — if "
+    "the output is truncated, call again with a higher ``offset`` or a "
+    "smaller ``limit`` to continue.",
     path="Path relative to the workspace root",
+    offset="1-indexed line to start from (default 1)",
+    limit="Max number of lines to return (default 200)",
 )
-def read_file(path: str) -> str:
+def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     fp = resolve(path)
     with open(fp, "r", errors="replace") as f:
-        data = f.read(MAX_READ + 1)
-    truncated = len(data) > MAX_READ
-    data = data[:MAX_READ]
-    lines = data.splitlines()
-    numbered = "\n".join(f"{i + 1:6d}  {ln}" for i, ln in enumerate(lines))
-    if truncated:
-        numbered += "\n... [truncated]"
-    return numbered or "(empty file)"
+        lines = f.readlines()
+    total = len(lines)
+    if total == 0:
+        return "(empty file)"
+    start = max(1, offset) - 1
+    if start >= total:
+        return f"[offset {offset} is past end of file ({total} lines)]"
+    end = min(start + max(1, limit), total)
+    segment = lines[start:end]
+    header = f"[lines {start + 1}–{end} of {total}]"
+    numbered = "\n".join(
+        f"{i + start + 1:6d}  {ln.rstrip()}" for i, ln in enumerate(segment)
+    )
+    return header + "\n" + numbered
 
 
 @tool(
