@@ -5,13 +5,41 @@ If the build fails, the run is skipped and the compile error is returned.
 """
 from __future__ import annotations
 
+import glob
 import os
+import shutil
 import subprocess
 
 from ..workspace import get_root, resolve
 from .base import tool
 
 MAX_OUT = 20_000
+
+# Common install prefixes for tooling we may need even when not on PATH.
+# Newest CUDA wins (sorted descending).
+_CUDA_PREFIX_GLOBS = ("/usr/local/cuda*", "/opt/cuda*")
+
+
+def _resolve_nvcc() -> str | None:
+    """Find nvcc on PATH first, else scan common install prefixes."""
+    found = shutil.which("nvcc")
+    if found:
+        return found
+    candidates: list[str] = []
+    for pat in _CUDA_PREFIX_GLOBS:
+        candidates.extend(glob.glob(f"{pat}/bin/nvcc"))
+    # newest version-suffixed prefix first (e.g. cuda-12.9 before cuda-12.6)
+    candidates.sort(reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _cuda_runtime_env(nvcc_path: str, base_env: dict | None = None) -> dict:
+    """Return an env dict with CUDA's lib64 prepended to LD_LIBRARY_PATH."""
+    env = (base_env or os.environ).copy()
+    lib64 = os.path.join(os.path.dirname(os.path.dirname(nvcc_path)), "lib64")
+    if os.path.isdir(lib64):
+        env["LD_LIBRARY_PATH"] = lib64 + ":" + env.get("LD_LIBRARY_PATH", "")
+    return env
 
 
 def _run(cmd: list[str], timeout: int = 180, env: dict | None = None) -> tuple[str, int]:
@@ -47,12 +75,17 @@ def _rel(p: str) -> str:
     args="Args to pass to the binary (space-separated, default empty)",
 )
 def nvcc_build_and_run(src: str, out: str, flags: str = "-O3", args: str = "") -> str:
-    cmd = ["nvcc", *flags.split(), _rel(src), "-o", _rel(out)]
+    nvcc = _resolve_nvcc()
+    if not nvcc:
+        return ("ERROR: nvcc not found on PATH or under /usr/local/cuda*/bin "
+                "or /opt/cuda*/bin. Install CUDA toolkit or set PATH.")
+    cmd = [nvcc, *flags.split(), _rel(src), "-o", _rel(out)]
     build_out, rc = _run(cmd, timeout=300)
     if rc != 0:
         return build_out
+    run_env = _cuda_runtime_env(nvcc)
     run_cmd = ["./" + _rel(out), *args.split()] if args else ["./" + _rel(out)]
-    run_out, _ = _run(run_cmd)
+    run_out, _ = _run(run_cmd, env=run_env)
     return build_out + "\n" + run_out
 
 
@@ -130,10 +163,13 @@ def hardware_info() -> str:
     if rocm:
         parts.append("=== GPUs (rocm-smi) ===\n" + rocm)
 
-    nvcc = _probe(["nvcc", "--version"])
-    parts.append("=== nvcc ===\n" + (
-        nvcc.splitlines()[-1] if nvcc else "not on PATH"
-    ))
+    nvcc_path = _resolve_nvcc()
+    if nvcc_path:
+        ver = _probe([nvcc_path, "--version"])
+        last = ver.splitlines()[-1] if ver else "(version probe failed)"
+        parts.append(f"=== nvcc ===\n{nvcc_path}\n{last}")
+    else:
+        parts.append("=== nvcc ===\nnot found")
 
     for comp in ("g++", "clang++", "icpx", "hipcc", "mpicc", "mpicxx"):
         v = _probe([comp, "--version"])
