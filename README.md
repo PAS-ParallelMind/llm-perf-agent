@@ -1,4 +1,4 @@
-# ParallelMind Agent
+# ParallelMind Harness
 
 An agentic framework for writing, debugging, and benchmarking parallel code
 (CUDA / MPI / OpenMP). Uses OpenAI-compatible tool-calling with any vLLM
@@ -305,7 +305,7 @@ Otherwise:
 
 ```bash
 # on the remote box
-cd /mnt/data1/.../parallelmind_agent
+cd /mnt/data1/.../parallelmind_harness
 uv run python3 -m http.server 8000
 # on your laptop
 ssh -L 8000:localhost:8000 <host>

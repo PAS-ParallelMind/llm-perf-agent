@@ -1,5 +1,5 @@
 [project]
-name = "parallelmind-agent"
+name = "parallelmind-harness"
 version = "0.1.0"
 description = "Agentic framework for writing, debugging, and benchmarking parallel code (CUDA / MPI / OpenMP) with vLLM-served models."
 readme = "README.md"

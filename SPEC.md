@@ -1,4 +1,4 @@
-# ParallelMind Agent — Specification
+# ParallelMind Harness — Specification
 
 Reference for what this framework **is**, what guarantees it makes, and what
 its extension points are. Read `README.md` for tutorial-style onboarding; read
@@ -8,7 +8,7 @@ this document to understand the contracts.
 
 ## 1. Purpose
 
-ParallelMind Agent drives an LLM — via an OpenAI-compatible tool-calling
+ParallelMind Harness drives an LLM — via an OpenAI-compatible tool-calling
 endpoint — through benchmark-defined parallel programming tasks, then feeds
 each generated solution into the benchmark's own evaluator to produce
 correctness + performance numbers.
