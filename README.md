@@ -42,6 +42,69 @@ runs/                    # per-benchmark subdirs: pareval/, hecbench/
 SPEC.md                  # contracts and invariants
 ```
 
+## Architecture
+
+A single run flows through one orchestrator script that drives four stages:
+load tasks via the adapter, fan them out to N concurrent agent loops, then
+hand the agent's outputs to the benchmark's own evaluator for timing and
+metrics. The agent loop itself is benchmark-agnostic — only the adapter
+and the orchestrator script know what benchmark is in use.
+
+```mermaid
+flowchart TB
+    subgraph IN ["inputs (runs/&lt;bench&gt;/&lt;run&gt;/)"]
+        direction LR
+        A1["agent.yaml<br><sub>model + agent settings</sub>"]
+        A2["config.yaml<br><sub>benchmark settings</sub>"]
+        A3["benchmarks/&lt;name&gt;/<br><sub>prompts · reference · evaluator</sub>"]
+    end
+
+    IN --> ORCH["scripts/run_&lt;bench&gt;.py<br><sub>orchestrator · 4 stages</sub>"]
+
+    ORCH -->|"Stage 1: agent"| BATCH["agent/batch.py<br><sub>adapter.load → AgentTasks · fan out</sub>"]
+    BATCH -->|"workers = N threads"| LOOP
+
+    subgraph LOOP ["per-task agent loop · agent/loop.py"]
+        direction LR
+        ENG["engine.chat<br><sub>vLLM OpenAI endpoint</sub>"]
+        DISP["tools.dispatch"]
+        ENG -->|"tool_calls"| DISP
+        DISP -->|"tool result"| ENG
+    end
+
+    subgraph TOOLS ["agent/tools/*"]
+        direction LR
+        T1["fs<br><sub>read/write/edit<br>glob/grep</sub>"]
+        T2["bash"]
+        T3["parallel<br><sub>nvcc · mpi · omp<br>build_and_run</sub>"]
+        T4["hardware_info"]
+        T5["submit_solution<br><sub>terminates loop</sub>"]
+        T6["memory<br><sub>remember/recall</sub>"]
+    end
+    DISP <--> TOOLS
+
+    LOOP -->|"AgentResult"| EXPORT["adapter.export()<br><sub>agent_output.json</sub>"]
+    EXPORT -->|"Stages 2–4"| EVAL["scratch tree<br>+ native evaluator<br><sub>autohecbench · ParEval drivers</sub>"]
+    EVAL --> OUT["results.csv<br>speedup.md<br>metrics.csv"]
+
+    classDef in fill:#eef6ff,stroke:#5a86b8;
+    classDef orch fill:#fff4e1,stroke:#b8895a;
+    classDef loop fill:#fdeef7,stroke:#b85a90;
+    classDef tools fill:#f0e9ff,stroke:#7e5ab8;
+    classDef out fill:#e9f7ec,stroke:#5ab877;
+    class A1,A2,A3 in;
+    class ORCH,BATCH orch;
+    class ENG,DISP loop;
+    class T1,T2,T3,T4,T5,T6 tools;
+    class EXPORT,EVAL,OUT out;
+```
+
+The agent loop and the tools are completely benchmark-agnostic — adding a
+new benchmark is a ~200-line adapter (`load` + `export`) plus a
+`scripts/run_<name>.py` that wires the post-agent stages to that
+benchmark's evaluator. See [`SPEC.md`](SPEC.md) for the full layer
+contract and extension checklist.
+
 ## Configuration
 
 Each run has two YAML files under `runs/<bench>/<run-name>/`
