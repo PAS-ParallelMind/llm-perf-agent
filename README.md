@@ -1,5 +1,7 @@
 # ParallelMind Harness
 
+![ParallelMind Harness](assets/banner.png)
+
 An agentic framework for writing, debugging, and benchmarking parallel code
 (CUDA / MPI / OpenMP). Uses OpenAI-compatible tool-calling with any vLLM
 backend.
