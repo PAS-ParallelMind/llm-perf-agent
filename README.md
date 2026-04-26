@@ -277,6 +277,8 @@ any `batch/<problem>/trace.json` (also accepts the matching
 `tool_calls.jsonl`). Useful for both debugging a single run and
 presenting a trace to collaborators.
 
+![Trace viewer](assets/trace_viewer_example.png)
+
 **Features**
 - Role-color message cards (system / user / assistant / tool), with
   per-message index and `tool_call_id` for pairing results back to calls
