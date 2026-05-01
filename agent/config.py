@@ -68,6 +68,36 @@ class ParevalBenchmarkConfig:
 
 
 @dataclass
+class HeCBenchSerialGenConfig:
+    """Loaded from runs/hecbench_serial_gen/<run-name>/config.yaml.
+
+    Task framing: produce a serial C++ reference for each HeCBench
+    benchmark by exposing every available parallel implementation
+    (``<name>-cuda``, ``-omp``, ``-hip``, ``-sycl``) as a subdirectory
+    of the agent's workspace and letting it iterate via tool calls.
+    """
+
+    # HeCBench src/ tree (each benchmark is at <src_root>/<name>-<variant>/).
+    src_root: str = "benchmarks/HeCBench/src"
+    # Path to benchmarks.yaml — used to discover candidate names + their
+    # test args / regex / timeout / categories.
+    benchmarks_yaml: str = "benchmarks/HeCBench/benchmarks.yaml"
+    # Where the final serial corpus is written (consumed by run_hecbench.py).
+    out_root: str = "benchmarks/HeCBench/serial_agent"
+    # Allow-list filters — both optional.
+    names: list[str] | None = None
+    categories: list[str] | None = None
+    # Skip benchmarks that don't have this variant. Set to null to accept
+    # any benchmark with at least one variant.
+    require_variant: str | None = "omp"
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> HeCBenchSerialGenConfig:
+        raw = yaml.safe_load(Path(path).read_text())
+        return cls(**raw)
+
+
+@dataclass
 class HeCBenchBenchmarkConfig:
     """Loaded from runs/<run-name>/config.yaml for HeCBench runs.
 

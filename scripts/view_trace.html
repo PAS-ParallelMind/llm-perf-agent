@@ -145,6 +145,18 @@
   }
   .copy-btn:hover { color: var(--text); }
 
+  .raw-btn {
+    margin-left: auto; font-size: 11px; padding: 2px 8px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 3px;
+    color: var(--muted); cursor: pointer;
+  }
+  .raw-btn:hover { color: var(--text); }
+  .raw-pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 10px 12px; margin: 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+
   .truncated { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
   .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
@@ -360,6 +372,12 @@
       t.textContent = m.tool_call_id;
       head.appendChild(t);
     }
+
+    const rawBtn = document.createElement('button');
+    rawBtn.className = 'raw-btn';
+    rawBtn.textContent = 'raw';
+    rawBtn.title = 'Show raw message JSON';
+    head.appendChild(rawBtn);
     div.appendChild(head);
 
     const body = document.createElement('div');
@@ -377,7 +395,23 @@
       });
     }
 
+    const rawBody = document.createElement('div');
+    rawBody.className = 'msg-body';
+    rawBody.style.display = 'none';
+    const rawPre = document.createElement('pre');
+    rawPre.className = 'raw-pre';
+    rawPre.textContent = JSON.stringify(m, null, 2);
+    rawBody.appendChild(rawPre);
+
+    rawBtn.addEventListener('click', () => {
+      const showingRaw = rawBody.style.display !== 'none';
+      rawBody.style.display = showingRaw ? 'none' : 'block';
+      body.style.display = showingRaw ? 'block' : 'none';
+      rawBtn.textContent = showingRaw ? 'raw' : 'rendered';
+    });
+
     div.appendChild(body);
+    div.appendChild(rawBody);
     return div;
   }
 

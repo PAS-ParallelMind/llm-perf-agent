@@ -90,6 +90,27 @@ def nvcc_build_and_run(src: str, out: str, flags: str = "-O3", args: str = "") -
 
 
 @tool(
+    "Compile a plain C/C++ source (no OpenMP, no CUDA) and run the binary. "
+    "Use this to verify a serial reference compiles and runs cleanly. "
+    "If the build fails, the run is skipped and the compile error is returned.",
+    src="Path to .c/.cpp file (relative to workspace)",
+    out="Output binary path (relative to workspace)",
+    compiler="Compiler to use (g++/gcc/clang++)",
+    flags="Extra compiler flags (default '-O3 -std=c++17')",
+    args="Args to pass to the binary (space-separated, default empty)",
+)
+def cpp_build_and_run(src: str, out: str, compiler: str = "g++",
+                      flags: str = "-O3 -std=c++17", args: str = "") -> str:
+    cmd = [compiler, *flags.split(), _rel(src), "-o", _rel(out)]
+    build_out, rc = _run(cmd, timeout=180)
+    if rc != 0:
+        return build_out
+    run_cmd = ["./" + _rel(out), *args.split()] if args else ["./" + _rel(out)]
+    run_out, _ = _run(run_cmd, timeout=300)
+    return build_out + "\n" + run_out
+
+
+@tool(
     "Compile a C/C++ source with OpenMP and run the binary. "
     "If the build fails, the run is skipped and the compile error is returned.",
     src="Path to .c/.cpp file (relative to workspace)",

@@ -26,6 +26,7 @@ from rich.console import Console
 from . import memory, submission  # noqa: F401  registers memory tools
 from .adapters.base import AgentResult, AgentTask, BenchmarkAdapter
 from .adapters.hecbench import HeCBenchAdapter
+from .adapters.hecbench_serial_gen import HeCBenchSerialGenAdapter
 from .adapters.pareval import ParevalAdapter
 from .engine import Engine
 from .loop import Agent
@@ -41,6 +42,7 @@ console = Console()
 ADAPTERS: dict[str, type[BenchmarkAdapter]] = {
     "pareval": ParevalAdapter,
     "hecbench": HeCBenchAdapter,
+    "hecbench_serial_gen": HeCBenchSerialGenAdapter,
 }
 
 # ---------------------------------------------------------------------------
@@ -227,12 +229,27 @@ def main() -> None:
             for p in Path(seed_dir).iterdir():
                 if p.is_file() and not p.name.startswith("."):
                     shutil.copy2(p, root / p.name)
+        # Optionally pre-seed nested directories — useful when the agent
+        # needs reference material organized by subfolder (e.g. all
+        # programming-model variants of a HeCBench benchmark exposed as
+        # cuda/, omp/, hip/, sycl/).
+        seed_subdirs = task.metadata.get("seed_subdirs") or {}
+        for dst_name, src_path in seed_subdirs.items():
+            src = Path(src_path)
+            if not src.is_dir():
+                continue
+            dst = root / dst_name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns(
+                "*.o", "*.bin", "*.exe", "main", "__pycache__"))
         set_root(root)
         console.print(f"[bold][{idx+1}/{len(tasks)}] start {task.id}[/]")
         result = run_one(engine, task,
                          max_steps=args.max_steps,
                          time_budget=args.time_budget,
                          system_prompt=system_prompt)
+        result.metadata["workspace"] = str(root)
         console.print(
             f"[{idx+1}/{len(tasks)}] {task.id} "
             f"submitted={result.submitted} "
