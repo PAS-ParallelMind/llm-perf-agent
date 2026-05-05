@@ -7,11 +7,11 @@ from .base import tool
 
 @tool(
     "Submit the final solution code for this problem. Call exactly ONCE "
-    "when the solution has been built and verified. The code string must "
-    "contain ONLY the required function definition (no main, no extra "
-    "includes — the evaluation harness provides those). Calling this tool "
-    "terminates the agent loop for this problem.",
-    code="The final function definition as a single code string",
+    "when the solution has been built and verified. For single-function "
+    "tasks, pass the final source code. For multi-file workspace tasks, pass "
+    "a concise summary of the files changed; the evaluator reads the modified "
+    "workspace files. Calling this tool terminates the agent loop.",
+    code="Final source code, or a concise summary for multi-file workspace tasks",
 )
 def submit_solution(code: str) -> str:
     set_code(code)

@@ -64,6 +64,8 @@ def run_one(
             task_id=task.id,
             code="",
             raw_reply="",
+            trace=list(agent.messages),
+            tool_calls=list(agent.tool_call_log),
             steps=agent.step_count,
             elapsed_s=0.0,
             submitted=False,

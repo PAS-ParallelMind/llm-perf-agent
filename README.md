@@ -185,6 +185,24 @@ Things to capture in the preprocessing script:
   alongside the agent's submission (category, expected validation
   type, parallelism model, etc.).
 
+### CUDAMicroBench workflow
+
+Place or clone CUDAMicroBench under `benchmarks/CUDAMicroBench`, then run:
+
+```bash
+python scripts/run_cudamicrobench_experiment.py \
+  --model Qwen/Qwen2.5-Coder-32B-Instruct \
+  --base-url http://localhost:8000/v1 \
+  --limit 1
+```
+
+The wrapper writes `runs/cudamicrobench/problems.json`, creates
+`runs/cudamicrobench/run.yaml`, runs `agent.batch`, then evaluates each
+modified workspace with `scripts/eval_cudamicrobench.py`. Add
+`--eval-no-tests` when CUDA builds are available but `nvprof` is not.
+The agent can call `cuda_guided_profile` for broad-to-narrow Nsight
+Compute feedback, then `cuda_profile` for focused before/after timing.
+
 ## Trace viewer
 
 `visualize_tool/view_trace.html` is a single-file, zero-dependency viewer for
