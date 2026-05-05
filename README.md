@@ -34,8 +34,10 @@ agent/
     submit.py     # submit_solution (terminates the loop)
 visualize_tool/
   view_trace.html # single-file viewer for batch/<task>/trace.json
-scripts/          # per-benchmark preprocessors (benchmark → problems.json)
-                  # — empty for now; see scripts/README.md
+scripts/
+  run_bare.py     # bare-model baseline runner (same problems.json,
+                  # single-shot LLM, no tool loop)
+                  # other per-benchmark preprocessors go here
 runs/             # per-run dirs; each holds run.yaml, problems.json,
                   # agent_output.json, batch/<task>/*
 SPEC.md           # contracts + invariants
