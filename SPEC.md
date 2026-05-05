@@ -1,79 +1,73 @@
 # ParallelMind Harness — Specification
 
-Reference for what this framework **is**, what guarantees it makes, and what
-its extension points are. Read `README.md` for tutorial-style onboarding; read
-this document to understand the contracts.
+Reference for what this framework **is**, what guarantees it makes, and
+what its extension points are. Read `README.md` for tutorial-style
+onboarding; read this document to understand the contracts.
 
 ---
 
 ## 1. Purpose
 
-ParallelMind Harness drives an LLM — via an OpenAI-compatible tool-calling
-endpoint — through benchmark-defined parallel programming tasks, then feeds
-each generated solution into the benchmark's own evaluator to produce
-correctness + performance numbers.
+ParallelMind Harness drives an LLM — via an OpenAI-compatible
+tool-calling endpoint — through pre-rendered programming tasks, runs
+each task in a sandboxed workspace, and emits a unified results JSON.
 
-It is **not** a parallel runtime, compiler, or scheduler. It is the glue
-between:
+It is **not** a parallel runtime, compiler, scheduler, or benchmark
+evaluator. It is glue between:
 
-* a vLLM-served model speaking OpenAI chat-completions,
-* a tool-calling loop with filesystem / shell / build tools,
-* per-benchmark adapters that translate between the benchmark's format and
-  the agent's internal format,
-* driver scripts that orchestrate generate → evaluate → metrics.
+- a vLLM-served model speaking OpenAI chat-completions,
+- a tool-calling loop with filesystem / shell / build tools,
+- a unified JSON-in/JSON-out contract that a benchmark-specific
+  preprocessor produces.
 
-Supported benchmarks today: **ParEval** (function-level prompts, 60 problems
-across OMP / MPI / CUDA / Kokkos / HIP / serial) and **HeCBench** (~500
-full-program heterogeneous benchmarks). Extending to a new suite is a
-~200-line adapter + a run script.
+The harness itself is benchmark-agnostic. Suite-specific code (ParEval,
+HeCBench, ParallelMind eval, …) lives outside the harness as
+preprocessing scripts that emit `problems.json` and downstream
+evaluators that consume the harness's output.
 
 ---
 
 ## 2. Architecture
 
-Four layers, top → bottom:
+Three layers, top → bottom:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ scripts/run_<bench>.py    orchestration: agent → eval → metrics│
+│ agent/batch.py            config-driven runner + concurrency │
 ├──────────────────────────────────────────────────────────────┤
-│ agent/batch.py            per-task runner + concurrency       │
-│ agent/adapters/<name>.py  benchmark ↔ AgentTask/AgentResult   │
+│ agent/loop.py             tool-calling agent loop            │
+│ agent/engine.py           OpenAI chat.completions wrapper    │
+│ agent/tools/*             FS / shell / build / submit tools  │
+│ agent/memory.py           persistent cross-run notes         │
 ├──────────────────────────────────────────────────────────────┤
-│ agent/loop.py             tool-calling agent loop             │
-│ agent/engine.py           OpenAI chat.completions wrapper     │
-│ agent/tools/*             FS / shell / build / submit tools   │
-│ agent/memory.py           persistent cross-run notes          │
-├──────────────────────────────────────────────────────────────┤
-│ agent/workspace.py        thread-local per-task working dir   │
-│ agent/submission.py       thread-local submit_solution sink   │
+│ agent/workspace.py        thread-local per-task working dir  │
+│ agent/submission.py       thread-local submit_solution sink  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Strict layering**: a layer calls only downward. Adapters never import
-`loop.py`; tools never import adapters. This keeps the loop benchmark-agnostic
-and the tools reusable across benchmarks.
+**Strict layering**: a layer calls only downward. Tools never reach
+into batch.py, the loop never imports the batch runner. The loop is
+benchmark-agnostic and the tools are reusable across runs.
 
 ---
 
 ## 3. Core data types
 
-Defined in `agent/adapters/base.py`. Both are `@dataclass` with no methods —
-they are pure data envelopes.
+Defined in `agent/types.py`. Both are `@dataclass` with no methods —
+pure data envelopes.
 
 ### `AgentTask`
 ```python
 id: str                          # unique problem identifier
 instruction: str                 # natural-language prompt for the agent
-metadata: dict[str, Any]         # pass-through — returned verbatim in AgentResult
+metadata: dict[str, Any]         # pass-through — copied to AgentResult
 ```
 
-* `id` doubles as the per-task workspace directory name, so it must be
+- `id` doubles as the per-task workspace directory name, so it must be
   filesystem-safe.
-* `instruction` is appended as the first `user` message. The system prompt
-  comes from `AgentConfig.system_prompt` + the memory index.
-* `metadata` is preserved untouched so `export()` can reconstruct the
-  benchmark-native record.
+- `instruction` is the first `user` message. The system prompt comes
+  from `RunConfig.system_prompt` + the memory index.
+- `metadata` is preserved untouched; output JSON copies it back.
 
 ### `AgentResult`
 ```python
@@ -86,46 +80,76 @@ steps: int
 elapsed_s: float
 submitted: bool                  # True iff submit_solution was called
 error: str | None
-metadata: dict                   # copy of AgentTask.metadata
+metadata: dict                   # copy of AgentTask.metadata + harness-internal additions
 ```
 
 If the agent never calls `submit_solution`, `batch.py` falls back to
-extracting the last fenced code block from `raw_reply`; `submitted` stays
-False.
+extracting the last fenced code block from `raw_reply`; `submitted`
+stays False.
 
 ---
 
-## 4. BenchmarkAdapter contract
+## 4. Input / output JSON contract
 
-```python
-class BenchmarkAdapter(ABC):
-    def load(self, path: str, **kwargs) -> list[AgentTask]: ...
-    def export(self, results: list[AgentResult], output_path: str) -> None: ...
+The harness's only external contract: read `problems.json`, write a
+results JSON. No template substitution, no benchmark-specific routing.
+
+### Input — `problems.json`
+
+```json
+[
+  {
+    "id":          "P001",
+    "prompt":      "...already-rendered text...",
+    "seed_files":  { "<relpath>": "<content>", ... },   // optional
+    "metadata":    { ... }                              // optional
+  }
+]
 ```
 
 **Invariants:**
 
-1. `load()` is pure — no network, no mutation of input files.
-2. For every task `t` produced by `load()`, `t.metadata` contains
-   enough information for `export()` to reproduce the benchmark-native
-   record without re-reading the benchmark repo.
-3. `export()` accepts results in any order; the output format must be
-   self-describing (including task ids / names) so it can be consumed by the
-   benchmark's native evaluator.
-4. Any normalization of model output (stripping fences, signatures, etc.)
-   happens in `export()`, not in `loop.py`. The adapter is the only layer
-   that knows what the benchmark's evaluator accepts.
+1. `id` values are unique within a file. The harness rejects
+   duplicates at load time.
+2. `prompt` is the verbatim user message — the harness performs no
+   `{{var}}` substitution. The producing script is responsible for
+   rendering whatever template it likes.
+3. `seed_files` keys are forward-slash relative paths. Absolute paths
+   and `..` segments are rejected. Nested directories are created
+   automatically. Each file is written into the per-task workspace
+   before the agent loop starts.
+4. `metadata` is copied verbatim into the matching output entry. The
+   harness never reads its keys (one exception: a harness-internal
+   `workspace` key is added during execution and stripped before
+   export).
 
-Registered in `agent/batch.py::ADAPTERS` — a string key routes
-`--adapter <name>` on the batch CLI.
+### Output
 
-**Optional workspace pre-seeding.** An adapter may set
-`task.metadata["seed_dir"] = "<path>"`. Before the agent loop
-starts, `batch.py` copies every file in that directory into the
-per-task workspace (shallow, skips dotfiles). Lets the agent call
-build tools against headers / reference files without needing a
-`write_file` per dependency. HeCBench uses this to ship
-`reference.h` alongside the agent's main source.
+`<output>.json`:
+```json
+[
+  {
+    "id":         "P001",
+    "code":       "...submitted source...",
+    "submitted":  true,
+    "steps":      21,
+    "elapsed_s":  356.0,
+    "error":      null,
+    "metadata":   { ... passthrough ... }     // omitted if empty
+  }
+]
+```
+
+`<output_stem>.code.json` (always written):
+```json
+[ {"id": "P001", "code": "..."}, ... ]
+```
+Only entries where `submitted=True` and `code` is non-empty appear.
+Convenient for piping into a downstream evaluator.
+
+**Crash-safe incremental export**: after each task completes,
+`batch.py` re-serializes the full partial result set. A crash mid-run
+leaves a valid (partial) output JSON.
 
 ---
 
@@ -138,25 +162,25 @@ decorator (`agent/tools/base.py`). The decorator:
 2. builds a JSON-schema parameter object,
 3. appends the function to a module-level registry keyed by name.
 
-`Agent.run()` calls `tools.base.schemas()` once to get the schema list for
-the LLM, and `tools.base.dispatch(name, args)` to execute each tool call.
+`Agent.run()` calls `tools.base.schemas()` once to get the schema list
+for the LLM, and `tools.base.dispatch(name, args)` to execute each
+tool call.
 
 **Invariants:**
 
-* Every tool has a single-string return value. Truncation happens at the
-  loop boundary (16 KB, in `agent/loop.py`), not in the tool.
-* Tools are pure Python callables — no async, no generators.
-* File-modifying tools (`write_file`, `edit_file`, `omp_build_and_run`,
-  etc.) operate within the current workspace root; paths resolve via
+- Every tool returns a single string. Truncation happens at the loop
+  boundary (16 KB, in `agent/loop.py`), not in the tool.
+- Tools are pure Python callables — no async, no generators.
+- File-modifying tools (`write_file`, `edit_file`, `omp_build_and_run`,
+  …) operate within the current workspace root; paths resolve via
   `agent.workspace.resolve()` which blocks escaping via `..`.
-* `submit_solution` is the only tool that terminates the loop. It sets a
-  thread-local value read by the loop at end-of-turn.
-* `remember` / `recall` are the only tools allowed to write outside the
-  workspace (they target `memory/`).
-* **`read_file` is paginated** (`offset` + `limit`, default 200 lines).
-  Responses start with a `[lines X–Y of N]` header so the agent knows
-  where to continue. For files whose content exceeds the 16 KB cap even
-  after this, the agent re-reads with a smaller `limit`.
+- `submit_solution` is the only tool that terminates the loop. It
+  sets a thread-local value read by the loop at end-of-turn.
+- `remember` / `recall` are the only tools allowed to write outside
+  the workspace (they target `memory/`).
+- **`read_file` is paginated** (`offset` + `limit`, default 200
+  lines). Responses start with a `[lines X–Y of N]` header so the
+  agent knows where to continue.
 
 Available tools today:
 
@@ -180,8 +204,8 @@ Available tools today:
 
 ## 6. Agent loop contract
 
-`agent/loop.py::Agent.run(task, time_budget_s)` is the only place the LLM
-is invoked. One turn =
+`agent/loop.py::Agent.run(task, time_budget_s)` is the only place the
+LLM is invoked. One turn =
 
 1. Call `engine.chat(messages, tools=schemas)`.
 2. Append assistant message (with `tool_calls` if any).
@@ -189,102 +213,75 @@ is invoked. One turn =
    `content` so it's echoed on the next turn.
 4. If no tool calls: send an idle-nudge; after `_MAX_IDLE_TURNS=3`
    consecutive idle turns, stop.
-5. Otherwise, dispatch each tool call sequentially, append the result as a
-   `tool` message, log to `tool_call_log`.
+5. Otherwise, dispatch each tool call sequentially, append the result
+   as a `tool` message, log to `tool_call_log`.
 6. If `submission.get() is not None`, the loop exits successfully.
 
-Exits: successful submission, time budget exceeded, `max_steps` reached,
-or idle-streak exceeded. Every exit produces an `AgentResult` — the loop
-never raises to its caller except for engine / network errors, which
-`batch.py` catches and records as `error`.
+Exits: successful submission, time budget exceeded, `max_steps`
+reached, or idle-streak exceeded. Every exit produces an `AgentResult`
+— the loop never raises to its caller except for engine / network
+errors, which `batch.py` catches and records as `error`.
 
 ---
 
 ## 7. Configuration model
 
-Two YAML files per run, under `runs/<bench>/<run-name>/`:
-
-### `agent.yaml` — shared across benchmarks
-Dataclasses in `agent/config.py::AgentConfig`:
+A single YAML drives a run. Schema in `agent/config.py::RunConfig`:
 
 ```yaml
 model:
-  name:        <str>     # e.g. openai/gpt-oss-120b
+  name:        <str>     # e.g. openai/Qwen3-Coder-30B-A3B-Instruct
   base_url:    <str>     # vLLM OpenAI endpoint
   api_key:     <str>     # usually "EMPTY"
   temperature: <float>
   max_tokens:  <int>
   reasoning:   <bool>    # echo model's chain-of-thought back each turn
+
 agent:
   max_steps:   <int>     # hard cap on loop iterations
   time_budget: <int>     # per-task wall-clock seconds
-  workers:    <int>     # concurrent tasks
+  workers:     <int>     # concurrent tasks (threads)
+
+io:
+  input:           <abs path to problems.json>
+  output:          <abs path to results JSON>
+  workspace_root:  <abs path; per-task subdirs created here>
+
+# One of:
 system_prompt: |
   <multiline task-specific guidance>
+# or
+system_prompt_file: <path>
 ```
 
 The system prompt is concatenated with the auto-loaded memory index
-(`memory/MEMORY.md`) to produce the final system message.
-
-### `config.yaml` — benchmark-specific
-One dataclass per benchmark. Current entries:
-
-* `ParevalBenchmarkConfig` — `problem_set` (omp / mpi / cuda / ...),
-  `launch_configs`, `build_timeout`, `run_timeout`.
-* `HeCBenchBenchmarkConfig` — `target` (the parallel model to
-  produce: cuda / omp / hip / sycl), `serial_root` (dir of
-  pre-generated serial C++ sources), `src_root` (HeCBench `src/`
-  tree used for the reference baseline), `names`, `categories`
-  (optional filters), `repeat` (autohecbench `-r`), `nvidia_sm`
-  (compute capability for autohecbench baseline timing, e.g. 89 for
-  RTX 4090 — not seen by the agent, which probes the GPU itself via
-  the `hardware_info` tool).
-
-Adding a benchmark = add another dataclass + `from_yaml` classmethod.
+(`memory/MEMORY.md`) to produce the final system message. If both
+`system_prompt` and `system_prompt_file` are set, the inline string
+wins.
 
 ---
 
 ## 8. Run output layout
 
-Runs are grouped per-benchmark under `runs/<bench>/<run-name>/`, so
-ParEval and HeCBench artifacts don't mix:
+Everything for a run lives under whatever directory you choose; the
+harness only manages `io.output` and `io.workspace_root`:
 
 ```
-runs/
-  pareval/
-    _shared/                     # shared inputs (launch-configs, ...)
-    _analysis/                   # cross-run aggregate CSVs/MDs
-    <run-name>/
-      agent.yaml                 # input: agent/model config
-      config.yaml                # input: benchmark config
-      system_prompt.txt          # derived: system_prompt excerpted from agent.yaml
-      agent_output.json          # stage 1 output (adapter-normalized)
-      results.json / results.csv / metrics.csv
-      batch/<task_id>/           # per-task workspace
-        trace.json               # full message history
-        tool_calls.jsonl         # step-indexed tool log
-        summary.json             # steps / elapsed / submitted / error
-        solution.cpp             # canonical TU evaluated by the benchmark
-        *.cpp, a.out             # agent scratch files
-      scratch/                   # ParEval's own eval scratch
-  hecbench/
-    <run-name>/
-      agent.yaml / config.yaml / system_prompt.txt / agent_output.json
-      batch/<name>/              # per-task workspace, pre-seeded with
-                                 # serial main.cpp + reference.h
-      scratch/<name>-<target>/   # mirrored src dir with agent's candidate
-                                 # main source substituted (Stage 2)
-      baseline.csv               # Stage 3a: autohecbench timings on src
-      candidate.csv              # Stage 3b: autohecbench timings on scratch
-      speedup.md                 # Stage 4: autohecbench-compare output
-      results.json / results.csv # Stage 4: merged per-task records
+<run-dir>/
+  run.yaml                         # input: config
+  problems.json                    # input: pre-rendered prompts
+  agent_output.json                # output: per-task results
+  agent_output.code.json           # auxiliary: [{id, code}, ...]
+  batch/<task_id>/                 # per-task workspace
+    trace.json                     # full message history
+    tool_calls.jsonl               # step-indexed tool log
+    summary.json                   # steps / elapsed / submitted / error
+    *.cu, *.cpp, a.out             # whatever the agent wrote
 ```
 
-The `solution.cpp` in each `batch/<task_id>/` (ParEval) is guaranteed
-to be the exact TU the benchmark compiled (`prompt + normalized
-output`). For HeCBench, the evaluated source lives at
-`scratch/<name>-<target>/main.cu` (or `main.cpp`) — each benchmark is
-compiled and run by `autohecbench.py` via its own Makefile.
+Filenames inside `batch/<task_id>/` aren't enforced by the harness —
+the agent can write anything. `trace.json` / `tool_calls.jsonl` /
+`summary.json` are produced by `batch.py` after the loop finishes.
 
 ---
 
@@ -292,123 +289,73 @@ compiled and run by `autohecbench.py` via its own Makefile.
 
 `memory/` stores persistent notes usable across runs.
 
-* `MEMORY.md` is the index — one line per memory: `- [title](file.md) — hook`.
-* Per-memory files have YAML frontmatter (`name`, `description`, `type`).
-* The `remember` tool writes both the file and the index line atomically.
-* The `recall` tool reads a memory file by filename.
-* `prompts.build_system_prompt()` always loads the index and injects it
-  under a `## Memory` section in the system message.
+- `MEMORY.md` is the index — one line per memory:
+  `- [title](file.md) — hook`.
+- Per-memory files have YAML frontmatter (`name`, `description`,
+  `type`).
+- The `remember` tool writes both the file and the index line
+  atomically.
+- The `recall` tool reads a memory file by filename.
+- `prompts.build_system_prompt()` always loads the index and injects
+  it under a `## Memory` section in the system message.
 
-Memory is **optional** and **inspectable** — nothing in the loop requires a
-memory entry to exist. The index is truncated to fit the context window.
-
----
-
-## 10. Scripts
-
-### `scripts/run_pareval.py`
-Three-stage pipeline: agent (via `agent.batch`) → ParEval eval
-(`drivers/run-all.py`) → metrics (`analysis/metrics.py`). Writes
-`solution.cpp` in each task dir after stage 1 so evaluated TU is
-always inspectable.
-
-### `scripts/run_bare.py`
-Non-agent baseline that wraps ParEval's own `generate-openai-vllm.py`.
-Output is post-processed through the adapter's `normalize()` so numbers
-are apples-to-apples with agent mode.
-
-### `scripts/run_hecbench.py`
-Four-stage pipeline:
-
-1. **Agent** via `agent.batch` with the HeCBench adapter — produces
-   `agent_output.json`.
-2. **Scratch tree** — mirrors `src/<name>-<target>/` →
-   `scratch/<name>-<target>/` per submitted entry, overwriting the
-   main source with the agent's candidate. Original HeCBench tree
-   is never modified.
-3. **Timing** — invokes `benchmarks/HeCBench/src/scripts/autohecbench.py`
-   twice (against `src/` and against `scratch/`) to produce
-   `baseline.csv` and `candidate.csv`. Each row has `config.repeat`
-   timing samples.
-4. **Compare** — runs `autohecbench-compare.py`, writes
-   `speedup.md` + merged `results.json` / `results.csv`.
-
-Delegating to HeCBench's own scripts (instead of reimplementing
-build+time+parse) means the numbers are directly comparable to
-HeCBench-published results.
-
-### `scripts/gen_serial_hecbench.py`
-One-shot LLM utility that produces serial CPU versions of HeCBench
-benchmarks for use as "serial → parallel" task prompts. For each
-`src/<name>-<src-model>/` (default `--src-model omp`), pulls the
-main source file (or merges multiple sources when needed), asks the
-model to strip parallel directives, and writes the result to
-`benchmarks/HeCBench/serial/<name>/main.cpp`. Copies sibling headers
-(including cross-directory ones referenced via `-I../xxx/` in the
-Makefile) so each serial dir is self-contained. `.meta.json` per
-benchmark records the `args` / `regex` / `timeout` / `categories`
-from `benchmarks.yaml` so the adapter can build prompts without
-re-scanning. Supports `--workers`, `--limit`, `--names`,
-`--categories`, `--overwrite`.
-
-### `scripts/gen_hecbench_yaml.py`
-Regenerates `benchmarks/HeCBench/benchmarks.yaml` from upstream
-`src/<name>-<model>/CMakeLists.txt` + `src/scripts/benchmarks/subset.json`.
-Replaces HeCBench's own `tools/generate_metadata.py` whose category
-parsing leaks adjacent CMake tokens. `--check` diffs against the
-shipped yaml without writing.
-
-### `scripts/view_trace.html`
-Single-file HTML viewer for `batch/<task>/trace.json`. Runs entirely in
-the browser; no backend.
+Memory is **optional** and **inspectable** — nothing in the loop
+requires a memory entry to exist. The index is truncated to fit the
+context window.
 
 ---
 
-## 11. Invariants and non-goals
+## 10. Invariants and non-goals
 
 ### Invariants
-1. **No benchmark-specific logic in `loop.py` or `tools/`**. Everything
-   benchmark-aware lives in `adapters/` or `scripts/run_<bench>.py`.
-2. **Workspace isolation**: each task's filesystem effects are confined
-   to its `batch/<task_id>/` directory. Tool dispatch resolves paths
-   through `workspace.resolve()` which rejects `..` escapes.
+1. **No benchmark-specific logic anywhere in the harness**. All
+   benchmark-aware logic lives in external preprocessing scripts that
+   emit `problems.json`.
+2. **Workspace isolation**: each task's filesystem effects are
+   confined to its `batch/<task_id>/` directory. Tool dispatch
+   resolves paths through `workspace.resolve()` which rejects `..`
+   escapes.
 3. **Thread safety via thread-locals**: `workspace.set_root()` and
    `submission.reset()` are thread-local, so `workers: N` in config
    produces N independent agent runs without mutex.
-4. **Deterministic re-runs**: with `temperature: 0.0` and `--skip-agent`,
-   the eval pipeline produces identical results across invocations. The
-   agent stage is only non-deterministic if temperature > 0 or the vLLM
-   server is under concurrent load from multiple workers (known vLLM
-   quirk).
+4. **Deterministic re-runs**: with `temperature: 0.0`, the same
+   `problems.json` produces near-identical output across runs. (Some
+   non-determinism remains under concurrent vLLM load; known quirk.)
 5. **Crash-safe incremental export**: after each task completes,
-   `batch.py` re-serializes the full partial result set. A crash mid-run
-   leaves a valid (partial) `agent_output.json`.
+   `batch.py` re-serializes the full partial result set.
 
 ### Non-goals
-* **No distributed scheduling**: workers are threads in one process. For
-  multi-host runs, launch N instances with disjoint `--limit` slices.
-* **No sandboxing beyond `subprocess` + `cwd`**: the `bash` tool can
+- **No distributed scheduling**: workers are threads in one process.
+  For multi-host runs, split `problems.json` and launch N instances.
+- **No sandboxing beyond `subprocess` + `cwd`**: the `bash` tool can
   read anything the process can read. Run in a constrained container
   for untrusted models.
-* **No automatic benchmark patching**: known upstream bugs (e.g., ParEval
-  07's FFT) are documented in the README's *Known issues / local
-  patches* section and must be applied manually when the benchmark
-  repo is re-cloned.
-* **No caching of model responses**: every run re-issues every prompt.
+- **No template substitution**: the harness will not interpret
+  `{{var}}` or any other syntax in `prompt`. Render externally.
+- **No caching of model responses**: every run re-issues every
+  prompt.
+- **No benchmark evaluator integration**: validating correctness or
+  measuring performance is a downstream concern. The harness emits
+  `code`; the consumer evaluates.
 
 ---
 
-## 12. Extension checklist — adding a benchmark
+## 11. Extension — running a new benchmark
 
-1. Clone benchmark into `benchmarks/<name>/` (gitignored).
-2. Implement `agent/adapters/<name>.py`:
-   * `load(path, **kwargs) → list[AgentTask]` — filter + wrap as tasks.
-   * `export(results, output_path) → None` — serialize to benchmark's
-     native format, including any output normalization.
-3. Add `<Name>BenchmarkConfig` dataclass to `agent/config.py` with a
-   `from_yaml` classmethod.
-4. Register in `agent/batch.py::ADAPTERS`.
-5. Write `scripts/run_<name>.py` mirroring `run_pareval.py`: stage 1
-   calls `python -m agent.batch --adapter <name> ...`; later stages
-   invoke the benchmark's evaluator.
-6. Document known bugs / local patches in `DEV_NOTES.md`.
+There is no harness-side change required. Write a small preprocessing
+script that walks the benchmark's source tree and emits a
+`problems.json`. For each problem:
+
+1. Render whatever prompt / instructions you want into `prompt`.
+2. If the task needs scaffolding files (headers, datasets, reference
+   sources), inline them into `seed_files`.
+3. Put any downstream-consumer-relevant fields (category, expected
+   validation type, parallelism model, ...) into `metadata`.
+
+Then write a `run.yaml` pointing at the output and run
+`python -m agent.batch --config run.yaml`. The result JSON has
+everything a downstream evaluator needs (id, code, metadata
+passthrough, submitted flag).
+
+`eval/build_problems_json.py` (in this repo) is a 30-line example
+that converts ParallelMind's own benchmarks into the harness format.

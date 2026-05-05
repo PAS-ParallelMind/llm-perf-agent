@@ -7,7 +7,7 @@ from typing import Any
 from rich.console import Console
 
 from . import submission
-from .adapters.base import AgentResult, AgentTask
+from .types import AgentResult, AgentTask
 from .engine import Engine
 from .memory import load_index
 from .prompts import build_system_prompt
