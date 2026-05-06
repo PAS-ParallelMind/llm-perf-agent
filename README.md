@@ -199,9 +199,11 @@ python scripts/run_cudamicrobench_experiment.py \
 The wrapper writes `runs/cudamicrobench/problems.json`, creates
 `runs/cudamicrobench/run.yaml`, runs `agent.batch`, then evaluates each
 modified workspace with `scripts/eval_cudamicrobench.py`. Add
-`--eval-no-tests` when CUDA builds are available but `nvprof` is not.
+`--eval-no-tests` when CUDA builds are available but runtime tests are not.
 The agent can call `cuda_guided_profile` for broad-to-narrow Nsight
 Compute feedback, then `cuda_profile` for focused before/after timing.
+On newer GPUs, `cuda_profile` prefers local Nsight Compute (`ncu`) over
+legacy `nvprof`.
 
 ## Trace viewer
 

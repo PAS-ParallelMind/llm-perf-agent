@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 from pathlib import Path
 
 
@@ -30,26 +31,6 @@ COMMON_ALLOWLIST = {
     "helper_timer.h",
 }
 
-
-SUMMARY = {
-    "WarpDivRedux": ("warp divergence", "change the algorithm to reduce divergent branches"),
-    "DynParallel": ("nested parallelism", "use CUDA dynamic parallelism where appropriate"),
-    "Conkernels": ("serialized kernel launches", "use concurrent kernels"),
-    "TaskGraph": ("repeated task submission overhead", "use CUDA graphs"),
-    "Shmem": ("repeated global memory access", "use shared memory"),
-    "CoMem_AXPY": ("uncoalesced memory access", "coalesce accesses across threads"),
-    "CoMem_SpMM": ("uncoalesced sparse matrix access", "coalesce accesses across threads"),
-    "MemAlign": ("unaligned allocation", "use aligned allocation/access"),
-    "GSOverlap": ("global-to-shared copy overhead", "overlap copies with computation"),
-    "BankRedux": ("shared-memory bank conflicts", "avoid bank conflicts"),
-    "HDOverlap": ("host-device copy overhead", "use asynchronous copies and overlap"),
-    "ReadOnlyMem_1D_Texture": ("read-only 1D data access", "use read-only or texture memory"),
-    "ReadOnlyMem_2D_Texture": ("read-only 2D data access", "use read-only or texture memory"),
-    "UniMem": ("low managed-memory access density", "reduce unnecessary page movement"),
-    "MiniTransfer_SpMV": ("inefficient transfer layout", "avoid useless host-device transfers"),
-    "Shuffle/cuda_global": ("inter-thread data exchange through memory", "use warp shuffle"),
-    "Shuffle/cuda_shuffle": ("warp-level data exchange", "use shuffle efficiently"),
-}
 
 DEFAULT_SELECTION = [
     "HDOverlap",
@@ -158,21 +139,51 @@ def infer_profile_command(bench_dir: Path) -> str | None:
     return None
 
 
+def strip_nvprof(line: str) -> str:
+    """Return the benchmark invocation from a test.sh line.
+
+    Several CUDAMicroBench tests use nvprof, which does not run on newer
+    NVIDIA GPUs. For validation we only need the benchmark program output, so
+    keep the executable and its arguments.
+    """
+    parts = shlex.split(line)
+    if not parts:
+        return ""
+    if parts[0] != "nvprof":
+        return shlex.join(parts)
+    for i, part in enumerate(parts[1:], start=1):
+        if part.startswith("./") or "/" in part:
+            return shlex.join(parts[i:])
+    return shlex.join(parts[1:])
+
+
+def infer_test_command(bench_dir: Path) -> str | None:
+    test_sh = bench_dir / "test.sh"
+    if not test_sh.exists():
+        return None
+    commands = []
+    for line in read_text(test_sh).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        commands.append(strip_nvprof(line))
+    return " && ".join(cmd for cmd in commands if cmd) or None
+
+
 def make_prompt(
     rel_dir: str,
     test_cmd: str | None,
     profile_cmd: str | None,
     sources: list[str],
 ) -> str:
-    problem, technique = SUMMARY.get(rel_dir, ("CUDA performance inefficiency", "improve CUDA performance"))
     source_list = "\n".join(f"- `{p}`" for p in sources) or "- inspect `Makefile` and source files"
     test_line = f"`cd {rel_dir} && {test_cmd}`" if test_cmd else "no `test.sh`; use the profile command and build result"
     profile_line = f"`cd {rel_dir} && {profile_cmd}`" if profile_cmd else "`cd {rel_dir} && make`, then inspect the produced executable"
     source_arg = sources[0] if sources else f"{rel_dir}/<source-file>"
     run_arg = profile_cmd or "./<executable>"
     test_cmd_arg = test_cmd or "./<executable>"
-    return f"""CUDAMicroBench task `{rel_dir}` demonstrates {problem}.
-Goal: improve the CUDA implementation using this intended technique: {technique}.
+    return f"""CUDAMicroBench task `{rel_dir}`.
+Goal: improve performance while preserving correctness and the existing command-line interface.
 
 Editable source files:
 {source_list}
@@ -181,20 +192,19 @@ Required workflow:
 1. Call `hardware_info` once.
 2. Read `Makefile` and the editable source files. Do not rename files and do not invent source filenames.
 3. Build exactly with `cd {rel_dir} && make`.
-4. Profile exactly with {profile_line}. If the binary is missing, build first rather than changing filenames.
-5. Edit only the listed source files, preserving program behavior and command-line interface.
+4. Profile exactly with {profile_line}. Use cuda_profile and the returned profile_information to identify the bottleneck. If the binary is missing, build first rather than changing filenames.
+5. Edit only the listed source files, preserving program behavior and command-line interface. Make changes justified by profile evidence.
 6. Rebuild with `cd {rel_dir} && make`.
 7. Validate with {test_line}.
-8. Use `cuda_profile` for focused before/after timing if needed.
-9. Call `submit_solution` with a concise summary of changed files and measured result.
+8. Use `cuda_profile` for focused before/after timing. Keep `timeline="auto"` so the profiler can add Nsight Systems timeline facts when the ncu facts indicate they are useful.
+9. Call `submit_solution` with a concise summary of changed files and measured before/after result. If no measured improvement is found, say so clearly.
 
 Tool call templates to follow:
 - `hardware_info()`
 - `read_file(path="{rel_dir}/Makefile")`
 - `read_file(path="{source_arg}")`
-- `cuda_guided_profile(workdir="{rel_dir}", build_command="make", run_command="{run_arg}", detailed=true)`
+- `cuda_profile(workdir="{rel_dir}", build_command="make", run_command="{run_arg}", repeats=3, timeline="auto")`
 - Edit only the listed source files with `edit_file` or `write_file`.
-- `cuda_profile(workdir="{rel_dir}", build_command="make", run_command="{run_arg}", repeats=3)`
 - `bash(command="cd {rel_dir} && {test_cmd_arg}")`
 - `submit_solution(code="Changed <files>; build/test passed; measured result: <brief summary>.")`
 
@@ -203,7 +213,7 @@ Do not use `nvcc_build_and_run` for this benchmark unless the Makefile is unusab
 
 def build_problem(root: Path, bench_dir: Path, include_common: bool) -> dict[str, object]:
     rel_dir = bench_dir.relative_to(root).as_posix()
-    test_cmd = "sh test.sh" if (bench_dir / "test.sh").exists() else None
+    test_cmd = infer_test_command(bench_dir)
     profile_cmd = infer_profile_command(bench_dir)
     sources = editable_sources(root, bench_dir)
     return {
