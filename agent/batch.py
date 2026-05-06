@@ -212,11 +212,28 @@ def run_from_config(config_path: str,
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # --- Skip existing ---
+    # Seed `results` with previously-successful entries so re-export
+    # preserves them. Otherwise --skip-existing would clobber prior
+    # successes the moment any new result is written.
     done_ids: set[str] = set()
+    preserved: list[AgentResult] = []
     if skip_existing and out_path.exists():
         try:
             existing = json.loads(out_path.read_text())
-            done_ids = {e["id"] for e in existing if e.get("submitted")}
+            for e in existing:
+                if not e.get("submitted"):
+                    continue
+                preserved.append(AgentResult(
+                    task_id=e["id"],
+                    code=e.get("code", ""),
+                    raw_reply="",
+                    steps=e.get("steps", 0),
+                    elapsed_s=e.get("elapsed_s", 0.0),
+                    submitted=True,
+                    error=e.get("error"),
+                    metadata=dict(e.get("metadata") or {}),
+                ))
+                done_ids.add(e["id"])
         except Exception:
             pass
 
@@ -244,7 +261,7 @@ def run_from_config(config_path: str,
         system_prompt = Path(cfg.system_prompt_file).read_text()
 
     # --- Run ---
-    results: list[AgentResult] = []
+    results: list[AgentResult] = list(preserved)
     results_lock = threading.Lock()
 
     def _run_task(idx: int, task: AgentTask) -> AgentResult:
