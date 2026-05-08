@@ -32,6 +32,9 @@ Output
   ``eval_results.json``  list of ``{id, submitted, validation?, speedup?}``
                          aligned 1:1 with the input. Non-submitted entries
                          have ``validation=null, speedup=null``.
+  ``eval_results.summary.json``
+                         sidecar aggregate metrics, including pass@k when
+                         validation is enabled.
 
 Usage
 -----
@@ -43,6 +46,7 @@ Usage
       [--problem P001]                 # restrict to one id
       [--workers N] [--n-runs 3] [--timeout 120]
       [--repeat-validation 3] [--speedup-inputs 3]
+      [--pass-at-k 1,5,10]
       [--speedup-all]                  # measure speedup even when
                                        #   validation fails
       [--keep-tempdir]                 # don't auto-delete per-task work
@@ -448,6 +452,80 @@ def _all_pass(summary: dict[str, Any]) -> bool:
     return (summary["pass_byte"]
             + summary["pass_checker"]
             + summary["pass_llm"]) == total
+
+
+def _parse_k_values(raw: str) -> list[int]:
+    try:
+        vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise SystemExit("--pass-at-k must be a comma-separated list of integers")
+    if not vals:
+        raise SystemExit("--pass-at-k must contain at least one integer")
+    if any(k < 1 for k in vals):
+        raise SystemExit("--pass-at-k values must be >= 1")
+    return sorted(set(vals))
+
+
+def _pass_at_k_unbiased(n: int, c: int, k: int) -> float | None:
+    if n < k:
+        return None
+    if c <= 0:
+        return 0.0
+    if n - c < k:
+        return 1.0
+    return 1.0 - (math.comb(n - c, k) / math.comb(n, k))
+
+
+def _summary_out_path(out_path: Path) -> Path:
+    if out_path.suffix:
+        return out_path.with_name(f"{out_path.stem}.summary{out_path.suffix}")
+    return out_path.with_name(f"{out_path.name}.summary.json")
+
+
+def summarize_pass_at_k(results: list[dict[str, Any]],
+                        problems: dict[str, Any],
+                        k_values: list[int]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for r in results:
+        pid = r.get("id")
+        if pid not in problems:
+            continue
+        grouped.setdefault(pid, []).append(r)
+
+    per_problem: dict[str, dict[str, Any]] = {}
+    for pid, group in sorted(grouped.items()):
+        n = len(group)
+        c = sum(
+            1 for r in group
+            if r.get("validation") and _all_pass(r["validation"]["summary"])
+        )
+        row: dict[str, Any] = {"n": n, "c": c}
+        for k in k_values:
+            v = _pass_at_k_unbiased(n, c, k)
+            if v is not None:
+                row[f"pass@{k}"] = round(v, 10)
+        per_problem[pid] = row
+
+    metrics: dict[str, dict[str, Any]] = {}
+    total = len(per_problem)
+    for k in k_values:
+        key = f"pass@{k}"
+        vals = [p[key] for p in per_problem.values() if key in p]
+        metrics[key] = {
+            "value": round(sum(vals) / len(vals), 10) if vals else None,
+            "eligible_problems": len(vals),
+            "total_problems": total,
+        }
+
+    return {
+        "pass_at_k": {
+            "k_values": k_values,
+            "group_by": "id",
+            "formula": "unbiased",
+            "metrics": metrics,
+            "problems": per_problem,
+        }
+    }
 
 
 def validate_one(prob: dict[str, Any], code: str, language: str, *,
@@ -869,6 +947,8 @@ def main() -> None:
                     help="Run each candidate/input N times during validation")
     ap.add_argument("--speedup-inputs", type=int, default=1,
                     help="Number of generated inputs to use for speedup")
+    ap.add_argument("--pass-at-k", default="1,5,10",
+                    help="Comma-separated k values for pass@k summary")
     ap.add_argument("--timeout", type=int, default=120,
                     help="Per-binary run timeout (seconds)")
     ap.add_argument("--llm-base-url", default=DEFAULT_LLM_BASE_URL)
@@ -884,6 +964,7 @@ def main() -> None:
         sys.exit("--repeat-validation must be >= 1")
     if args.speedup_inputs < 1:
         sys.exit("--speedup-inputs must be >= 1")
+    pass_at_k = _parse_k_values(args.pass_at_k)
 
     bench_path = Path(args.benchmarks).resolve()
     in_path    = Path(args.input).resolve()
@@ -1008,6 +1089,11 @@ def main() -> None:
 
     out_path.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out_path}")
+    if do_validate:
+        summary_path = _summary_out_path(out_path)
+        summary = summarize_pass_at_k(results, problems, pass_at_k)
+        summary_path.write_text(json.dumps(summary, indent=2))
+        print(f"wrote {summary_path}")
 
     # Final summary
     n = len(results)
@@ -1017,6 +1103,12 @@ def main() -> None:
     if do_validate:
         print(f"  {n_pass}/{n} fully pass"
               + (f"   {n_sp} with speedup" if do_speedup else ""))
+        pk = summary["pass_at_k"]["metrics"]
+        pk_str = " ".join(
+            f"{key}={val['value'] if val['value'] is not None else 'n/a'}"
+            for key, val in pk.items()
+        )
+        print(f"  {pk_str}")
     else:
         print(f"  validation skipped"
               + (f"   {n_sp}/{n} with speedup" if do_speedup else ""))

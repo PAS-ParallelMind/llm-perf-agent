@@ -52,12 +52,29 @@ silently decide correctness for cases where byte comparison is insufficient.
 - This avoids multiple workers competing for the GPU during timing, which makes
   speedup numbers more stable.
 
+## pass@k Metric Changes
+
+- Added `--pass-at-k`, defaulting to `1,5,10`.
+- pass@k is computed after validation when validation is enabled.
+- Multiple entries with the same problem `id` are treated as multiple samples
+  for that problem.
+- A sample is counted as correct only when its validation summary fully passes.
+- The metric uses the unbiased estimator:
+  `1 - comb(n - c, k) / comb(n, k)`.
+- Problems with fewer than `k` samples are excluded from that specific
+  aggregate.
+- The original evaluation output remains a list, and aggregate pass@k metrics
+  are written to a sidecar file named `<out_stem>.summary.json`.
+
 ## Compatibility Notes
 
 - `--repeat-validation` defaults to `1`, so existing validation behavior remains
   fast by default.
 - `--speedup-inputs` defaults to `1`, preserving the old single-input speedup
   behavior unless explicitly changed.
+- `--pass-at-k` defaults to `1,5,10`.
+- The main `--out` JSON shape is unchanged; pass@k is stored in a sidecar
+  summary file.
 - Existing top-level speedup JSON keys are still present.
 - The legacy scripts `eval/validate.py` and `eval/measure_speedup.py` were not
   changed.
