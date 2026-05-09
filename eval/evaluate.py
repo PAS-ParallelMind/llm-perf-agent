@@ -15,8 +15,9 @@ Per submitted entry, the pipeline is:
      to produce K inputs, then for each input compare bytes:
        - bytes equal                       → PASS_BYTE
        - bytes differ + checker            → PASS_CHECKER / FAIL
-       - bytes differ + non-byte-det       → LLM judge (PASS_LLM / FAIL /
-                                              ERROR_LLM)
+       - bytes differ + non-byte-det       → MISSING_CHECKER by default;
+                                              optional LLM judge only with
+                                              --allow-llm-judge
        - bytes differ + byte-deterministic → FAIL (no LLM fallback)
 
   2. **Measure speedup** (only if validation is fully-pass). Time the
@@ -31,6 +32,9 @@ Output
   ``eval_results.json``  list of ``{id, submitted, validation?, speedup?}``
                          aligned 1:1 with the input. Non-submitted entries
                          have ``validation=null, speedup=null``.
+  ``eval_results.summary.json``
+                         sidecar aggregate metrics, including pass@k when
+                         validation is enabled.
 
 Usage
 -----
@@ -38,9 +42,11 @@ Usage
       --input runs/agent_v3/agent_output.json \\
       --out   runs/agent_v3/eval_results.json
       [--no-validate | --no-speedup]
-      [--no-llm]                       # skip LLM judge fallback
+      [--allow-llm-judge]              # permit LLM judge fallback
       [--problem P001]                 # restrict to one id
       [--workers N] [--n-runs 3] [--timeout 120]
+      [--repeat-validation 3] [--speedup-inputs 3]
+      [--pass-at-k 1,5,10]
       [--speedup-all]                  # measure speedup even when
                                        #   validation fails
       [--keep-tempdir]                 # don't auto-delete per-task work
@@ -232,21 +238,30 @@ def run_gen_input(workdir: Path, gen_block: dict[str, Any],
     return True, "", inputs
 
 
-def gen_one_input_for_speedup(gen_block: dict[str, Any],
-                               workdir: Path) -> Path | None:
-    """Like run_gen_input but forces --count 1 to keep speedup runs fast."""
+def gen_inputs_for_speedup(gen_block: dict[str, Any], workdir: Path,
+                           count: int) -> list[Path] | None:
+    """Like run_gen_input but forces --count so timing stays bounded."""
     src = workdir / ("gen_input" + EXT_FOR_LANG.get(
         gen_block.get("language", "python"), ".py"))
     src.write_text(gen_block["code"])
     args2 = list(gen_block.get("default_args", []))
     if "--count" in args2:
-        args2[args2.index("--count") + 1] = "1"
+        args2[args2.index("--count") + 1] = str(count)
+    else:
+        args2.extend(["--count", str(count)])
     p = subprocess.run([sys.executable, str(src), *args2],
                        cwd=workdir, capture_output=True, timeout=120)
     if p.returncode != 0:
         return None
-    inp = workdir / "inputs" / "input_0.bin"
-    return inp if inp.is_file() else None
+    inputs = sorted((workdir / "inputs").glob("input_*.bin"))
+    return inputs[:count] if len(inputs) >= count else None
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    xs = sorted(values)
+    return xs[len(xs) // 2]
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +435,8 @@ def _summarize(cases: list[CaseResult]) -> dict[str, Any]:
         "fail_ref":        counts.get("FAIL_REF",        0),
         "fail_cand":       counts.get("FAIL_CAND",       0),
         "error_llm":       counts.get("ERROR_LLM",       0),
+        "fail_nondeterministic": counts.get("FAIL_NONDETERMINISTIC", 0),
+        "missing_checker": counts.get("MISSING_CHECKER",  0),
         "build_fail_ref":  counts.get("BUILD_FAIL_REF",  0),
         "build_fail_cand": counts.get("BUILD_FAIL_CAND", 0),
         "pass_rate":       (f"{ok}/{total}"
@@ -437,9 +454,84 @@ def _all_pass(summary: dict[str, Any]) -> bool:
             + summary["pass_llm"]) == total
 
 
+def _parse_k_values(raw: str) -> list[int]:
+    try:
+        vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise SystemExit("--pass-at-k must be a comma-separated list of integers")
+    if not vals:
+        raise SystemExit("--pass-at-k must contain at least one integer")
+    if any(k < 1 for k in vals):
+        raise SystemExit("--pass-at-k values must be >= 1")
+    return sorted(set(vals))
+
+
+def _pass_at_k_unbiased(n: int, c: int, k: int) -> float | None:
+    if n < k:
+        return None
+    if c <= 0:
+        return 0.0
+    if n - c < k:
+        return 1.0
+    return 1.0 - (math.comb(n - c, k) / math.comb(n, k))
+
+
+def _summary_out_path(out_path: Path) -> Path:
+    if out_path.suffix:
+        return out_path.with_name(f"{out_path.stem}.summary{out_path.suffix}")
+    return out_path.with_name(f"{out_path.name}.summary.json")
+
+
+def summarize_pass_at_k(results: list[dict[str, Any]],
+                        problems: dict[str, Any],
+                        k_values: list[int]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for r in results:
+        pid = r.get("id")
+        if pid not in problems:
+            continue
+        grouped.setdefault(pid, []).append(r)
+
+    per_problem: dict[str, dict[str, Any]] = {}
+    for pid, group in sorted(grouped.items()):
+        n = len(group)
+        c = sum(
+            1 for r in group
+            if r.get("validation") and _all_pass(r["validation"]["summary"])
+        )
+        row: dict[str, Any] = {"n": n, "c": c}
+        for k in k_values:
+            v = _pass_at_k_unbiased(n, c, k)
+            if v is not None:
+                row[f"pass@{k}"] = round(v, 10)
+        per_problem[pid] = row
+
+    metrics: dict[str, dict[str, Any]] = {}
+    total = len(per_problem)
+    for k in k_values:
+        key = f"pass@{k}"
+        vals = [p[key] for p in per_problem.values() if key in p]
+        metrics[key] = {
+            "value": round(sum(vals) / len(vals), 10) if vals else None,
+            "eligible_problems": len(vals),
+            "total_problems": total,
+        }
+
+    return {
+        "pass_at_k": {
+            "k_values": k_values,
+            "group_by": "id",
+            "formula": "unbiased",
+            "metrics": metrics,
+            "problems": per_problem,
+        }
+    }
+
+
 def validate_one(prob: dict[str, Any], code: str, language: str, *,
                  check_fn, llm_client, llm_model: str,
-                 run_timeout: int, keep_tempdir: bool = False,
+                 run_timeout: int, repeat_validation: int = 1,
+                 keep_tempdir: bool = False,
                  ) -> dict[str, Any]:
     """Compile + run + judge one candidate. Returns the validation block."""
     description = prob.get("description", prob.get("name", "?"))
@@ -479,7 +571,6 @@ def validate_one(prob: dict[str, Any], code: str, language: str, *,
                 cand_name = prob.get("id", "candidate")
                 for inp in inputs:
                     ref_out  = tmp / f"_ref_{inp.stem}.bin"
-                    cand_out = tmp / f"_cand_{inp.stem}.bin"
                     rr = run_binary(ref_bin, inp, ref_out, timeout=run_timeout)
                     base = CaseResult(input=inp.name, status="?",
                                       ref_elapsed_s=round(rr.elapsed_s, 4))
@@ -490,14 +581,38 @@ def validate_one(prob: dict[str, Any], code: str, language: str, *,
                     ref_data = rr.output_bytes or b""
                     base.ref_bytes = len(ref_data)
 
-                    cr = run_binary(cand_bin, inp, cand_out, timeout=run_timeout)
-                    base.cand_elapsed_s = round(cr.elapsed_s, 4)
-                    if not cr.ok:
-                        base.status = "FAIL_CAND"
-                        base.detail = f"cand rc={cr.rc}: {cr.stderr[:200]}"
+                    cand_runs: list[bytes] = []
+                    cand_elapsed: list[float] = []
+                    cand_failed = False
+                    for rep in range(repeat_validation):
+                        cand_out = tmp / f"_cand_{inp.stem}_{rep}.bin"
+                        cr = run_binary(cand_bin, inp, cand_out,
+                                        timeout=run_timeout)
+                        cand_elapsed.append(cr.elapsed_s)
+                        if not cr.ok:
+                            base.status = "FAIL_CAND"
+                            base.detail = (
+                                f"repeat {rep + 1}/{repeat_validation}: "
+                                f"cand rc={cr.rc}: {cr.stderr[:200]}"
+                            )
+                            cand_failed = True
+                            break
+                        cand_runs.append(cr.output_bytes or b"")
+
+                    med_elapsed = _median(cand_elapsed)
+                    base.cand_elapsed_s = round(med_elapsed or 0.0, 4)
+                    if cand_failed:
                         cases.append(base); continue
-                    cand_data = cr.output_bytes or b""
+
+                    cand_data = cand_runs[0] if cand_runs else b""
                     base.cand_bytes = len(cand_data)
+                    if any(data != cand_data for data in cand_runs[1:]):
+                        base.status = "FAIL_NONDETERMINISTIC"
+                        base.detail = (
+                            "candidate output differed across "
+                            f"{repeat_validation} repeat runs"
+                        )
+                        cases.append(base); continue
 
                     # 1. byte-equal
                     if ref_data == cand_data:
@@ -522,8 +637,12 @@ def validate_one(prob: dict[str, Any], code: str, language: str, *,
                                        "problem (no checker / no LLM)")
                         cases.append(base); continue
                     if llm_client is None:
-                        base.status = "FAIL"
-                        base.detail = "byte mismatch; LLM disabled"
+                        base.status = "MISSING_CHECKER"
+                        base.detail = (
+                            "byte mismatch on non-byte-deterministic problem "
+                            "with no checker; rerun with --allow-llm-judge "
+                            "to permit LLM fallback"
+                        )
                         cases.append(base); continue
                     judge = llm_judge(
                         llm_client, llm_model,
@@ -656,8 +775,20 @@ def time_nsys_kernel(nsys: str, binary: Path, in_path: Path, out_path: Path,
     return total_ns / 1e6 if total_ns else float("nan")
 
 
+def _round_float(x, p=3):
+    return None if (x is None or (isinstance(x, float) and math.isnan(x))) \
+                else round(x, p)
+
+
+def _median_case_value(cases: list[dict[str, Any]], key: str) -> float | None:
+    vals = [c[key] for c in cases if isinstance(c.get(key), (int, float))]
+    med = _median([float(v) for v in vals])
+    return med
+
+
 def measure_speedup(prob: dict[str, Any], code: str, language: str,
-                    *, n_runs: int, keep_tempdir: bool = False,
+                    *, n_runs: int, speedup_inputs: int,
+                    keep_tempdir: bool = False,
                     ) -> dict[str, Any] | None:
     """Time reference (compute-only) + candidate (kernel-only via nsys).
     Returns None when reference build / input gen / candidate build fails.
@@ -681,13 +812,10 @@ def measure_speedup(prob: dict[str, Any], code: str, language: str,
         if not ok:
             return None
 
-        # One input
-        inp = gen_one_input_for_speedup(prob["gen_input"], tmp)
-        if inp is None:
+        # Timing inputs
+        inputs = gen_inputs_for_speedup(prob["gen_input"], tmp, speedup_inputs)
+        if inputs is None:
             return None
-
-        ref_wall, ref_compute = time_run(
-            ref_bin, inp, tmp / "ref_out.bin", n=n_runs)
 
         # Candidate
         cand_path = tmp / f"candidate{EXT_FOR_LANG.get(language, '.cu')}"
@@ -697,27 +825,41 @@ def measure_speedup(prob: dict[str, Any], code: str, language: str,
         if not ok:
             return None
 
-        cand_wall, _ = time_run(cand_bin, inp, tmp / "cand_out.bin", n=n_runs)
-        cand_kern = (time_nsys_kernel(nsys, cand_bin, inp, tmp / "cand_out.bin",
-                                       tmp=tmp)
-                     if (nsys and language == "cuda") else float("nan"))
+        cases: list[dict[str, Any]] = []
+        for i, inp in enumerate(inputs):
+            ref_wall, ref_compute = time_run(
+                ref_bin, inp, tmp / f"ref_{i}_out.bin", n=n_runs)
+            cand_wall, _ = time_run(
+                cand_bin, inp, tmp / f"cand_{i}_out.bin", n=n_runs)
+            cand_kern = (
+                time_nsys_kernel(nsys, cand_bin, inp, tmp / f"cand_{i}_out.bin",
+                                 tmp=tmp)
+                if (nsys and language == "cuda") else float("nan")
+            )
 
-        def _round(x, p=3):
-            return None if (x is None or (isinstance(x, float) and math.isnan(x))) \
-                        else round(x, p)
+            kern_ok = (isinstance(cand_kern, float)
+                       and not math.isnan(cand_kern) and cand_kern > 0)
+            comp_ok = isinstance(ref_compute, float) and not math.isnan(ref_compute)
+            cases.append({
+                "input":          inp.name,
+                "ref_wall_ms":    _round_float(ref_wall),
+                "ref_compute_ms": _round_float(ref_compute, 4),
+                "cand_wall_ms":   _round_float(cand_wall),
+                "cand_kernel_ms": _round_float(cand_kern, 4),
+                "speedup_e2e":    (round(ref_wall / cand_wall, 3)
+                                   if cand_wall else None),
+                "speedup_kernel": (round(ref_compute / cand_kern, 3)
+                                   if (kern_ok and comp_ok) else None),
+            })
 
-        kern_ok = isinstance(cand_kern, float) and not math.isnan(cand_kern) \
-                  and cand_kern > 0
-        comp_ok = isinstance(ref_compute, float) and not math.isnan(ref_compute)
         return {
-            "ref_wall_ms":     _round(ref_wall),
-            "ref_compute_ms":  _round(ref_compute, 4),
-            "cand_wall_ms":    _round(cand_wall),
-            "cand_kernel_ms":  _round(cand_kern, 4),
-            "speedup_e2e":     (round(ref_wall / cand_wall, 3)
-                                if cand_wall else None),
-            "speedup_kernel":  (round(ref_compute / cand_kern, 3)
-                                if (kern_ok and comp_ok) else None),
+            "ref_wall_ms":     _round_float(_median_case_value(cases, "ref_wall_ms")),
+            "ref_compute_ms":  _round_float(_median_case_value(cases, "ref_compute_ms"), 4),
+            "cand_wall_ms":    _round_float(_median_case_value(cases, "cand_wall_ms")),
+            "cand_kernel_ms":  _round_float(_median_case_value(cases, "cand_kernel_ms"), 4),
+            "speedup_e2e":     _round_float(_median_case_value(cases, "speedup_e2e")),
+            "speedup_kernel":  _round_float(_median_case_value(cases, "speedup_kernel")),
+            "cases":           cases,
         }
 
 
@@ -728,7 +870,8 @@ def measure_speedup(prob: dict[str, Any], code: str, language: str,
 def evaluate_one(prob: dict[str, Any], entry: dict[str, Any], *,
                  do_validate: bool, do_speedup: bool, speedup_all: bool,
                  llm_client, llm_model: str,
-                 run_timeout: int, n_runs: int,
+                 run_timeout: int, n_runs: int, repeat_validation: int,
+                 speedup_inputs: int,
                  keep_tempdir: bool = False) -> dict[str, Any]:
     out: dict[str, Any] = {
         "id":         entry["id"],
@@ -748,7 +891,8 @@ def evaluate_one(prob: dict[str, Any], entry: dict[str, Any], *,
             prob, code, language,
             check_fn=check_fn,
             llm_client=llm_client, llm_model=llm_model,
-            run_timeout=run_timeout, keep_tempdir=keep_tempdir,
+            run_timeout=run_timeout, repeat_validation=repeat_validation,
+            keep_tempdir=keep_tempdir,
         )
 
     if do_speedup:
@@ -761,7 +905,8 @@ def evaluate_one(prob: dict[str, Any], entry: dict[str, Any], *,
         if gate_ok:
             out["speedup"] = measure_speedup(
                 prob, code, language,
-                n_runs=n_runs, keep_tempdir=keep_tempdir,
+                n_runs=n_runs, speedup_inputs=speedup_inputs,
+                keep_tempdir=keep_tempdir,
             )
 
     return out
@@ -785,7 +930,10 @@ def main() -> None:
     ap.add_argument("--no-speedup", action="store_true",
                     help="Skip the timing/speedup measurement")
     ap.add_argument("--no-llm", action="store_true",
-                    help="Skip LLM judge fallback (non-byte-det only)")
+                    help="Disable LLM judge client")
+    ap.add_argument("--allow-llm-judge", action="store_true",
+                    help="Allow LLM fallback for non-byte-det mismatches "
+                         "with no checker")
     ap.add_argument("--speedup-all", action="store_true",
                     help="Measure speedup even when validation isn't all-pass")
     ap.add_argument("--keep-tempdir", action="store_true",
@@ -795,6 +943,12 @@ def main() -> None:
                     help="Parallel worker threads")
     ap.add_argument("--n-runs", type=int, default=3,
                     help="Median over N timed runs (per direction)")
+    ap.add_argument("--repeat-validation", type=int, default=1,
+                    help="Run each candidate/input N times during validation")
+    ap.add_argument("--speedup-inputs", type=int, default=1,
+                    help="Number of generated inputs to use for speedup")
+    ap.add_argument("--pass-at-k", default="1,5,10",
+                    help="Comma-separated k values for pass@k summary")
     ap.add_argument("--timeout", type=int, default=120,
                     help="Per-binary run timeout (seconds)")
     ap.add_argument("--llm-base-url", default=DEFAULT_LLM_BASE_URL)
@@ -806,6 +960,11 @@ def main() -> None:
     do_speedup  = not args.no_speedup
     if not (do_validate or do_speedup):
         sys.exit("nothing to do (both --no-validate and --no-speedup set)")
+    if args.repeat_validation < 1:
+        sys.exit("--repeat-validation must be >= 1")
+    if args.speedup_inputs < 1:
+        sys.exit("--speedup-inputs must be >= 1")
+    pass_at_k = _parse_k_values(args.pass_at_k)
 
     bench_path = Path(args.benchmarks).resolve()
     in_path    = Path(args.input).resolve()
@@ -828,7 +987,7 @@ def main() -> None:
 
     # LLM client (lazy)
     llm_client = None
-    if do_validate and not args.no_llm:
+    if do_validate and args.allow_llm_judge and not args.no_llm:
         try:
             from openai import OpenAI
             llm_client = OpenAI(base_url=args.llm_base_url, api_key=args.api_key)
@@ -839,52 +998,120 @@ def main() -> None:
     results: list[dict[str, Any]] = [None] * len(entries)  # type: ignore
     print_lock = threading.Lock()
 
-    def _run(idx: int, entry: dict[str, Any]) -> None:
+    def _base_result(entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": entry.get("id"),
+            "submitted": bool(entry.get("submitted")),
+            "validation": None,
+            "speedup": None,
+        }
+
+    def _speedup_gate(r: dict[str, Any]) -> bool:
+        return (
+            args.speedup_all
+            or (do_validate and r.get("validation")
+                and _all_pass(r["validation"]["summary"]))
+            or (not do_validate)
+        )
+
+    def _speedup_str(v: dict[str, Any] | None) -> str:
+        if v is None:
+            return "speedup=-"
+        e2e = "None" if v.get("speedup_e2e") is None else f"{v['speedup_e2e']}x"
+        kern = ("None" if v.get("speedup_kernel") is None
+                else f"{v['speedup_kernel']}x")
+        return f"e2e={e2e} kern={kern}"
+
+    def _run_validation(idx: int, entry: dict[str, Any]) -> None:
         pid = entry.get("id")
         prob = problems.get(pid)
         if prob is None:
             with print_lock:
                 print(f"  [{idx+1}/{len(entries)}] {pid}: NOT in benchmarks.json — skip")
-            results[idx] = {"id": pid, "submitted": bool(entry.get("submitted")),
-                            "validation": None, "speedup": None}
+            results[idx] = _base_result(entry)
             return
         r = evaluate_one(
             prob, entry,
-            do_validate=do_validate, do_speedup=do_speedup,
-            speedup_all=args.speedup_all,
+            do_validate=do_validate, do_speedup=False,
+            speedup_all=False,
             llm_client=llm_client, llm_model=args.llm_model,
             run_timeout=args.timeout, n_runs=args.n_runs,
+            repeat_validation=args.repeat_validation,
+            speedup_inputs=args.speedup_inputs,
             keep_tempdir=args.keep_tempdir,
         )
         results[idx] = r
-        v = r["speedup"]
         s = (r["validation"] or {}).get("summary") if r["validation"] else None
         with print_lock:
             v_str = (f"val={s['pass_rate']}" if s else "val=skip")
-            sp_str = ("e2e=" + ("None" if not v or v["speedup_e2e"] is None
-                                else f"{v['speedup_e2e']}x")
-                      + " kern=" + ("None" if not v or v["speedup_kernel"] is None
-                                    else f"{v['speedup_kernel']}x")) \
-                     if r["speedup"] is not None else "speedup=-"
-            print(f"  [{idx+1}/{len(entries)}] {pid:5} {v_str:<28} {sp_str}")
+            print(f"  [{idx+1}/{len(entries)}] {pid:5} {v_str:<28} speedup=-")
 
-    print(f"evaluating {len(entries)} entries with {args.workers} worker(s)\n")
-    if args.workers <= 1:
-        for i, e in enumerate(entries):
-            _run(i, e)
+    def _run_speedup(idx: int, entry: dict[str, Any]) -> None:
+        pid = entry.get("id")
+        r = results[idx]
+        prob = problems.get(pid)
+        if prob is None or r is None:
+            print(f"  [{idx+1}/{len(entries)}] {pid}: speedup skip")
+            return
+        if not entry.get("submitted") or not entry.get("code"):
+            print(f"  [{idx+1}/{len(entries)}] {pid:5} speedup=-")
+            return
+        if not _speedup_gate(r):
+            print(f"  [{idx+1}/{len(entries)}] {pid:5} speedup=-")
+            return
+        language = (entry.get("metadata") or {}).get("language", DEFAULT_CAND_LANG)
+        r["speedup"] = measure_speedup(
+            prob, entry["code"], language,
+            n_runs=args.n_runs,
+            speedup_inputs=args.speedup_inputs,
+            keep_tempdir=args.keep_tempdir,
+        )
+        print(f"  [{idx+1}/{len(entries)}] {pid:5} {_speedup_str(r['speedup'])}")
+
+    if do_validate:
+        print(f"validating {len(entries)} entries with {args.workers} worker(s)\n")
+        if args.workers <= 1:
+            for i, e in enumerate(entries):
+                _run_validation(i, e)
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                list(pool.map(lambda ie: _run_validation(*ie),
+                              enumerate(entries)))
     else:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            list(pool.map(lambda ie: _run(*ie), enumerate(entries)))
+        for i, e in enumerate(entries):
+            results[i] = _base_result(e)
+
+    if do_speedup:
+        print(f"\nmeasuring speedup serially over "
+              f"{args.speedup_inputs} input(s)\n")
+        for i, e in enumerate(entries):
+            _run_speedup(i, e)
 
     out_path.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out_path}")
+    if do_validate:
+        summary_path = _summary_out_path(out_path)
+        summary = summarize_pass_at_k(results, problems, pass_at_k)
+        summary_path.write_text(json.dumps(summary, indent=2))
+        print(f"wrote {summary_path}")
 
     # Final summary
     n = len(results)
     n_pass = sum(1 for r in results
                  if r["validation"] and _all_pass(r["validation"]["summary"]))
     n_sp = sum(1 for r in results if r["speedup"])
-    print(f"  {n_pass}/{n} fully pass" + (f"   {n_sp} with speedup" if do_speedup else ""))
+    if do_validate:
+        print(f"  {n_pass}/{n} fully pass"
+              + (f"   {n_sp} with speedup" if do_speedup else ""))
+        pk = summary["pass_at_k"]["metrics"]
+        pk_str = " ".join(
+            f"{key}={val['value'] if val['value'] is not None else 'n/a'}"
+            for key, val in pk.items()
+        )
+        print(f"  {pk_str}")
+    else:
+        print(f"  validation skipped"
+              + (f"   {n_sp}/{n} with speedup" if do_speedup else ""))
 
 
 if __name__ == "__main__":
