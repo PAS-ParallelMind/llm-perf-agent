@@ -72,7 +72,7 @@ metadata: dict[str, Any]         # pass-through — copied to AgentResult
 ### `AgentResult`
 ```python
 task_id: str
-code: str                        # submitted (or fallback-extracted) code
+code: str                        # submitted code, or summary for workspace tasks
 raw_reply: str                   # the model's final text reply
 trace: list[dict]                # full message history
 tool_calls: list[dict]           # step-indexed tool-call log
@@ -194,9 +194,11 @@ Available tools today:
 | `bash`                 | tools/bash.py       | Shell exec, timeout-bounded                 |
 | `omp_build_and_run`    | tools/parallel.py   | gcc/clang/icpx + run                        |
 | `nvcc_build_and_run`   | tools/parallel.py   | nvcc + run                                  |
+| `cuda_profile`         | tools/profile.py    | Build/profile CUDA workspace commands       |
+| `cuda_guided_profile`  | tools/profile.py    | Broad-to-narrow CUDA bottleneck diagnosis   |
 | `mpi_build_and_run`    | tools/parallel.py   | mpicc/mpicxx + `mpirun -np N` + run         |
 | `hardware_info`        | tools/parallel.py   | Probe GPUs / nvcc / host compilers          |
-| `submit_solution`      | tools/submit.py     | Submit final code and stop the loop         |
+| `submit_solution`      | tools/submit.py     | Submit final code/summary and stop the loop |
 | `remember`             | memory.py           | Write a memory file + index entry           |
 | `recall`               | memory.py           | Read a memory file by name                  |
 

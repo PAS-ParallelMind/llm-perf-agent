@@ -21,6 +21,7 @@ class AgentResult:
     task_id: str
     code: str                            # submitted (or fallback-extracted) code
     raw_reply: str                       # agent's final text reply
+    notes: str = ""                      # optional explanatory text from submit_solution
     trace: list[dict[str, Any]] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     steps: int = 0

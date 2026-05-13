@@ -64,6 +64,8 @@ def run_one(
             task_id=task.id,
             code="",
             raw_reply="",
+            trace=list(agent.messages),
+            tool_calls=list(agent.tool_call_log),
             steps=agent.step_count,
             elapsed_s=0.0,
             submitted=False,
@@ -165,9 +167,9 @@ def _write_seed_files(root: Path, seeds: dict[str, str]) -> None:
 
 
 def _export_results(results: list[AgentResult], output_path: str) -> None:
-    """Unified output schema: [{id, code, submitted, steps, elapsed_s, error,
-    metadata?}, ...]. Auxiliary <stem>.code.json holds the pure {id, code}
-    list for downstream eval."""
+    """Unified output schema: [{id, code, notes?, submitted, steps,
+    elapsed_s, error, metadata?}, ...]. Auxiliary <stem>.code.json holds
+    the pure {id, code} list for downstream eval."""
     out = []
     for r in results:
         entry: dict[str, Any] = {
@@ -178,6 +180,8 @@ def _export_results(results: list[AgentResult], output_path: str) -> None:
             "elapsed_s":  r.elapsed_s,
             "error":      r.error,
         }
+        if r.notes:
+            entry["notes"] = r.notes
         # Drop harness-internal additions (e.g. workspace path) before
         # emitting; only keep keys the caller put in problems.json metadata.
         meta = {k: v for k, v in r.metadata.items() if k != "workspace"}
@@ -227,6 +231,7 @@ def run_from_config(config_path: str,
                     task_id=e["id"],
                     code=e.get("code", ""),
                     raw_reply="",
+                    notes=e.get("notes", "") or "",
                     steps=e.get("steps", 0),
                     elapsed_s=e.get("elapsed_s", 0.0),
                     submitted=True,
