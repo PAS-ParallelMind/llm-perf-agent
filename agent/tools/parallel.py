@@ -9,28 +9,70 @@ import glob
 import os
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 from ..workspace import get_root, resolve
 from .base import tool
 
 MAX_OUT = 20_000
 
-# Common install prefixes for tooling we may need even when not on PATH.
-# Newest CUDA wins (sorted descending).
-_CUDA_PREFIX_GLOBS = ("/usr/local/cuda*", "/opt/cuda*")
+# Versioned CUDA install dirs (skip unversioned ``cuda`` symlink so the
+# system-admin's choice of default doesn't override the "newest wins"
+# semantics). Newest CUDA wins (sorted descending).
+_CUDA_PREFIX_GLOBS = ("/usr/local/cuda-*", "/opt/cuda-*")
+
+# CUDA compute capability for the runtime probe. Matches eval/evaluate.py.
+_CUDA_PROBE_ARCH = "sm_89"
+
+_NVCC_OK_CACHE: dict[str, bool] = {}
+
+
+def _nvcc_runtime_ok(nvcc_path: str) -> bool:
+    """Compile a tiny CUDA program and try ``cudaMalloc``. Cached.
+
+    Mirrors ``eval/evaluate.py``'s probe so the agent's compile tool can't
+    silently fall back to an nvcc whose CUDA runtime is too new for the
+    host driver (or, conversely, too old to know about the GPU's arch).
+    """
+    if nvcc_path in _NVCC_OK_CACHE:
+        return _NVCC_OK_CACHE[nvcc_path]
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "probe.cu"
+        src.write_text(
+            "#include <cuda_runtime.h>\n#include <cstdio>\n"
+            "int main(){void*p;cudaError_t e=cudaMalloc(&p,16);"
+            "printf(\"%d\",e);return e!=cudaSuccess;}"
+        )
+        binp = Path(tmp) / "probe"
+        cp = subprocess.run(
+            [nvcc_path, "-O0", "-arch=" + _CUDA_PROBE_ARCH,
+             str(src), "-o", str(binp)],
+            capture_output=True, timeout=60,
+        )
+        ok = (cp.returncode == 0
+              and subprocess.run([str(binp)], capture_output=True,
+                                 timeout=10).returncode == 0)
+    _NVCC_OK_CACHE[nvcc_path] = ok
+    return ok
 
 
 def _resolve_nvcc() -> str | None:
-    """Find nvcc on PATH first, else scan common install prefixes."""
-    found = shutil.which("nvcc")
-    if found:
-        return found
+    """Return a working nvcc.
+
+    Prefer ``/usr/local/cuda-*/bin/nvcc`` (newest first), each verified via
+    a tiny compile + cudaMalloc probe. Fall back to ``shutil.which("nvcc")``
+    only when none of the local CUDA installs works — the system
+    ``/usr/bin/nvcc`` is often an older package that doesn't know about
+    newer compute capabilities (e.g. sm_89)."""
     candidates: list[str] = []
     for pat in _CUDA_PREFIX_GLOBS:
         candidates.extend(glob.glob(f"{pat}/bin/nvcc"))
-    # newest version-suffixed prefix first (e.g. cuda-12.9 before cuda-12.6)
     candidates.sort(reverse=True)
-    return candidates[0] if candidates else None
+    for c in candidates:
+        if _nvcc_runtime_ok(c):
+            return c
+    return shutil.which("nvcc")
 
 
 def _cuda_runtime_env(nvcc_path: str, base_env: dict | None = None) -> dict:

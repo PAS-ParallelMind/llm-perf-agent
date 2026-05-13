@@ -148,11 +148,20 @@ def _nvcc_runtime_ok(nvcc_path: str) -> bool:
 
 def find_compiler(name: str) -> str | None:
     """Find a working compiler. nvcc gets a runtime probe to skip versions
-    whose CUDA runtime is too new for the host driver."""
+    whose CUDA runtime is too new for the host driver.
+
+    Mirrors ``agent/tools/parallel.py:_resolve_nvcc`` so the agent's build
+    tool and this evaluator both see the same nvcc (otherwise the agent
+    might write code that builds under one toolchain but not the other —
+    e.g. thrust+cub between cuda-12.9 and cuda-13.0)."""
     if name == "nvcc":
         from glob import glob
-        cands = sorted(glob("/usr/local/cuda-*/bin/nvcc"), reverse=True)
-        cands.append("/usr/local/cuda/bin/nvcc")
+        # Versioned dirs only; skip unversioned `cuda` symlink so the
+        # admin's choice of default doesn't override "newest wins".
+        cands = []
+        for pat in ("/usr/local/cuda-*/bin/nvcc", "/opt/cuda-*/bin/nvcc"):
+            cands.extend(glob(pat))
+        cands.sort(reverse=True)
         for c in cands:
             if Path(c).is_file() and _nvcc_runtime_ok(c):
                 return c
