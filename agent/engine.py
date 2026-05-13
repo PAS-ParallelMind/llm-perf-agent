@@ -12,7 +12,9 @@ class Engine:
     model: str
     base_url: str = "http://localhost:8000/v1"
     api_key: str = "EMPTY"
-    temperature: float = 0.2
+    # Set to None to omit the param entirely (some Anthropic models
+    # reject `temperature`).
+    temperature: float | None = 0.2
     max_tokens: int = 2048
     reasoning: bool = False
 
@@ -27,9 +29,10 @@ class Engine:
         kwargs: dict[str, Any] = dict(
             model=self.model,
             messages=messages,
-            temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
