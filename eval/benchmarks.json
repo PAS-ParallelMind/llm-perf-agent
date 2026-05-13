@@ -3,8 +3,8 @@
     "P001": {
       "id": "P001",
       "name": "pareval_03_dense_la_axpy",
-      "byte_deterministic": true,
-      "description": "BLAS-1 AXPY: z = alpha * x + y elementwise.\n\nEach output element is computed independently and once, so\nany correct parallel implementation produces byte-identical\nresults.\n\nBinary I/O:\n  argv[1] = input.bin   [int32 N][double alpha][double x[N]][double y[N]]\n  argv[2] = output.bin  [double z[N]]",
+      "byte_deterministic": false,
+      "description": "BLAS-1 AXPY: z = alpha * x + y elementwise.\n\nEach output element is computed independently. Results should match\nthe reference to within a few ULPs \u2014 small last-bit differences from\nFMA contraction (GPU's `fma(a,x,y)` rounds once; CPU's `a*x+y` rounds\ntwice) are tolerated by the checker.\n\nBinary I/O:\n  argv[1] = input.bin   [int32 N][double alpha][double x[N]][double y[N]]\n  argv[2] = output.bin  [double z[N]]",
       "reference": {
         "language": "cpp",
         "code": "// ParEval 03: axpy \u2014 z = alpha * x + y elementwise (BLAS-1).\n//\n// Each output element is computed independently and once, so any\n// correct parallel implementation produces byte-identical results.\n//\n// Binary I/O contract:\n//   argv[1] = input.bin   [int32 N][double alpha][double x[N]][double y[N]]\n//   argv[2] = output.bin  [double z[N]]   z[i] = alpha * x[i] + y[i]\n\n#include <cstdint>\n#include <cstdio>\n#include <vector>\n\nint main(int argc, char* argv[]) {\n    if (argc != 3) return 1;\n    FILE* fin = std::fopen(argv[1], \"rb\");\n    if (!fin) return 1;\n    int32_t N = 0;\n    double alpha = 0.0;\n    if (std::fread(&N,     sizeof(int32_t), 1, fin) != 1 || N <= 0) { std::fclose(fin); return 1; }\n    if (std::fread(&alpha, sizeof(double),  1, fin) != 1)            { std::fclose(fin); return 1; }\n    std::vector<double> x(N), y(N);\n    if (std::fread(x.data(), sizeof(double), N, fin) != (std::size_t)N) { std::fclose(fin); return 1; }\n    if (std::fread(y.data(), sizeof(double), N, fin) != (std::size_t)N) { std::fclose(fin); return 1; }\n    std::fclose(fin);\n\n    std::vector<double> z(N);\n    for (int i = 0; i < N; ++i) z[i] = alpha * x[i] + y[i];\n\n    FILE* fout = std::fopen(argv[2], \"wb\");\n    if (!fout) return 1;\n    std::fwrite(z.data(), sizeof(double), N, fout);\n    std::fclose(fout);\n    return 0;\n}\n"
@@ -23,7 +23,10 @@
           "inputs"
         ]
       },
-      "checker": null
+      "checker": {
+        "language": "python",
+        "code": "def check(input_bytes, output_bytes):\n    \"\"\"axpy: z = alpha*x + y. rel_tol=1e-13, abs_tol=1e-14 \u2014 covers\n    FMA-vs-mul-add and any reasonable cancellation behavior.\"\"\"\n    import struct, math\n    if len(input_bytes) < 12:\n        return {\"valid\": False, \"reason\": \"input too short\"}\n    N = struct.unpack_from(\"<i\", input_bytes, 0)[0]\n    if N <= 0:\n        return {\"valid\": False, \"reason\": f\"N={N} not positive\"}\n    expected_in = 4 + 8 + 8 * 2 * N\n    if len(input_bytes) != expected_in:\n        return {\"valid\": False,\n                \"reason\": f\"input size {len(input_bytes)} != {expected_in}\"}\n    alpha = struct.unpack_from(\"<d\", input_bytes, 4)[0]\n    x = struct.unpack_from(f\"<{N}d\", input_bytes, 12)\n    y = struct.unpack_from(f\"<{N}d\", input_bytes, 12 + 8*N)\n\n    expected_out = 8 * N\n    if len(output_bytes) != expected_out:\n        return {\"valid\": False,\n                \"reason\": f\"output size {len(output_bytes)} != {expected_out}\"}\n    z = struct.unpack(f\"<{N}d\", output_bytes)\n\n    REL = 1e-13\n    ABS = 1e-14\n    n_bad = 0\n    worst_rel = 0.0\n    worst_abs = 0.0\n    bad_idx = -1\n    for i in range(N):\n        e = alpha * x[i] + y[i]\n        c = z[i]\n        if math.isclose(e, c, rel_tol=REL, abs_tol=ABS):\n            continue\n        n_bad += 1\n        bad_idx = i\n        ad = abs(e - c)\n        if ad > worst_abs: worst_abs = ad\n        s = max(abs(e), abs(c), 1e-300)\n        rd = ad / s\n        if rd > worst_rel: worst_rel = rd\n    if n_bad:\n        return {\"valid\": False,\n                \"reason\": f\"{n_bad}/{N} elements outside tol (rel<={REL}, abs<={ABS}); \"\n                          f\"worst_rel={worst_rel:.2e}, worst_abs={worst_abs:.2e} @ idx {bad_idx}\"}\n    return {\"valid\": True, \"reason\": \"within tolerance\"}\n"
+      }
     },
     "P002": {
       "id": "P002",
@@ -294,8 +297,8 @@
     "P012": {
       "id": "P012",
       "name": "hecbench_axpby",
-      "byte_deterministic": true,
-      "description": "Compute z = a*x + b*y elementwise (BLAS-1 extension of axpy).\n\nEach element is a single fused multiply-add; byte-deterministic.\n\nBinary I/O:\n  argv[1] = input.bin\n    [int32 N][double a][double b][double x[N]][double y[N]]\n  argv[2] = output.bin  [double z[N]]",
+      "byte_deterministic": false,
+      "description": "Compute z = a*x + b*y elementwise (BLAS-1 extension of axpy).\n\nEach element is two fused multiply-adds. Results should match the\nreference to within a few ULPs \u2014 small last-bit differences from FMA\ncontraction on GPU are tolerated by the checker.\n\nBinary I/O:\n  argv[1] = input.bin\n    [int32 N][double a][double b][double x[N]][double y[N]]\n  argv[2] = output.bin  [double z[N]]",
       "reference": {
         "language": "cpp",
         "code": "// hecbench_axpby \u2014 z = a*x + b*y elementwise (BLAS-1 extension of axpy).\n// Per-element compute, byte-deterministic for any same-precision impl.\n//\n// Binary I/O contract:\n//   argv[1] = input.bin\n//     [int32 N][double a][double b][double x[N]][double y[N]]\n//   argv[2] = output.bin\n//     [double z[N]]   z[i] = a * x[i] + b * y[i]\n\n#include <cstdint>\n#include <cstdio>\n#include <vector>\n\nint main(int argc, char* argv[]) {\n    if (argc != 3) return 1;\n    FILE* fin = std::fopen(argv[1], \"rb\");\n    if (!fin) return 1;\n    int32_t N = 0;\n    double a = 0.0, b = 0.0;\n    if (std::fread(&N, sizeof(int32_t), 1, fin) != 1 || N <= 0) { std::fclose(fin); return 1; }\n    if (std::fread(&a, sizeof(double),  1, fin) != 1) { std::fclose(fin); return 1; }\n    if (std::fread(&b, sizeof(double),  1, fin) != 1) { std::fclose(fin); return 1; }\n    std::vector<double> x(N), y(N);\n    if (std::fread(x.data(), sizeof(double), N, fin) != (std::size_t)N) { std::fclose(fin); return 1; }\n    if (std::fread(y.data(), sizeof(double), N, fin) != (std::size_t)N) { std::fclose(fin); return 1; }\n    std::fclose(fin);\n\n    std::vector<double> z(N);\n    for (int i = 0; i < N; ++i) z[i] = a * x[i] + b * y[i];\n\n    FILE* fout = std::fopen(argv[2], \"wb\");\n    if (!fout) return 1;\n    std::fwrite(z.data(), sizeof(double), N, fout);\n    std::fclose(fout);\n    return 0;\n}\n"
@@ -314,7 +317,10 @@
           "inputs"
         ]
       },
-      "checker": null
+      "checker": {
+        "language": "python",
+        "code": "def check(input_bytes, output_bytes):\n    \"\"\"axpby: z = a*x + b*y. rel_tol=1e-13, abs_tol=1e-14 \u2014 covers\n    FMA-vs-mul-add and any reasonable cancellation behavior.\"\"\"\n    import struct, math\n    if len(input_bytes) < 20:\n        return {\"valid\": False, \"reason\": \"input too short\"}\n    N = struct.unpack_from(\"<i\", input_bytes, 0)[0]\n    if N <= 0:\n        return {\"valid\": False, \"reason\": f\"N={N} not positive\"}\n    expected_in = 4 + 8 + 8 + 8 * 2 * N\n    if len(input_bytes) != expected_in:\n        return {\"valid\": False,\n                \"reason\": f\"input size {len(input_bytes)} != {expected_in}\"}\n    a = struct.unpack_from(\"<d\", input_bytes, 4)[0]\n    b = struct.unpack_from(\"<d\", input_bytes, 12)[0]\n    x = struct.unpack_from(f\"<{N}d\", input_bytes, 20)\n    y = struct.unpack_from(f\"<{N}d\", input_bytes, 20 + 8*N)\n\n    expected_out = 8 * N\n    if len(output_bytes) != expected_out:\n        return {\"valid\": False,\n                \"reason\": f\"output size {len(output_bytes)} != {expected_out}\"}\n    z = struct.unpack(f\"<{N}d\", output_bytes)\n\n    REL = 1e-13\n    ABS = 1e-14\n    n_bad = 0\n    worst_rel = 0.0\n    worst_abs = 0.0\n    bad_idx = -1\n    for i in range(N):\n        e = a * x[i] + b * y[i]\n        c = z[i]\n        if math.isclose(e, c, rel_tol=REL, abs_tol=ABS):\n            continue\n        n_bad += 1\n        bad_idx = i\n        ad = abs(e - c)\n        if ad > worst_abs: worst_abs = ad\n        s = max(abs(e), abs(c), 1e-300)\n        rd = ad / s\n        if rd > worst_rel: worst_rel = rd\n    if n_bad:\n        return {\"valid\": False,\n                \"reason\": f\"{n_bad}/{N} elements outside tol (rel<={REL}, abs<={ABS}); \"\n                          f\"worst_rel={worst_rel:.2e}, worst_abs={worst_abs:.2e} @ idx {bad_idx}\"}\n    return {\"valid\": True, \"reason\": \"within tolerance\"}\n"
+      }
     },
     "P013": {
       "id": "P013",
