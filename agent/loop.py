@@ -153,7 +153,19 @@ class Agent:
                 final_reply = f"[time budget {time_budget_s}s exceeded after {step} steps]"
                 break
 
+            # Time the LLM call itself — it dominates wall-clock for
+            # large prompts / loaded backends, but isn't visible in
+            # tool dispatch logs without this.
+            llm_start = time.monotonic()
             msg = self.engine.chat(self.messages, tools=tool_schemas)
+            llm_elapsed_ms = round((time.monotonic() - llm_start) * 1000)
+            self.tool_call_log.append({
+                "step":       self.step_count,
+                "tool":       "<llm>",
+                "arguments":  "",
+                "result":     "",
+                "elapsed_ms": llm_elapsed_ms,
+            })
 
             content = msg.content or ""
             if self.engine.reasoning:
@@ -200,6 +212,22 @@ class Agent:
 
                 if len(result) > 16000:
                     result = result[:16000] + "\n... [truncated observation]"
+                # Surface remaining budget so the agent can pace itself \u2014
+                # without this, agents over-iterate and run out of one
+                # budget (steps OR wall-clock) before submitting.
+                steps_left = self.max_steps - self.step_count
+                if time_budget_s is not None:
+                    elapsed = time.monotonic() - start
+                    time_left = max(0, time_budget_s - elapsed)
+                    result += (
+                        f"\n\n[step {self.step_count}/{self.max_steps} "
+                        f"({steps_left} left) \u00b7 "
+                        f"time {int(elapsed)}/{int(time_budget_s)}s "
+                        f"({int(time_left)}s left)]"
+                    )
+                else:
+                    result += (f"\n\n[step {self.step_count}/{self.max_steps}"
+                               f" ({steps_left} left)]")
                 preview = "\n".join(result.splitlines()[:10])
                 console.print(f"[dim]  \u21b3 {preview}[/]")
 
