@@ -35,3 +35,10 @@ Thumbs.db
 # Personal dev log (not part of the public repo)
 DEV_NOTES.md
 eval/PLAN.md
+
+# Eval sandbox + ad-hoc speedup playground (large binaries / nsys reports)
+eval/example_speedup/
+
+# webui frontend build artefacts + dev deps
+webui/frontend/node_modules/
+webui/frontend/dist/
