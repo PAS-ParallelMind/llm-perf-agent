@@ -259,6 +259,8 @@ def run_from_config(config_path: str,
         temperature=cfg.model.temperature,
         max_tokens=cfg.model.max_tokens,
         reasoning=cfg.model.reasoning,
+        timeout=cfg.model.timeout,
+        max_retries=cfg.model.max_retries,
     )
 
     system_prompt: str | None = cfg.system_prompt

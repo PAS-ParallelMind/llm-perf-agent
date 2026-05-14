@@ -36,6 +36,8 @@ class ModelConfig:
     temperature: float | None = 0.0
     max_tokens: int = 2048
     reasoning: bool = False
+    timeout: float = 900.0
+    max_retries: int = 2
 
 
 @dataclass
