@@ -13,6 +13,7 @@ import io
 import shlex
 from statistics import mean, stdev
 
+from ..cuda import cuda_env as _cuda_env
 from ..workspace import get_root, resolve
 from .base import tool
 
@@ -42,20 +43,6 @@ NCU_METRICS = {
 
 def _truncate(text: str, limit: int = MAX_OUT) -> str:
     return text if len(text) <= limit else text[-limit:] + "\n... [truncated from front]"
-
-
-def _cuda_env() -> dict:
-    env = os.environ.copy()
-    for prefix in ("/usr/local/cuda", "/opt/cuda"):
-        nvcc = Path(prefix) / "bin" / "nvcc"
-        if nvcc.exists():
-            env["CUDA_HOME"] = prefix
-            env["PATH"] = str(nvcc.parent) + os.pathsep + env.get("PATH", "")
-            lib64 = Path(prefix) / "lib64"
-            if lib64.exists():
-                env["LD_LIBRARY_PATH"] = str(lib64) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-            break
-    return env
 
 
 def _run(command: str, cwd: Path, timeout: int) -> dict:

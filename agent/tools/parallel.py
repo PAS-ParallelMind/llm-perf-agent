@@ -5,83 +5,22 @@ If the build fails, the run is skipped and the compile error is returned.
 """
 from __future__ import annotations
 
-import glob
 import os
-import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
+from ..cuda import cuda_env as _cuda_env, find_nvcc as _resolve_nvcc
 from ..workspace import get_root, resolve
 from .base import tool
 
 MAX_OUT = 20_000
 
-# Versioned CUDA install dirs (skip unversioned ``cuda`` symlink so the
-# system-admin's choice of default doesn't override the "newest wins"
-# semantics). Newest CUDA wins (sorted descending).
-_CUDA_PREFIX_GLOBS = ("/usr/local/cuda-*", "/opt/cuda-*")
-
-# CUDA compute capability for the runtime probe. Matches eval/evaluate.py.
-_CUDA_PROBE_ARCH = "sm_89"
-
-_NVCC_OK_CACHE: dict[str, bool] = {}
-
-
-def _nvcc_runtime_ok(nvcc_path: str) -> bool:
-    """Compile a tiny CUDA program and try ``cudaMalloc``. Cached.
-
-    Mirrors ``eval/evaluate.py``'s probe so the agent's compile tool can't
-    silently fall back to an nvcc whose CUDA runtime is too new for the
-    host driver (or, conversely, too old to know about the GPU's arch).
-    """
-    if nvcc_path in _NVCC_OK_CACHE:
-        return _NVCC_OK_CACHE[nvcc_path]
-    with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "probe.cu"
-        src.write_text(
-            "#include <cuda_runtime.h>\n#include <cstdio>\n"
-            "int main(){void*p;cudaError_t e=cudaMalloc(&p,16);"
-            "printf(\"%d\",e);return e!=cudaSuccess;}"
-        )
-        binp = Path(tmp) / "probe"
-        cp = subprocess.run(
-            [nvcc_path, "-O0", "-arch=" + _CUDA_PROBE_ARCH,
-             str(src), "-o", str(binp)],
-            capture_output=True, timeout=60,
-        )
-        ok = (cp.returncode == 0
-              and subprocess.run([str(binp)], capture_output=True,
-                                 timeout=10).returncode == 0)
-    _NVCC_OK_CACHE[nvcc_path] = ok
-    return ok
-
-
-def _resolve_nvcc() -> str | None:
-    """Return a working nvcc.
-
-    Prefer ``/usr/local/cuda-*/bin/nvcc`` (newest first), each verified via
-    a tiny compile + cudaMalloc probe. Fall back to ``shutil.which("nvcc")``
-    only when none of the local CUDA installs works — the system
-    ``/usr/bin/nvcc`` is often an older package that doesn't know about
-    newer compute capabilities (e.g. sm_89)."""
-    candidates: list[str] = []
-    for pat in _CUDA_PREFIX_GLOBS:
-        candidates.extend(glob.glob(f"{pat}/bin/nvcc"))
-    candidates.sort(reverse=True)
-    for c in candidates:
-        if _nvcc_runtime_ok(c):
-            return c
-    return shutil.which("nvcc")
-
 
 def _cuda_runtime_env(nvcc_path: str, base_env: dict | None = None) -> dict:
-    """Return an env dict with CUDA's lib64 prepended to LD_LIBRARY_PATH."""
-    env = (base_env or os.environ).copy()
-    lib64 = os.path.join(os.path.dirname(os.path.dirname(nvcc_path)), "lib64")
-    if os.path.isdir(lib64):
-        env["LD_LIBRARY_PATH"] = lib64 + ":" + env.get("LD_LIBRARY_PATH", "")
-    return env
+    """Thin wrapper around ``agent.cuda.cuda_env`` pinned to a specific
+    nvcc. Kept for backwards compat with callers that already know which
+    nvcc they're using."""
+    return _cuda_env(base_env=base_env, nvcc_path=nvcc_path)
 
 
 def _run(cmd: list[str], timeout: int = 180, env: dict | None = None) -> tuple[str, int]:
