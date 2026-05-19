@@ -1,6 +1,6 @@
 """VRAM estimation: model weights + KV cache.
 
-Exposed as the ``memory_estimate`` tool; also runnable as a CLI for ad-hoc
+Exposed as the ``estimate_memory`` tool; also runnable as a CLI for ad-hoc
 sanity checks.
 """
 from __future__ import annotations
@@ -108,7 +108,7 @@ def _render_report(
     context_length="Per-request context length in tokens (capped at the "
                    "model's max_seq_len).",
 )
-def memory_estimate(model: str, concurrency: int, context_length: int) -> str:
+def estimate_memory(model: str, concurrency: int, context_length: int) -> str:
     if model not in PRESET_MODELS:
         return f"ERROR: unknown model {model!r}. Available: {', '.join(sorted(PRESET_MODELS))}"
     spec = PRESET_MODELS[model]
@@ -138,7 +138,7 @@ if __name__ == "__main__":
         print(f"\n[!] Error: model {args.model!r} not in PRESET_MODELS.")
         raise SystemExit(1)
 
-    print(memory_estimate(
+    print(estimate_memory(
         model=args.model,
         concurrency=args.concurrency,
         context_length=args.context_length,

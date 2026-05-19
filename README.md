@@ -33,8 +33,8 @@ agent/
     benchmarking/
       benchmark.py   ⏳ placeholder — probe a running inference endpoint
     modeling/
-      memory.py      memory_estimate    — weights + KV cache VRAM breakdown
-      latency.py     forward_latency    — single forward-pass roofline
+      memory.py      estimate_memory    — weights + KV cache VRAM breakdown
+      latency.py     estimate_latency   — single forward-pass roofline
       serving.py     simulate_serving   — continuous-batching workload sim
       report.py      ReportBuilder      — shared text-report helpers
       configs/
@@ -55,7 +55,7 @@ and throughput. The three modeling tools under `modeling/` are real.
 All three modeling tools take preset model and GPU names (see
 `PRESET_MODELS` / `PRESET_GPUS`) and return a formatted text report.
 
-### `memory_estimate`
+### `estimate_memory`
 
 Estimate GPU memory required to serve a model: weight bytes (respecting
 per-component quantization: attention vs. FFN vs. embeddings) plus KV
@@ -63,10 +63,10 @@ cache bytes for the requested concurrency and context length. Sliding-
 window attention layers are capped at the window size.
 
 ```
-memory_estimate(model, concurrency, context_length) -> report
+estimate_memory(model, concurrency, context_length) -> report
 ```
 
-### `forward_latency`
+### `estimate_latency`
 
 Roofline latency of a single transformer forward pass for a homogeneous
 batch, broken down per operation (qkv_proj, attn_core, o_proj,
@@ -74,7 +74,7 @@ up_gate_proj, down_proj, lm_head) with a compute-vs-memory bottleneck
 label per op.
 
 ```
-forward_latency(model, gpu, batch_size, input_tokens, kv_cache_len) -> report
+estimate_latency(model, gpu, batch_size, input_tokens, kv_cache_len) -> report
 ```
 
 For decode: `input_tokens=1`, `kv_cache_len = current context length`.

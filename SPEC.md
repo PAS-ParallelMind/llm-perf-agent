@@ -105,8 +105,8 @@ and `tools.base.dispatch(name, args)` to execute each call.
 | `grep`              | tools/fs.py                         | Regex across workspace                                 |
 | `bash`              | tools/bash.py                       | Shell exec, timeout-bounded                            |
 | `benchmark`         | tools/benchmarking/benchmark.py     | ⏳ placeholder — endpoint latency/throughput probe     |
-| `memory_estimate`   | tools/modeling/memory.py            | VRAM breakdown: weights + KV cache (per model/concurrency/context) |
-| `forward_latency`   | tools/modeling/latency.py           | Single-pass roofline: per-op compute vs. memory bound  |
+| `estimate_memory`   | tools/modeling/memory.py            | VRAM breakdown: weights + KV cache (per model/concurrency/context) |
+| `estimate_latency`  | tools/modeling/latency.py           | Single-pass roofline: per-op compute vs. memory bound  |
 | `simulate_serving`  | tools/modeling/serving.py           | Continuous-batching workload sim: TTFT / TPOT / throughput |
 | `remember`          | memory.py                           | Save a memory file + index entry                       |
 | `recall`            | memory.py                           | Read a memory file by name                             |

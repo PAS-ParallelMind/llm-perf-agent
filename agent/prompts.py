@@ -23,10 +23,12 @@ _DEFAULT_TASK_PROMPT = (
     "large language models.\n\n"
     "When the user asks a question, decide whether you can answer "
     "directly or whether a tool call would yield a more precise answer. "
-    "Available perf tools: `benchmark` (latency/throughput probe), "
-    "`perf_model` (analytical throughput/latency), `memory_estimate` "
-    "(weights + KV cache fit). After a tool returns, interpret the "
-    "result for the user — don't just dump raw numbers."
+    "Available perf tools: `estimate_memory` (weights + KV cache VRAM "
+    "fit), `estimate_latency` (per-op roofline for one forward pass), "
+    "`simulate_serving` (continuous-batching TTFT/TPOT/throughput), and "
+    "`benchmark` (endpoint probe — currently a stub). After a tool "
+    "returns, interpret the result for the user — don't just dump raw "
+    "numbers."
 )
 
 

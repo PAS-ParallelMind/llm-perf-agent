@@ -1,7 +1,7 @@
 """Analytical forward-pass latency model.
 
 Computes per-operation compute / memory / roofline latencies for a single
-transformer forward pass. Used standalone via the ``forward_latency``
+transformer forward pass. Used standalone via the ``estimate_latency``
 tool, and as the inner loop of the serving simulator.
 
 Conventions:
@@ -448,7 +448,7 @@ def _render_forward_report(
 
 
 # ---------------------------------------------------------------------------
-# Tool: forward_latency
+# Tool: estimate_latency
 # ---------------------------------------------------------------------------
 
 @tool(
@@ -464,7 +464,7 @@ def _render_forward_report(
                  "(1 = decode step, N = prefill chunk of N).",
     kv_cache_len="Existing KV cache length per request before this pass.",
 )
-def forward_latency(
+def estimate_latency(
     model: str,
     gpu: str,
     batch_size: int,

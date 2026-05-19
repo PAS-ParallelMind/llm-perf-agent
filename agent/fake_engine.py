@@ -22,9 +22,9 @@ def _call(cid: str, name: str, args: dict) -> SimpleNamespace:
 class FakeEngine:
     """Returns a canned sequence of assistant messages per user turn.
 
-    Two-step trajectory: call the (placeholder) memory_estimate tool, then
-    return a final text reply with no more tool calls — the loop treats
-    that text as the assistant's answer to the user.
+    Two-step trajectory: call the estimate_memory tool against a preset
+    model, then return a final text reply with no more tool calls — the
+    loop treats that text as the assistant's answer to the user.
     """
 
     model = "fake-dry-run"
@@ -37,14 +37,16 @@ class FakeEngine:
         return [
             _msg(
                 "Let me sketch the memory footprint first.",
-                [_call(f"c{turn}a", "memory_estimate",
-                       {"spec": "{\"model\":\"demo-7B\",\"dtype\":\"fp16\"}"})],
+                [_call(f"c{turn}a", "estimate_memory",
+                       {"model": "openai/gpt-oss-20b",
+                        "concurrency": 8,
+                        "context_length": 4096})],
             ),
             _msg(
-                "[dry-run] FakeEngine reply: I called memory_estimate (which "
-                "is a placeholder for now) and would interpret the result "
-                "here. Replace FakeEngine with a real Engine to talk to a "
-                "live vLLM server.",
+                "[dry-run] FakeEngine reply: I called estimate_memory on a "
+                "preset model and would interpret the VRAM breakdown here. "
+                "Replace FakeEngine with a real Engine to talk to a live "
+                "vLLM server.",
                 None,
             ),
         ]
