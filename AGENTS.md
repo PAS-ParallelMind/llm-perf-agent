@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Python chat agent for LLM inference deployment guidance and performance analysis. Core source lives in `agent/`: `main.py` is the interactive REPL entry point, `loop.py` owns the multi-turn tool-calling loop (`ChatAgent`), `engine.py` wraps OpenAI-compatible model clients, and `config.py` defines `ChatConfig`. Tool implementations are under `agent/tools/` — `fs.py` / `bash.py` for general I/O, plus three perf-tool placeholders (`benchmark.py`, `perf_model.py`, `memory_estimate.py`) whose implementations are TBD. Static README assets live in `assets/`. `SPEC.md` documents contracts and invariants; keep behavior-changing edits consistent with it.
+This is a Python chat agent for LLM inference deployment guidance and performance analysis. Core source lives in `agent/`: `main.py` is the interactive REPL entry point, `loop.py` owns the multi-turn tool-calling loop (`ChatAgent`), `engine.py` wraps OpenAI-compatible model clients, and `config.py` defines `ChatConfig`. Tool implementations are under `agent/tools/`: `fs.py` / `bash.py` for general I/O, `benchmarking/benchmark.py` (still a stub — endpoint probe), and `modeling/{memory,latency,serving}.py` (real analytical tools: `memory_estimate`, `forward_latency`, `simulate_serving`) sharing `modeling/report.py` and `modeling/configs/` for GPU/model presets. Static README assets live in `assets/`. `SPEC.md` documents contracts and invariants; keep behavior-changing edits consistent with it.
 
 ## Build, Test, and Development Commands
 
@@ -17,11 +17,11 @@ Use Python 3.10+ and standard 4-space indentation. Follow existing module style:
 
 ## Testing Guidelines
 
-No dedicated test suite is currently checked in. For changes to the agent loop or tools, run `uv run python -m agent.main --dry-run`. For batch behavior, run a minimal config with `--limit 1` and inspect `trace.json`, `tool_calls.jsonl`, and `summary.json`. Add tests under a future `tests/` directory using `test_*.py` naming for logic that does not need a model server.
+No dedicated test suite is currently checked in. For changes to the agent loop or tools, run `uv run python -m agent.main --dry-run` and inspect `trace.json`, `tool_calls.jsonl`, and `summary.json` under `runs/`. For modeling-tool changes, the modules under `agent/tools/modeling/` are runnable as standalone CLIs (`uv run python -m agent.tools.modeling.memory ...`) for quick sanity checks. Add tests under a future `tests/` directory using `test_*.py` naming for logic that does not need a model server.
 
 ## Commit & Pull Request Guidelines
 
-Recent commits use concise imperative subjects, for example `Add bare-model baseline runner` and `Replace adapter layer with JSON-in/JSON-out contract`. Keep the first line focused and under roughly 72 characters. Pull requests should describe the behavior change, list commands or smoke tests run, call out config or schema changes, and include screenshots only when touching `assets/` or `visualize_tool/`.
+Recent commits use concise imperative subjects, for example `Refocus repo on LLM inference perf agent` and `Engine: per-call timeout + retry on transient errors`. Keep the first line focused and under roughly 72 characters. Pull requests should describe the behavior change, list commands or smoke tests run, call out config or schema changes, and include screenshots only when touching `assets/` or the `webui/` frontend.
 
 ## Security & Configuration Tips
 

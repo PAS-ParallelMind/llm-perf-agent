@@ -96,22 +96,26 @@ and `tools.base.dispatch(name, args)` to execute each call.
 
 **Registered tools today:**
 
-| Tool                | Module                       | Purpose                                       |
-|---------------------|------------------------------|-----------------------------------------------|
-| `read_file`         | tools/fs.py                  | Paginated read (offset/limit, line-numbered)  |
-| `write_file`        | tools/fs.py                  | Overwrite / create                            |
-| `edit_file`         | tools/fs.py                  | String-replace (`old` → `new`)                |
-| `glob`              | tools/fs.py                  | List matching paths                           |
-| `grep`              | tools/fs.py                  | Regex across workspace                        |
-| `bash`              | tools/bash.py                | Shell exec, timeout-bounded                   |
-| `benchmark`         | tools/benchmark.py           | ⏳ placeholder — latency/throughput probe     |
-| `perf_model`        | tools/perf_model.py          | ⏳ placeholder — analytical perf model        |
-| `memory_estimate`   | tools/memory_estimate.py     | ⏳ placeholder — weights + KV cache fit       |
-| `remember`          | memory.py                    | Save a memory file + index entry              |
-| `recall`            | memory.py                    | Read a memory file by name                    |
+| Tool                | Module                              | Purpose                                                |
+|---------------------|-------------------------------------|--------------------------------------------------------|
+| `read_file`         | tools/fs.py                         | Paginated read (offset/limit, line-numbered)           |
+| `write_file`        | tools/fs.py                         | Overwrite / create                                     |
+| `edit_file`         | tools/fs.py                         | String-replace (`old` → `new`)                         |
+| `glob`              | tools/fs.py                         | List matching paths                                    |
+| `grep`              | tools/fs.py                         | Regex across workspace                                 |
+| `bash`              | tools/bash.py                       | Shell exec, timeout-bounded                            |
+| `benchmark`         | tools/benchmarking/benchmark.py     | ⏳ placeholder — endpoint latency/throughput probe     |
+| `memory_estimate`   | tools/modeling/memory.py            | VRAM breakdown: weights + KV cache (per model/concurrency/context) |
+| `forward_latency`   | tools/modeling/latency.py           | Single-pass roofline: per-op compute vs. memory bound  |
+| `simulate_serving`  | tools/modeling/serving.py           | Continuous-batching workload sim: TTFT / TPOT / throughput |
+| `remember`          | memory.py                           | Save a memory file + index entry                       |
+| `recall`            | memory.py                           | Read a memory file by name                             |
 
-The three placeholders intentionally have loose argument schemas (a
-single `spec: str`). Tighten them when the implementations land.
+The three modeling tools take structured kwargs (model + GPU preset
+names from `tools/modeling/configs/`, plus workload-shape ints) and
+return a formatted text report rendered via `tools/modeling/report.py`.
+The `benchmark` tool is still a stub with a loose `spec: str` schema;
+tighten it when the endpoint probe lands.
 
 ---
 
@@ -229,12 +233,22 @@ requires an entry to exist.
 
 ## 10. Extending — adding a tool
 
-1. Create `agent/tools/<your_tool>.py`.
+1. Create `agent/tools/<your_tool>.py`, or drop a module into an
+   existing subpackage (e.g. `agent/tools/modeling/<your_tool>.py`,
+   `agent/tools/benchmarking/<your_tool>.py`) when the tool fits a
+   thematic group. Subpackages are imported by `agent/tools/__init__.py`
+   via their own `__init__.py`, which side-effect imports the leaf
+   modules so the `@tool` decorator runs.
 2. Decorate a regular function with `@tool(description, **param_desc)`.
-3. Register the module in `agent/tools/__init__.py` (`from . import <your_tool>`).
+   Type-hint every parameter — those types drive the JSON schema.
+3. Register the module: either add `from . import <your_tool>` to
+   `agent/tools/__init__.py` for top-level tools, or to the subpackage's
+   own `__init__.py` for grouped tools.
 4. (Optional) Update `agent/prompts.py` so the default system prompt
    tells the model when to reach for it.
 
-The function signature drives the JSON schema. Default values become
-optional parameters. Return value must be a single string; long results
-are auto-truncated at 16 KB.
+Default values become optional parameters. Return value must be a single
+string; long results are auto-truncated at 16 KB. For tools that produce
+multi-section reports, prefer composing the output via
+`agent/tools/modeling/report.py::ReportBuilder` so formatting stays
+consistent across tools.
