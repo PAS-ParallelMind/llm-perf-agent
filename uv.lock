@@ -314,6 +314,28 @@ wheels = [
 ]
 
 [[package]]
+name = "llm-perf-agent"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "openai" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pyyaml" },
+    { name = "rich" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "huggingface-hub", specifier = ">=1.12.0" },
+    { name = "openai", specifier = ">=1.40.0" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "rich", specifier = ">=13.7.0" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -644,28 +666,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e4/a5/2f6ed612056819de445a433ca1f2821ac3dab7f150d569a59e9cc105de1d/pandas-3.0.2-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:734be7551687c00fbd760dc0522ed974f82ad230d4a10f54bf51b80d44a08702", size = 11815274, upload-time = "2026-03-31T06:48:22.695Z" },
     { url = "https://files.pythonhosted.org/packages/00/2f/b622683e99ec3ce00b0854bac9e80868592c5b051733f2cf3a868e5fea26/pandas-3.0.2-cp314-cp314t-win_amd64.whl", hash = "sha256:57a07209bebcbcf768d2d13c9b78b852f9a15978dac41b9e6421a81ad4cdd276", size = 10888530, upload-time = "2026-03-31T06:48:25.806Z" },
     { url = "https://files.pythonhosted.org/packages/cb/2b/f8434233fab2bd66a02ec014febe4e5adced20e2693e0e90a07d118ed30e/pandas-3.0.2-cp314-cp314t-win_arm64.whl", hash = "sha256:5371b72c2d4d415d08765f32d689217a43227484e81b2305b52076e328f6f482", size = 9455341, upload-time = "2026-03-31T06:48:28.418Z" },
-]
-
-[[package]]
-name = "parallelmind-harness"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "huggingface-hub" },
-    { name = "openai" },
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pyyaml" },
-    { name = "rich" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "huggingface-hub", specifier = ">=1.12.0" },
-    { name = "openai", specifier = ">=1.40.0" },
-    { name = "pandas", specifier = ">=2.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "rich", specifier = ">=13.7.0" },
 ]
 
 [[package]]

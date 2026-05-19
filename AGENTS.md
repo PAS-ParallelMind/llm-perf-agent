@@ -2,16 +2,14 @@
 
 ## Project Structure & Module Organization
 
-This is a Python harness for agentic parallel-code generation and benchmarking. Core source lives in `agent/`: `batch.py` runs config-driven batches, `main.py` is the experimental interactive CLI, `loop.py` owns the tool-calling loop, and `engine.py` wraps OpenAI-compatible model clients. Tool implementations are under `agent/tools/`. `scripts/` holds benchmark or baseline utilities such as `scripts/run_bare.py`. `visualize_tool/view_trace.html` is a standalone trace viewer. Static README assets live in `assets/`. `SPEC.md` documents contracts and invariants; keep behavior-changing edits consistent with it.
+This is a Python chat agent for LLM inference deployment guidance and performance analysis. Core source lives in `agent/`: `main.py` is the interactive REPL entry point, `loop.py` owns the multi-turn tool-calling loop (`ChatAgent`), `engine.py` wraps OpenAI-compatible model clients, and `config.py` defines `ChatConfig`. Tool implementations are under `agent/tools/` — `fs.py` / `bash.py` for general I/O, plus three perf-tool placeholders (`benchmark.py`, `perf_model.py`, `memory_estimate.py`) whose implementations are TBD. Static README assets live in `assets/`. `SPEC.md` documents contracts and invariants; keep behavior-changing edits consistent with it.
 
 ## Build, Test, and Development Commands
 
 - `uv sync`: install dependencies from `pyproject.toml` and `uv.lock`.
-- `uv run python -m agent.batch --config /path/to/run.yaml`: run a batch using a YAML config.
-- `uv run python -m agent.batch --config /path/to/run.yaml --limit 1`: smoke-test a single problem.
-- `uv run python -m agent.main --dry-run`: exercise the interactive loop with `FakeEngine`, without a vLLM server.
-- `uv run python scripts/run_bare.py ...`: run the bare-model baseline.
-- `python -m http.server` from the repo root: serve `visualize_tool/view_trace.html` when browser file loading is restricted.
+- `uv run python -m agent.main --dry-run`: exercise the chat loop with `FakeEngine`, no vLLM required.
+- `uv run python -m agent.main --config /path/to/chat.yaml`: real session against an OpenAI-compatible endpoint.
+- `uv run python -m agent.main --model <name> --base-url <url>`: same, without a YAML config.
 
 ## Coding Style & Naming Conventions
 

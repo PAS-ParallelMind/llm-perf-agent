@@ -1,23 +1,32 @@
 """System prompt assembly.
 
-Task-specific guidance lives in ``agent.yaml`` (``system_prompt`` field).
-This module only handles (a) a minimal default fallback, and (b)
-appending the persistent memory index to whatever task prompt was given.
+Task-specific guidance lives in ``chat.yaml`` (``system_prompt`` field).
+This module only handles (a) a minimal default fallback aimed at the
+LLM-inference-perf use case, and (b) appending the persistent memory
+index to whatever task prompt was given.
 """
 from __future__ import annotations
 
 _MEMORY_BLOCK = """
 ## Memory
 Persistent notes live under ./memory. Use `remember` to save durable
-facts and `recall` to re-read a file by name.
+facts (preferred hardware, customer constraints, known-good configs)
+and `recall` to re-read a file by name.
 
 ### MEMORY.md
 {memory_index}
 """
 
 _DEFAULT_TASK_PROMPT = (
-    "You are a helpful engineering agent. Use the available tools to "
-    "complete the user's request."
+    "You are an LLM inference performance engineer. Help the user with "
+    "deployment hardware guidance and performance analysis for serving "
+    "large language models.\n\n"
+    "When the user asks a question, decide whether you can answer "
+    "directly or whether a tool call would yield a more precise answer. "
+    "Available perf tools: `benchmark` (latency/throughput probe), "
+    "`perf_model` (analytical throughput/latency), `memory_estimate` "
+    "(weights + KV cache fit). After a tool returns, interpret the "
+    "result for the user — don't just dump raw numbers."
 )
 
 

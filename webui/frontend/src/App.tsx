@@ -27,7 +27,7 @@ export default function App() {
       <header className="border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/40">
         <div className="max-w-screen-2xl mx-auto px-6 py-3 flex items-center gap-6">
           <h1 className="text-lg font-semibold">
-            ParallelMind <span className="text-slate-400">/ webui</span>
+            llm-perf-agent <span className="text-slate-400">/ webui</span>
           </h1>
           <nav className="flex items-center">
             <NavTab to="/analyzer"   label="Analyzer" />

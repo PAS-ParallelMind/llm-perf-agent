@@ -1,4 +1,4 @@
-"""FastAPI backend for the parallelmind_harness web UI.
+"""FastAPI backend for the llm-perf-agent web UI.
 
 Run locally:
     /mnt/disk2/elton7318/venv/bin/python -m webui.backend.server
@@ -31,7 +31,7 @@ RUNS_DIR = HARNESS_ROOT / "runs"
 BENCH_PATH = HARNESS_ROOT / "eval" / "benchmarks.json"
 FRONTEND_DIST = HARNESS_ROOT / "webui" / "frontend" / "dist"
 
-# Run dirs we should ignore when listing (legacy / non-ParallelMind layouts).
+# Run dirs we should ignore when listing (legacy / non-session layouts).
 _RUN_BLOCKLIST = {"legacy", "hecbench", "hecbench_serial_gen", "pareval"}
 
 
@@ -39,7 +39,7 @@ _RUN_BLOCKLIST = {"legacy", "hecbench", "hecbench_serial_gen", "pareval"}
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="parallelmind_harness webui", version="0.1")
+app = FastAPI(title="llm-perf-agent webui", version="0.1")
 
 # Permissive CORS so Vite dev server (port 5173) can hit us during dev.
 app.add_middleware(

@@ -1,7 +1,7 @@
 [project]
-name = "parallelmind-harness"
+name = "llm-perf-agent"
 version = "0.1.0"
-description = "Agentic framework for writing, debugging, and benchmarking parallel code (CUDA / MPI / OpenMP) with vLLM-served models."
+description = "Interactive chat agent for LLM inference deployment guidance and performance analysis. OpenAI-compatible tool-calling against any vLLM backend."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

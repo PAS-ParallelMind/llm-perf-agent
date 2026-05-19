@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manage the parallelmind_harness webui tmux session.
+# Manage the llm-perf-agent webui tmux session.
 #
 # Usage:
 #   webui/webui.sh [start | stop | restart | status]

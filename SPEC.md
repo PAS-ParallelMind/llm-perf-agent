@@ -1,159 +1,76 @@
-# ParallelMind Harness — Specification
+# Agent for LLM Inference Performance — Specification
 
-Reference for what this framework **is**, what guarantees it makes, and
-what its extension points are. Read `README.md` for tutorial-style
-onboarding; read this document to understand the contracts.
+Reference for the chassis: what guarantees it makes, and where to extend
+it. Read [README.md](README.md) for tutorial-style onboarding; read this
+for contracts.
 
 ---
 
 ## 1. Purpose
 
-ParallelMind Harness drives an LLM — via an OpenAI-compatible
-tool-calling endpoint — through pre-rendered programming tasks, runs
-each task in a sandboxed workspace, and emits a unified results JSON.
+A multi-turn chat agent driving an LLM — via an OpenAI-compatible
+tool-calling endpoint — that helps users with **LLM inference deployment
+guidance and performance analysis**. The agent calls performance tools
+on the user's behalf, interprets results, and answers follow-ups across
+turns.
 
-It is **not** a parallel runtime, compiler, scheduler, or benchmark
-evaluator. It is glue between:
+It is **not** a benchmark runner, a serving framework, or a hardware
+oracle. It is glue between:
 
-- a vLLM-served model speaking OpenAI chat-completions,
-- a tool-calling loop with filesystem / shell / build tools,
-- a unified JSON-in/JSON-out contract that a benchmark-specific
-  preprocessor produces.
-
-The harness itself is benchmark-agnostic. Suite-specific code (ParEval,
-HeCBench, ParallelMind eval, …) lives outside the harness as
-preprocessing scripts that emit `problems.json` and downstream
-evaluators that consume the harness's output.
+- a vLLM-served (or any OpenAI-compatible) chat model,
+- a tool-calling loop with filesystem / shell / perf-analysis tools,
+- a REPL that persists messages, exports traces, and survives crashes.
 
 ---
 
 ## 2. Architecture
 
-Three layers, top → bottom:
-
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ agent/batch.py            config-driven runner + concurrency │
+│ agent/main.py             REPL + session bookkeeping         │
 ├──────────────────────────────────────────────────────────────┤
-│ agent/loop.py             tool-calling agent loop            │
+│ agent/loop.py             ChatAgent — multi-turn loop        │
 │ agent/engine.py           OpenAI chat.completions wrapper    │
-│ agent/tools/*             FS / shell / build / submit tools  │
-│ agent/memory.py           persistent cross-run notes         │
+│ agent/tools/*             FS / shell / perf tools            │
+│ agent/memory.py           persistent cross-session notes     │
 ├──────────────────────────────────────────────────────────────┤
-│ agent/workspace.py        thread-local per-task working dir  │
-│ agent/submission.py       thread-local submit_solution sink  │
+│ agent/workspace.py        thread-local session workspace     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Strict layering**: a layer calls only downward. Tools never reach
-into batch.py, the loop never imports the batch runner. The loop is
-benchmark-agnostic and the tools are reusable across runs.
+**Strict layering**: a layer calls only downward. Tools never reach into
+main.py; the loop never imports the REPL. The loop is domain-agnostic —
+the perf focus comes from the registered tools + the system prompt.
 
 ---
 
-## 3. Core data types
+## 3. Core types
 
-Defined in `agent/types.py`. Both are `@dataclass` with no methods —
-pure data envelopes.
+### `ChatAgent` (agent/loop.py)
+Holds:
+- `messages`: persistent OpenAI-format conversation
+- `tool_call_log`: append-only log of every dispatch (incl. `<llm>`)
+- `tool_call_counts`: anti-thrash counter keyed by `(name, args)`
+- `turn_count`, `max_steps`
 
-### `AgentTask`
+Public methods: `chat(user_message) -> TurnResult`, `reset()`.
+
+### `TurnResult`
 ```python
-id: str                          # unique problem identifier
-instruction: str                 # natural-language prompt for the agent
-metadata: dict[str, Any]         # pass-through — copied to AgentResult
-```
-
-- `id` doubles as the per-task workspace directory name, so it must be
-  filesystem-safe.
-- `instruction` is the first `user` message. The system prompt comes
-  from `RunConfig.system_prompt` + the memory index.
-- `metadata` is preserved untouched; output JSON copies it back.
-
-### `AgentResult`
-```python
-task_id: str
-code: str                        # submitted code, or summary for workspace tasks
-raw_reply: str                   # the model's final text reply
-trace: list[dict]                # full message history
-tool_calls: list[dict]           # step-indexed tool-call log
-steps: int
+reply: str             # final assistant text (what to show the user)
+steps: int             # tool-call iterations consumed this turn
 elapsed_s: float
-submitted: bool                  # True iff submit_solution was called
-error: str | None
-metadata: dict                   # copy of AgentTask.metadata + harness-internal additions
+tool_calls: list[dict] # this turn's dispatch log
+truncated: bool        # True if max_steps hit before a reply
 ```
 
-If the agent never calls `submit_solution`, `batch.py` falls back to
-extracting the last fenced code block from `raw_reply`; `submitted`
-stays False.
+### `SessionMeta` (agent/types.py)
+Top-level info written to `<session>/batch/session/summary.json` after
+every turn.
 
 ---
 
-## 4. Input / output JSON contract
-
-The harness's only external contract: read `problems.json`, write a
-results JSON. No template substitution, no benchmark-specific routing.
-
-### Input — `problems.json`
-
-```json
-[
-  {
-    "id":          "P001",
-    "prompt":      "...already-rendered text...",
-    "seed_files":  { "<relpath>": "<content>", ... },   // optional
-    "metadata":    { ... }                              // optional
-  }
-]
-```
-
-**Invariants:**
-
-1. `id` values are unique within a file. The harness rejects
-   duplicates at load time.
-2. `prompt` is the verbatim user message — the harness performs no
-   `{{var}}` substitution. The producing script is responsible for
-   rendering whatever template it likes.
-3. `seed_files` keys are forward-slash relative paths. Absolute paths
-   and `..` segments are rejected. Nested directories are created
-   automatically. Each file is written into the per-task workspace
-   before the agent loop starts.
-4. `metadata` is copied verbatim into the matching output entry. The
-   harness never reads its keys (one exception: a harness-internal
-   `workspace` key is added during execution and stripped before
-   export).
-
-### Output
-
-`<output>.json`:
-```json
-[
-  {
-    "id":         "P001",
-    "code":       "...submitted source...",
-    "submitted":  true,
-    "steps":      21,
-    "elapsed_s":  356.0,
-    "error":      null,
-    "metadata":   { ... passthrough ... }     // omitted if empty
-  }
-]
-```
-
-`<output_stem>.code.json` (always written):
-```json
-[ {"id": "P001", "code": "..."}, ... ]
-```
-Only entries where `submitted=True` and `code` is non-empty appear.
-Convenient for piping into a downstream evaluator.
-
-**Crash-safe incremental export**: after each task completes,
-`batch.py` re-serializes the full partial result set. A crash mid-run
-leaves a valid (partial) output JSON.
-
----
-
-## 5. Tool contract
+## 4. Tool contract
 
 Tools live in `agent/tools/*` and register themselves via the `@tool`
 decorator (`agent/tools/base.py`). The decorator:
@@ -162,202 +79,162 @@ decorator (`agent/tools/base.py`). The decorator:
 2. builds a JSON-schema parameter object,
 3. appends the function to a module-level registry keyed by name.
 
-`Agent.run()` calls `tools.base.schemas()` once to get the schema list
-for the LLM, and `tools.base.dispatch(name, args)` to execute each
-tool call.
+`ChatAgent.chat()` calls `tools.base.schemas()` for the LLM's tool list
+and `tools.base.dispatch(name, args)` to execute each call.
 
 **Invariants:**
 
 - Every tool returns a single string. Truncation happens at the loop
-  boundary (16 KB, in `agent/loop.py`), not in the tool.
+  boundary (16 KB, in `agent/loop.py`), not inside the tool.
 - Tools are pure Python callables — no async, no generators.
-- File-modifying tools (`write_file`, `edit_file`, `omp_build_and_run`,
-  …) operate within the current workspace root; paths resolve via
-  `agent.workspace.resolve()` which blocks escaping via `..`.
-- `submit_solution` is the only tool that terminates the loop. It
-  sets a thread-local value read by the loop at end-of-turn.
-- `remember` / `recall` are the only tools allowed to write outside
-  the workspace (they target `memory/`).
-- **`read_file` is paginated** (`offset` + `limit`, default 200
-  lines). Responses start with a `[lines X–Y of N]` header so the
-  agent knows where to continue.
+- File-modifying tools (`write_file`, `edit_file`, …) operate within the
+  session workspace; paths resolve via `agent.workspace.resolve()` which
+  blocks `..` escapes.
+- `remember` / `recall` are the only tools allowed to write outside the
+  workspace (they target `memory/`).
+- `read_file` is paginated (`offset` + `limit`, default 200 lines).
 
-Available tools today:
+**Registered tools today:**
 
-| Tool                   | Module              | Purpose                                     |
-|------------------------|---------------------|---------------------------------------------|
-| `read_file`            | tools/fs.py         | Paginated read (offset/limit, line-numbered) |
-| `write_file`           | tools/fs.py         | Overwrite / create                          |
-| `edit_file`            | tools/fs.py         | String-replace (`old` → `new`)              |
-| `glob`                 | tools/fs.py         | List matching paths                         |
-| `grep`                 | tools/fs.py         | Regex across workspace                      |
-| `bash`                 | tools/bash.py       | Shell exec, timeout-bounded                 |
-| `omp_build_and_run`    | tools/parallel.py   | gcc/clang/icpx + run                        |
-| `nvcc_build_and_run`   | tools/parallel.py   | nvcc + run                                  |
-| `cuda_profile`         | tools/profile.py    | Build/profile CUDA workspace commands       |
-| `cuda_guided_profile`  | tools/profile.py    | Broad-to-narrow CUDA bottleneck diagnosis   |
-| `mpi_build_and_run`    | tools/parallel.py   | mpicc/mpicxx + `mpirun -np N` + run         |
-| `hardware_info`        | tools/parallel.py   | Probe GPUs / nvcc / host compilers          |
-| `submit_solution`      | tools/submit.py     | Submit final code/summary and stop the loop |
-| `remember`             | memory.py           | Write a memory file + index entry           |
-| `recall`               | memory.py           | Read a memory file by name                  |
+| Tool                | Module                       | Purpose                                       |
+|---------------------|------------------------------|-----------------------------------------------|
+| `read_file`         | tools/fs.py                  | Paginated read (offset/limit, line-numbered)  |
+| `write_file`        | tools/fs.py                  | Overwrite / create                            |
+| `edit_file`         | tools/fs.py                  | String-replace (`old` → `new`)                |
+| `glob`              | tools/fs.py                  | List matching paths                           |
+| `grep`              | tools/fs.py                  | Regex across workspace                        |
+| `bash`              | tools/bash.py                | Shell exec, timeout-bounded                   |
+| `benchmark`         | tools/benchmark.py           | ⏳ placeholder — latency/throughput probe     |
+| `perf_model`        | tools/perf_model.py          | ⏳ placeholder — analytical perf model        |
+| `memory_estimate`   | tools/memory_estimate.py     | ⏳ placeholder — weights + KV cache fit       |
+| `remember`          | memory.py                    | Save a memory file + index entry              |
+| `recall`            | memory.py                    | Read a memory file by name                    |
+
+The three placeholders intentionally have loose argument schemas (a
+single `spec: str`). Tighten them when the implementations land.
 
 ---
 
-## 6. Agent loop contract
+## 5. Loop contract
 
-`agent/loop.py::Agent.run(task, time_budget_s)` is the only place the
-LLM is invoked. One turn =
+`ChatAgent.chat(user_message)` runs one user turn:
 
-1. Call `engine.chat(messages, tools=schemas)`.
-2. Append assistant message (with `tool_calls` if any).
-3. If `reasoning=True` on the engine, prepend the reasoning string to
-   `content` so it's echoed on the next turn.
-4. If no tool calls: send an idle-nudge; after `_MAX_IDLE_TURNS=3`
-   consecutive idle turns, stop.
-5. Otherwise, dispatch each tool call sequentially, append the result
-   as a `tool` message, log to `tool_call_log`.
-6. If `submission.get() is not None`, the loop exits successfully.
+1. Refresh the system prompt (picks up memory edits made mid-session).
+2. Append the user message; tick `turn_count`.
+3. Up to `max_steps` iterations of:
+   a. `engine.chat(messages, tools=schemas)`
+   b. If `reasoning=True`, prepend the reasoning to `content`.
+   c. **No tool calls** → that text is the final reply; return.
+   d. Otherwise: dispatch each tool (sequentially), append result as
+      `role:"tool"`, log to `tool_call_log`.
+4. If `max_steps` exhausted, return `truncated=True` with a sentinel
+   reply.
 
-Exits: successful submission, time budget exceeded, `max_steps`
-reached, or idle-streak exceeded. Every exit produces an `AgentResult`
-— the loop never raises to its caller except for engine / network
-errors, which `batch.py` catches and records as `error`.
+Anti-thrash: `_MAX_TOOL_CALLS_PER_TURN=4` (dedupe within a turn),
+`_MAX_IDENTICAL_TOOL_CALLS=3` (per session, across turns).
+
+The loop never raises to its caller; engine errors propagate up so the
+REPL can show them without killing the session.
 
 ---
 
-## 7. Configuration model
+## 6. Configuration model
 
-A single YAML drives a run. Schema in `agent/config.py::RunConfig`:
+A single YAML, schema in `agent/config.py::ChatConfig`:
 
 ```yaml
-model:
-  name:        <str>     # e.g. openai/Qwen3-Coder-30B-A3B-Instruct
-  base_url:    <str>     # vLLM OpenAI endpoint
-  api_key:     <str>     # usually "EMPTY"
-  temperature: <float>
-  max_tokens:  <int>
-  reasoning:   <bool>    # echo model's chain-of-thought back each turn
-
 agent:
-  max_steps:   <int>     # hard cap on loop iterations
-  time_budget: <int>     # per-task wall-clock seconds
-  workers:     <int>     # concurrent tasks (threads)
+  model:
+    name:        <str>
+    base_url:    <str>
+    api_key:     <str>
+    temperature: <float|null>
+    max_tokens:  <int>
+    reasoning:   <bool>
+  max_steps:     <int>
 
-io:
-  input:           <abs path to problems.json>
-  output:          <abs path to results JSON>
-  workspace_root:  <abs path; per-task subdirs created here>
+session:
+  dir:           <path>      # parent dir for session subdirs
+  name:          <str|null>  # auto chat-YYYYMMDD-HHMMSS if null
 
 # One of:
-system_prompt: |
-  <multiline task-specific guidance>
-# or
+system_prompt:      |
+  <multi-line task-specific guidance>
 system_prompt_file: <path>
 ```
 
-The system prompt is concatenated with the auto-loaded memory index
-(`memory/MEMORY.md`) to produce the final system message. If both
-`system_prompt` and `system_prompt_file` are set, the inline string
-wins.
+Inline `system_prompt` wins over `system_prompt_file` when both are set.
+
+The hardware / model *under analysis* is **not** in config. Tools take
+their own arguments per call.
 
 ---
 
-## 8. Run output layout
-
-Everything for a run lives under whatever directory you choose; the
-harness only manages `io.output` and `io.workspace_root`:
+## 7. Session output layout
 
 ```
-<run-dir>/
-  run.yaml                         # input: config
-  problems.json                    # input: pre-rendered prompts
-  agent_output.json                # output: per-task results
-  agent_output.code.json           # auxiliary: [{id, code}, ...]
-  batch/<task_id>/                 # per-task workspace
-    trace.json                     # full message history
-    tool_calls.jsonl               # step-indexed tool log
-    summary.json                   # steps / elapsed / submitted / error
-    *.cu, *.cpp, a.out             # whatever the agent wrote
+<session.dir>/<session.name>/
+  run.yaml                              config snapshot
+  batch/session/                        per-session workspace
+    trace.json                          full message history
+    tool_calls.jsonl                    step-indexed tool log
+    summary.json                        SessionMeta
+    *                                   whatever the agent wrote
 ```
 
-Filenames inside `batch/<task_id>/` aren't enforced by the harness —
-the agent can write anything. `trace.json` / `tool_calls.jsonl` /
-`summary.json` are produced by `batch.py` after the loop finishes.
+The nesting (`batch/session/`) is for compatibility with the legacy
+webui under `webui/`. After every user turn, the loop re-serializes
+trace.json + tool_calls.jsonl + summary.json — partial sessions remain
+inspectable.
 
 ---
 
-## 9. Memory system
+## 8. Memory
 
-`memory/` stores persistent notes usable across runs.
+`memory/` stores persistent notes usable across sessions.
 
-- `MEMORY.md` is the index — one line per memory:
-  `- [title](file.md) — hook`.
-- Per-memory files have YAML frontmatter (`name`, `description`,
-  `type`).
-- The `remember` tool writes both the file and the index line
-  atomically.
-- The `recall` tool reads a memory file by filename.
-- `prompts.build_system_prompt()` always loads the index and injects
-  it under a `## Memory` section in the system message.
+- `MEMORY.md` is the index: `- [title](file.md) — hook` per line.
+- Each memory file has YAML frontmatter (`name`, `description`, `type`).
+- `remember` writes both the file and the index line.
+- `recall` reads a memory file by filename.
+- `prompts.build_system_prompt()` always injects the index under a
+  `## Memory` section.
 
 Memory is **optional** and **inspectable** — nothing in the loop
-requires a memory entry to exist. The index is truncated to fit the
-context window.
+requires an entry to exist.
 
 ---
 
-## 10. Invariants and non-goals
+## 9. Invariants and non-goals
 
 ### Invariants
-1. **No benchmark-specific logic anywhere in the harness**. All
-   benchmark-aware logic lives in external preprocessing scripts that
-   emit `problems.json`.
-2. **Workspace isolation**: each task's filesystem effects are
-   confined to its `batch/<task_id>/` directory. Tool dispatch
-   resolves paths through `workspace.resolve()` which rejects `..`
-   escapes.
-3. **Thread safety via thread-locals**: `workspace.set_root()` and
-   `submission.reset()` are thread-local, so `workers: N` in config
-   produces N independent agent runs without mutex.
-4. **Deterministic re-runs**: with `temperature: 0.0`, the same
-   `problems.json` produces near-identical output across runs. (Some
-   non-determinism remains under concurrent vLLM load; known quirk.)
-5. **Crash-safe incremental export**: after each task completes,
-   `batch.py` re-serializes the full partial result set.
+1. **No domain-specific logic in the loop**. Domain focus comes from
+   registered tools + the system prompt.
+2. **Workspace isolation**: each session's filesystem effects are
+   confined to its `batch/session/` directory.
+3. **Crash-safe trace**: after every user turn, the full trace is
+   re-serialized.
+4. **No hidden global state**: the workspace root is thread-local; the
+   tool registry is process-wide but populated declaratively at import.
 
 ### Non-goals
-- **No distributed scheduling**: workers are threads in one process.
-  For multi-host runs, split `problems.json` and launch N instances.
-- **No sandboxing beyond `subprocess` + `cwd`**: the `bash` tool can
-  read anything the process can read. Run in a constrained container
-  for untrusted models.
-- **No template substitution**: the harness will not interpret
-  `{{var}}` or any other syntax in `prompt`. Render externally.
-- **No caching of model responses**: every run re-issues every
-  prompt.
-- **No benchmark evaluator integration**: validating correctness or
-  measuring performance is a downstream concern. The harness emits
-  `code`; the consumer evaluates.
+- **No batch mode**: this is an interactive chat agent. For headless
+  evaluation, drive `ChatAgent.chat()` from a Python script.
+- **No model-response caching**: every turn re-issues every prompt.
+- **No live endpoint management**: the agent does not spawn or tear
+  down inference servers. If a tool needs to talk to one, the URL is
+  passed as a tool argument.
 
 ---
 
-## 11. Extension — running a new benchmark
+## 10. Extending — adding a tool
 
-There is no harness-side change required. Write a small preprocessing
-script that walks the benchmark's source tree and emits a
-`problems.json`. For each problem:
+1. Create `agent/tools/<your_tool>.py`.
+2. Decorate a regular function with `@tool(description, **param_desc)`.
+3. Register the module in `agent/tools/__init__.py` (`from . import <your_tool>`).
+4. (Optional) Update `agent/prompts.py` so the default system prompt
+   tells the model when to reach for it.
 
-1. Render whatever prompt / instructions you want into `prompt`.
-2. If the task needs scaffolding files (headers, datasets, reference
-   sources), inline them into `seed_files`.
-3. Put any downstream-consumer-relevant fields (category, expected
-   validation type, parallelism model, ...) into `metadata`.
-
-Then write a `run.yaml` pointing at the output and run
-`python -m agent.batch --config run.yaml`. The result JSON has
-everything a downstream evaluator needs (id, code, metadata
-passthrough, submitted flag).
-
-`eval/build_problems_json.py` (in this repo) is a 30-line example
-that converts ParallelMind's own benchmarks into the harness format.
+The function signature drives the JSON schema. Default values become
+optional parameters. Return value must be a single string; long results
+are auto-truncated at 16 KB.

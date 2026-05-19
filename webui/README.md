@@ -37,11 +37,11 @@ Two terminals:
 
 ```bash
 # 1. backend (with auto-reload)
-cd parallelmind_harness
+cd llm-perf-agent
 /mnt/disk2/elton7318/venv/bin/python -m webui.backend.server   # :8080
 
 # 2. frontend (Vite dev server, proxies /api → :8080)
-cd parallelmind_harness/webui/frontend
+cd llm-perf-agent/webui/frontend
 npm run dev                                                     # :5173
 ```
 
@@ -51,7 +51,7 @@ edits under `webui/backend/` trigger uvicorn reload.
 ## Build for "production"
 
 ```bash
-cd parallelmind_harness/webui/frontend
+cd llm-perf-agent/webui/frontend
 npm run build                                                   # → dist/
 
 cd ../..

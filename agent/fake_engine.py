@@ -20,38 +20,31 @@ def _call(cid: str, name: str, args: dict) -> SimpleNamespace:
 
 
 class FakeEngine:
-    """Returns a canned sequence of assistant messages per user turn."""
+    """Returns a canned sequence of assistant messages per user turn.
+
+    Two-step trajectory: call the (placeholder) memory_estimate tool, then
+    return a final text reply with no more tool calls — the loop treats
+    that text as the assistant's answer to the user.
+    """
 
     model = "fake-dry-run"
+    reasoning = False
 
     def __init__(self) -> None:
         self._turn_counter = itertools.count()
 
     def _script(self, turn: int) -> list[SimpleNamespace]:
-        # a 3-step trajectory: glob -> read a memory file -> final answer
         return [
             _msg(
-                "Let me look around first.",
-                [_call(f"c{turn}a", "glob", {"pattern": "agent/**/*.py"})],
+                "Let me sketch the memory footprint first.",
+                [_call(f"c{turn}a", "memory_estimate",
+                       {"spec": "{\"model\":\"demo-7B\",\"dtype\":\"fp16\"}"})],
             ),
             _msg(
-                "I'll save a note to memory.",
-                [
-                    _call(
-                        f"c{turn}b",
-                        "remember",
-                        {
-                            "name": "dry run demo",
-                            "type": "project",
-                            "description": "Proof that the dry-run loop executes tool calls",
-                            "body": "Triggered via FakeEngine in --dry-run mode.",
-                        },
-                    )
-                ],
-            ),
-            _msg(
-                "[dry-run] Loop works: globbed files, wrote a memory entry, "
-                "and returning a final answer with no further tool calls.",
+                "[dry-run] FakeEngine reply: I called memory_estimate (which "
+                "is a placeholder for now) and would interpret the result "
+                "here. Replace FakeEngine with a real Engine to talk to a "
+                "live vLLM server.",
                 None,
             ),
         ]
@@ -61,8 +54,8 @@ class FakeEngine:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> SimpleNamespace:
-        # derive which step of the current user turn we're on from the
-        # message history: count tool results since the last user message
+        # Derive which step of the current user turn we're on from the
+        # message history: count tool results since the last user message.
         step = 0
         for m in reversed(messages):
             if m.get("role") == "user":

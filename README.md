@@ -1,259 +1,211 @@
-# ParallelMind Harness
+# Agent for LLM Inference Performance
 
-![ParallelMind Harness](assets/banner.png)
+An interactive chat agent for **LLM inference deployment guidance and
+performance analysis**. The agent runs on any OpenAI-compatible
+tool-calling endpoint (e.g. a vLLM server), and calls performance tools
+on the user's behalf to answer questions like:
 
-An agentic framework for writing, debugging, and benchmarking parallel
-code (CUDA / MPI / OpenMP). Uses OpenAI-compatible tool-calling with
-any vLLM backend.
+- "What GPU(s) do I need to deploy gpt-oss-20b at 4k context with concurrency 32?"
+- "Is my workload compute- or memory-bound on H100? What's the TPOT?"
+- "How does batch size 32 vs 128 change throughput for Qwen3-Coder-30B?"
+- "Will this fit on a single H100 if I quantize the experts to MXFP4?"
 
-The harness is benchmark-agnostic: a single `run.yaml` points to a
-unified `problems.json`, the agent loop runs each problem in its own
-sandboxed workspace, and a unified results JSON comes out the other
-end. Each benchmark suite gets its own (small) preprocessing script
-that produces the JSON — the harness itself doesn't know about ParEval,
-HeCBench, or anything else.
+The agent decides when to call a tool, interprets the result, and keeps
+going across multiple turns of conversation.
 
 ## Project structure
 
 ```
 agent/
-  batch.py        # config-driven batch runner
-  main.py         # interactive CLI — experimental (--dry-run uses fake_engine)
-  config.py       # RunConfig (model, agent, io, system_prompt)
-  types.py        # AgentTask / AgentResult
-  engine.py       # OpenAI-compatible client
-  fake_engine.py  # scripted engine for offline loop testing
-  loop.py         # tool-calling agent loop → AgentResult
-  prompts.py      # assembles system prompt + memory index
-  memory.py       # remember / recall tools; MEMORY.md index
+  main.py            interactive REPL — entry point
+  config.py          ChatConfig (agent model + session settings)
+  loop.py            ChatAgent: multi-turn tool-calling loop
+  engine.py          OpenAI-compatible client
+  fake_engine.py     scripted engine for --dry-run
+  prompts.py         system prompt + memory index
+  memory.py          remember / recall tools, MEMORY.md
+  types.py           SessionMeta dataclass
+  workspace.py       session workspace (cwd for tools)
   tools/
-    base.py       # @tool registry + JSON schema export
-    fs.py         # read (paginated) / write / edit / glob / grep
-    bash.py       # sandboxed shell exec
-    parallel.py   # nvcc/omp/mpi _build_and_run + hardware_info
-    submit.py     # submit_solution (terminates the loop)
-visualize_tool/
-  view_trace.html # single-file viewer for batch/<task>/trace.json
-scripts/
-  run_bare.py     # bare-model baseline runner (same problems.json,
-                  # single-shot LLM, no tool loop)
-                  # other per-benchmark preprocessors go here
-runs/             # per-run dirs; each holds run.yaml, problems.json,
-                  # agent_output.json, batch/<task>/*
-SPEC.md           # contracts + invariants
-DEV_NOTES.md      # dated experiment log
+    base.py          @tool registry + JSON-schema export
+    fs.py            read / write / edit / glob / grep
+    bash.py          sandboxed shell
+    benchmarking/
+      benchmark.py   ⏳ placeholder — probe a running inference endpoint
+    modeling/
+      memory.py      memory_estimate    — weights + KV cache VRAM breakdown
+      latency.py     forward_latency    — single forward-pass roofline
+      serving.py     simulate_serving   — continuous-batching workload sim
+      report.py      ReportBuilder      — shared text-report helpers
+      configs/
+        hw_specs.py    PRESET_GPUS      — 4090, A100, H100, H200, B200
+        model_specs.py PRESET_MODELS    — gpt-oss-20b, Qwen3-Coder-30B (BF16 + AWQ-4bit)
+runs/                per-session dirs (run.yaml + batch/session/...)
+webui/               legacy web UI from the previous incarnation; useful
+                     for inspecting session traces. Some pages depend on
+                     artifacts that no longer exist and will be blank.
 ```
 
-## Configuration
+The `benchmarking/benchmark` tool is still a stub — it will eventually
+probe a running OpenAI-compatible endpoint and return measured latency
+and throughput. The three modeling tools under `modeling/` are real.
 
-A run is described by a single YAML file:
+## Performance modeling tools
 
-```yaml
-# run.yaml
-model:
-  name:        openai/Qwen3-Coder-30B-A3B-Instruct
-  base_url:    http://140.112.90.46:8001/v1
-  api_key:     EMPTY
-  temperature: 0.0
-  max_tokens:  16384
-  reasoning:   false
+All three modeling tools take preset model and GPU names (see
+`PRESET_MODELS` / `PRESET_GPUS`) and return a formatted text report.
 
-agent:
-  max_steps:    30
-  time_budget:  600        # per-problem wall-clock seconds
-  workers:      4
+### `memory_estimate`
 
-io:
-  input:           /abs/path/to/problems.json
-  output:          /abs/path/to/agent_output.json
-  workspace_root:  /abs/path/to/run_dir/batch
+Estimate GPU memory required to serve a model: weight bytes (respecting
+per-component quantization: attention vs. FFN vs. embeddings) plus KV
+cache bytes for the requested concurrency and context length. Sliding-
+window attention layers are capped at the window size.
 
-system_prompt: |
-  You are an expert in parallel programming. ...
-  # Inline (preferred). Use system_prompt_file: <path> instead if
-  # the prompt is large or shared across runs.
+```
+memory_estimate(model, concurrency, context_length) -> report
 ```
 
-The `system_prompt` is concatenated with the always-loaded memory index
-(from `memory/MEMORY.md`) to form the final system message. Keep it
-task-focused; persistent cross-session notes belong in the memory
-system via the `remember` / `recall` tools.
+### `forward_latency`
 
-## Input JSON (`problems.json`)
+Roofline latency of a single transformer forward pass for a homogeneous
+batch, broken down per operation (qkv_proj, attn_core, o_proj,
+up_gate_proj, down_proj, lm_head) with a compute-vs-memory bottleneck
+label per op.
 
-A flat list — the harness applies no template substitution; each
-problem's prompt is whatever you put in.
-
-```json
-[
-  {
-    "id": "P001",
-    "prompt": "Implement a CUDA program that ...",
-    "seed_files": {
-      "reference.h":  "...inline content...",
-      "docs/spec.md": "...nested paths OK..."
-    },
-    "metadata": {
-      "category":           "demo",
-      "byte_deterministic": true
-    }
-  }
-]
+```
+forward_latency(model, gpu, batch_size, input_tokens, kv_cache_len) -> report
 ```
 
-| field | required | meaning |
-|---|---|---|
-| `id` | ✅ | unique key; output entries align by this |
-| `prompt` | ✅ | already-rendered prompt the agent sees as the user message |
-| `seed_files` | optional | flat dict of `<relpath>: <content>`; written to the workspace before the agent starts. Forward-slash paths nest into subdirs. Absolute paths and `..` are rejected. |
-| `metadata` | optional | passthrough — copied verbatim into the matching output entry |
+For decode: `input_tokens=1`, `kv_cache_len = current context length`.
+For prefill: `input_tokens = prompt length`, `kv_cache_len=0`.
 
-## Output JSON
+### `simulate_serving`
 
-```json
-[
-  {
-    "id":         "P001",
-    "code":       "...submitted source...",
-    "submitted":  true,
-    "steps":      21,
-    "elapsed_s":  356.0,
-    "error":      null,
-    "metadata":   { ...passthrough... }
-  }
-]
+Runs a fixed request pool through a vLLM-style continuous-batching
+scheduler with a `max_num_batched_tokens` budget, accumulates per-phase
+latencies, and reports TTFT / TPOT / throughput plus a per-op step
+breakdown with bottleneck analysis.
+
+```
+simulate_serving(model, gpu, concurrency, input_len, output_len,
+                 num_requests, max_num_batched_tokens) -> report
 ```
 
-A sibling `<output_stem>.code.json` with just `[{id, code}, ...]` is
-written automatically — convenient for piping into a downstream
-evaluator.
+Each modeling module is also runnable as a standalone CLI for ad-hoc
+checks, e.g.:
 
-Per-problem traces live under `io.workspace_root/<id>/`:
-`trace.json`, `tool_calls.jsonl`, `summary.json`, plus whatever files
-the agent wrote during the run.
+```bash
+uv run python -m agent.tools.modeling.memory \
+    --model openai/gpt-oss-20b --concurrency 32 --context-length 4096
+
+uv run python -m agent.tools.modeling.serving \
+    --model openai/gpt-oss-20b --gpu h100-sxm \
+    --num-concurrency 16 --input-len 128 --output-len 64 --num-requests 64
+```
 
 ## Quick start
 
 ```bash
-# 1. start a vLLM server (or point run.yaml's model.base_url at an
-#    existing OpenAI-compatible endpoint)
-python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen2.5-Coder-32B-Instruct \
-    --enable-auto-tool-choice --tool-call-parser hermes
-
-# 2. install deps
+# 1. Install deps
 uv sync
 
-# 3a. batch mode — point at run.yaml
-uv run python -m agent.batch --config /path/to/run.yaml
-# optional flags
-#   --limit N         only run first N problems
-#   --skip-existing   skip ids already submitted in the output JSON
+# 2a. Dry-run the chat REPL with no model server (uses FakeEngine)
+uv run python -m agent.main --dry-run
 
-# 3b. interactive mode (experimental — single-task REPL, no batching)
+# 2b. Real run — point at any OpenAI-compatible endpoint
 uv run python -m agent.main \
-    --base-url http://localhost:8000/v1 \
-    --model Qwen/Qwen2.5-Coder-32B-Instruct
-# add --dry-run for a scripted FakeEngine (no vLLM needed)
+    --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --base-url http://localhost:8000/v1
 ```
 
-## Bringing your own benchmark
+Slash commands inside the REPL:
 
-The harness is intentionally suite-agnostic. To run a benchmark, write
-a small preprocessing script that emits a `problems.json` in the format
-above, and drop it in `scripts/`.
+```
+/help      list commands
+/tools     list registered tools
+/reset     clear conversation history (keep the session dir)
+/exit      quit
+```
 
-Two examples:
+## Configuration via YAML
 
-- `eval/build_problems_json.py` (in this repo) — converts
-  ParallelMind's own 30-problem `benchmarks.json` into the harness
-  format, using each problem's `description` field as the prompt.
-- ParEval and HeCBench used to ship with adapter classes inside this
-  harness. Those have been removed in favour of the JSON-in/JSON-out
-  contract. To target them again, write a one-shot script that walks
-  the upstream tree (e.g. `ParEval/prompts/generation-prompts.json` or
-  `HeCBench/src/<name>-omp/main.cpp`), renders each problem's prompt,
-  and writes a `problems.json`.
+For repeatable sessions, drop a `chat.yaml`:
 
-Things to capture in the preprocessing script:
+```yaml
+agent:
+  model:
+    name:        openai/Qwen3-Coder-30B-A3B-Instruct
+    base_url:    http://localhost:8001/v1
+    api_key:     EMPTY
+    temperature: 0.0
+    max_tokens:  16384
+    reasoning:   false
+  max_steps:     20            # tool calls per user turn
 
-- **prompt** — render whatever template / instructions you want; the
-  harness applies none of its own.
-- **seed_files** — read source files, headers, datasets the agent
-  needs, inline them into the dict.
-- **metadata** — anything the downstream evaluator wants to see
-  alongside the agent's submission (category, expected validation
-  type, parallelism model, etc.).
+session:
+  dir:           runs/chat
+  name:          null          # auto: chat-YYYYMMDD-HHMMSS
 
-### CUDAMicroBench workflow
-
-Place or clone CUDAMicroBench under `benchmarks/CUDAMicroBench`, then run:
+system_prompt: |
+  You are an LLM inference performance engineer ...
+```
 
 ```bash
-python scripts/run_cudamicrobench_experiment.py \
-  --model Qwen/Qwen2.5-Coder-32B-Instruct \
-  --base-url http://localhost:8000/v1 \
-  --limit 1
+uv run python -m agent.main --config chat.yaml
 ```
 
-The wrapper writes `runs/cudamicrobench/problems.json`, creates
-`runs/cudamicrobench/run.yaml`, runs `agent.batch`, then evaluates each
-modified workspace with `scripts/eval_cudamicrobench.py`. Add
-`--eval-no-tests` when CUDA builds are available but runtime tests are not.
-The agent can call `cuda_guided_profile` for broad-to-narrow Nsight
-Compute feedback, then `cuda_profile` for focused before/after timing.
-On newer GPUs, `cuda_profile` prefers local Nsight Compute (`ncu`) over
-legacy `nvprof`.
+Note: the hardware / model *under analysis* is intentionally **not** in
+config. Sessions typically evolve — the user asks "what GPU for
+gpt-oss-20b?", agrees on hardware, then pivots to a different config.
+The perf tools take their own parameters per call.
 
-## Trace viewer
+## Session outputs
 
-`visualize_tool/view_trace.html` is a single-file, zero-dependency viewer for
-any `batch/<problem>/trace.json` (also accepts the matching
-`tool_calls.jsonl`). Useful for both debugging a single run and
-presenting a trace to collaborators.
+Each session writes:
 
-![Trace viewer](assets/trace_viewer_example.png)
-
-**Features**
-- Role-color message cards (system / user / assistant / tool), with
-  per-message index and `tool_call_id` for pairing results back to calls
-- Tool-call arguments broken out into one code block per argument with
-  copy buttons
-- `[previous analysis]` reasoning echoes auto-fold into collapsible
-  `<details>` so chain-of-thought doesn't drown the actionable content
-- Left outline panel with click-to-jump; Expand / Collapse all
-- Dark / light theme toggle (🌓); sidebar can be hidden (◀ / ▶)
-- Settings persisted in `localStorage`
-
-**Loading a file** — three ways:
-
-1. **Drag & drop** onto the page, or click the Load button
-2. **Paste a path** (absolute or relative) in the sidebar input →
-   Enter, or add `?file=<path>` to the URL. The viewer tries the path
-   as given, then progressively strips leading path segments until it
-   finds one the HTTP server can serve — so pasting the full
-   `/mnt/.../runs/.../trace.json` works even when the server root is
-   just the repo dir.
-3. URL query: `view_trace.html?file=runs/.../trace.json`
-
-**Serving it over remote SSH**
-
-VS Code Remote-SSH + Live Preview is the easiest: right-click
-`view_trace.html` → Show Preview, VS Code forwards the port for you.
-Otherwise:
-
-```bash
-# on the remote box
-cd /path/to/parallelmind_harness
-uv run python3 -m http.server 8000
-# on your laptop
-ssh -L 8000:localhost:8000 <host>
-# open http://localhost:8000/visualize_tool/view_trace.html
 ```
+runs/<session-name>/
+  run.yaml                       config snapshot
+  batch/session/
+    trace.json                   full message history (re-serialized each turn)
+    tool_calls.jsonl             step-indexed tool log
+    summary.json                 turns / steps / elapsed
+    <any files the agent wrote>  bench outputs, scratch notes
+```
+
+Traces are crash-safe: re-serialized after every user turn.
+
+## Memory
+
+`memory/` is a persistent note store across sessions. `MEMORY.md` is
+auto-loaded into the system prompt; the agent can call `remember` /
+`recall` to write and read entries (preferred hardware, customer
+constraints, known-good configs).
+
+## Extending
+
+### Add a new model or GPU preset
+
+Edit `PRESET_MODELS` in [agent/tools/modeling/configs/model_specs.py](agent/tools/modeling/configs/model_specs.py)
+or `PRESET_GPUS` in [agent/tools/modeling/configs/hw_specs.py](agent/tools/modeling/configs/hw_specs.py).
+All three modeling tools will pick it up automatically.
+
+### Wire up the benchmark tool
+
+The `benchmark` placeholder lives at
+[agent/tools/benchmarking/benchmark.py](agent/tools/benchmarking/benchmark.py).
+Implementations should accept an endpoint + load shape and return
+measured latency / throughput / TTFT / TPOT.
+
+### Add a new tool
+
+Drop a `@tool`-decorated function under `agent/tools/` and import the
+module from `agent/tools/__init__.py` (or one of its subpackages). The
+argument schema is derived from the function signature + type hints.
+See [agent/tools/base.py](agent/tools/base.py) for the registry contract.
 
 ## See also
 
-- [`SPEC.md`](SPEC.md) — invariants, data contracts, layer
-  architecture
-- [`DEV_NOTES.md`](DEV_NOTES.md) — dated log of experiments and
-  decisions
+- [SPEC.md](SPEC.md) — chassis contracts (loop, tool registry, config)
+- [AGENTS.md](AGENTS.md) — coding style + repo conventions
