@@ -29,6 +29,8 @@ class FakeEngine:
 
     model = "fake-dry-run"
     reasoning = False
+    max_output_tokens = 2048
+    max_model_len = 32768
 
     def __init__(self) -> None:
         self._turn_counter = itertools.count()

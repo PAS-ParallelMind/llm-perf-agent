@@ -5,13 +5,14 @@ bookkeeping live here; the tools are responsible for whatever parameters
 they need, per call.
 
     agent:                       # the LLM that *drives* the agent
-      model:        openai/Qwen3-Coder-30B-A3B-Instruct
-      base_url:     http://localhost:8001/v1
-      api_key:      EMPTY
-      temperature:  0.0
-      max_tokens:   16384
-      reasoning:    false
-      max_steps:    20            # tool-call cap per user turn
+      model:             openai/Qwen3-Coder-30B-A3B-Instruct
+      base_url:          http://localhost:8001/v1
+      api_key:           EMPTY
+      temperature:       0.0
+      max_output_tokens: 4096     # cap on tokens GENERATED per response
+      max_model_len:     32768    # server context window (= vLLM --max-model-len)
+      reasoning:         false
+      max_steps:         20       # tool-call cap per user turn
 
     session:
       dir:          runs/chat     # session working dir (trace, tool outputs)
@@ -57,7 +58,11 @@ class ModelConfig:
     base_url: str = "http://localhost:8000/v1"
     api_key: str = "EMPTY"
     temperature: float | None = 0.0
-    max_tokens: int = 4096
+    # Cap on tokens GENERATED per response (sent to the API as max_tokens).
+    max_output_tokens: int = 4096
+    # The server's context window (vLLM --max-model-len). The loop keeps
+    # prompt + max_output_tokens within this by trimming old tool results.
+    max_model_len: int = 32768
     reasoning: bool = False
     timeout: float = 900.0
     max_retries: int = 2

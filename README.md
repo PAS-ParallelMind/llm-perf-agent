@@ -135,13 +135,14 @@ For repeatable sessions, drop a `chat.yaml`:
 ```yaml
 agent:
   model:
-    name:        openai/Qwen3-Coder-30B-A3B-Instruct
-    base_url:    http://localhost:8001/v1
-    api_key:     EMPTY
-    temperature: 0.0
-    max_tokens:  16384
-    reasoning:   false
-  max_steps:     20            # tool calls per user turn
+    name:              openai/Qwen3-Coder-30B-A3B-Instruct
+    base_url:          http://localhost:8001/v1
+    api_key:           EMPTY
+    temperature:       0.0
+    max_output_tokens: 4096      # tokens generated per response
+    max_model_len:     32768     # match the server's vLLM --max-model-len
+    reasoning:         false
+  max_steps:           20        # tool calls per user turn
 
 session:
   dir:           runs/chat

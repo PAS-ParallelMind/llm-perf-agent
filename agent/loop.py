@@ -15,7 +15,7 @@ from typing import Any
 
 from rich.console import Console
 
-from .engine import Engine
+from .engine import ContextLengthExceeded, Engine
 from .memory import load_index
 from .prompts import build_system_prompt
 from .tools.base import dispatch, schemas
@@ -25,6 +25,13 @@ console = Console()
 _MAX_TOOL_CALLS_PER_TURN = 4
 _MAX_IDENTICAL_TOOL_CALLS = 3
 _TOOL_RESULT_TRUNCATE = 16_000
+
+# Context budgeting. We don't have the server's tokenizer, so estimate
+# tokens from characters. A *low* chars/token ratio under-estimates the
+# budget (trims sooner) — safer against overflow. The reactive
+# trim-and-retry below is the backstop when the estimate is off.
+_CHARS_PER_TOKEN = 3.5
+_CTX_RESERVE_TOKENS = 1024   # headroom kept below the window
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
@@ -130,6 +137,13 @@ class ChatAgent:
         self.engine = engine
         self.max_steps = max_steps
         self.system_prompt = system_prompt
+        # Char budget for the prompt we may send: window minus the output
+        # reservation minus headroom, converted to chars. Falls back to a
+        # 32k-window assumption for engines that don't expose the fields.
+        window = getattr(engine, "max_model_len", 32768)
+        out_reserve = getattr(engine, "max_output_tokens", 2048)
+        budget_tokens = max(window - out_reserve - _CTX_RESERVE_TOKENS, 1024)
+        self._input_budget_chars = int(budget_tokens * _CHARS_PER_TOKEN)
         self.messages: list[dict[str, Any]] = [
             {"role": "system",
              "content": build_system_prompt(load_index(), self.system_prompt)}
@@ -158,6 +172,34 @@ class ChatAgent:
             "content": build_system_prompt(load_index(), self.system_prompt),
         }
 
+    def _context_chars(self, tool_schemas: list[dict[str, Any]]) -> int:
+        """Rough size of what we'd send the model: messages + tool schemas."""
+        return (len(json.dumps(self.messages, default=str))
+                + len(json.dumps(tool_schemas, default=str)))
+
+    def _trim_context(self, tool_schemas: list[dict[str, Any]],
+                      aggressive: bool = False) -> int:
+        """Elide the bodies of the oldest tool-result messages until the
+        estimated context fits the input budget. Tool outputs are the
+        bulk of the context and become stale once the model has acted on
+        them, so they're trimmed oldest-first; the system prompt and the
+        user/assistant thread are left intact. Returns the count elided."""
+        budget = self._input_budget_chars // (2 if aggressive else 1)
+        elided = 0
+        for m in self.messages:
+            if self._context_chars(tool_schemas) <= budget:
+                break
+            if m.get("role") != "tool":
+                continue
+            body = m.get("content", "")
+            if body.startswith("[elided"):
+                continue
+            m["content"] = (f"[elided earlier {m.get('name', 'tool')} result "
+                            f"({len(body)} chars) to fit context — re-run the "
+                            f"tool if you need it again]")
+            elided += 1
+        return elided
+
     def chat(self, user_message: str) -> TurnResult:
         """Run one user turn and return the assistant's final reply."""
         self._refresh_system()
@@ -170,8 +212,22 @@ class ChatAgent:
         final_reply = ""
 
         for step in range(self.max_steps):
+            # Proactively trim before sending so we stay under the window.
+            if self._context_chars(tool_schemas) > self._input_budget_chars:
+                n = self._trim_context(tool_schemas)
+                if n:
+                    console.print(f"[dim]· context trim: elided {n} old tool "
+                                  f"result(s) to fit the window[/]")
+
             llm_start = time.monotonic()
-            msg = self.engine.chat(self.messages, tools=tool_schemas)
+            try:
+                msg = self.engine.chat(self.messages, tools=tool_schemas)
+            except ContextLengthExceeded:
+                # Estimate was off — trim hard and retry once.
+                n = self._trim_context(tool_schemas, aggressive=True)
+                console.print(f"[yellow]· context overflow: elided {n} old tool "
+                              f"result(s), retrying[/]")
+                msg = self.engine.chat(self.messages, tools=tool_schemas)
             llm_elapsed_ms = round((time.monotonic() - llm_start) * 1000)
 
             # Capture the exact request payload that was just sent, for the
