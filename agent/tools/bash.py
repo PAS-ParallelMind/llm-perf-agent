@@ -11,8 +11,10 @@ MAX_OUT = 20_000
 
 @tool(
     "Execute a shell command inside the session workspace and return "
-    "combined stdout/stderr. Useful for nvidia-smi, curl, and other "
-    "host-level probes.",
+    "combined stdout/stderr. Use it for working with files in the "
+    "workspace (scratch scripts, data wrangling). Do NOT use it to "
+    "inspect local hardware (e.g. nvidia-smi): this host is unrelated to "
+    "the deployment target — get GPU specs from `list_gpus` instead.",
     command="Shell command to run",
     timeout="Timeout in seconds (default 120)",
 )

@@ -200,6 +200,41 @@ class ChatAgent:
             elided += 1
         return elided
 
+    def _forced_synthesis(self, tool_schemas: list[dict[str, Any]],
+                          step: int) -> str:
+        """Wrap-up call made when the step budget is hit: ask the model for
+        a final answer with tools disabled, so it must synthesize from what
+        it already gathered rather than keep tool-calling. The reply is
+        appended to the conversation; the 'stop' nudge is ephemeral."""
+        console.print("[yellow]· step budget reached — requesting a final "
+                      "summary with tools disabled[/]")
+        if self._context_chars(tool_schemas) > self._input_budget_chars:
+            self._trim_context(tool_schemas, aggressive=True)
+        nudge = {
+            "role": "user",
+            "content": ("(Tool-call budget reached — do not call any more "
+                        "tools. Based on the results so far, give your best "
+                        "final answer now, and note anything you couldn't "
+                        "finish.)"),
+        }
+        try:
+            msg = self.engine.chat(self.messages + [nudge], tools=None)
+        except Exception as e:  # don't let the wrap-up itself crash the turn
+            return (f"[reached the {self.max_steps}-step tool budget; the "
+                    f"final-summary call failed: {type(e).__name__}: {e}]")
+
+        req = getattr(self.engine, "last_request", None)
+        if req is not None:
+            self.llm_requests.append({"turn": self.turn_count, "step": step,
+                                      "elapsed_ms": 0, "synthesis": True, **req})
+
+        reply = msg.content or ""
+        if self.engine.reasoning and not reply:
+            reply = (getattr(msg, "reasoning", None)
+                     or getattr(msg, "reasoning_content", None) or "")
+        self.messages.append({"role": "assistant", "content": reply})
+        return reply or "[reached the tool-call budget; no final summary produced]"
+
     def chat(self, user_message: str) -> TurnResult:
         """Run one user turn and return the assistant's final reply."""
         self._refresh_system()
@@ -312,11 +347,11 @@ class ChatAgent:
                 turn_tool_log.append(entry)
                 self.tool_call_log.append(entry)
         else:
+            # Step budget exhausted while still tool-calling. Force one
+            # tools-disabled call so the model synthesizes an answer from
+            # what it gathered, instead of returning a useless placeholder.
             truncated = True
-            final_reply = (
-                f"[max_steps={self.max_steps} reached for turn {self.turn_count} "
-                "without a final reply]"
-            )
+            final_reply = self._forced_synthesis(tool_schemas, step + 1)
 
         return TurnResult(
             reply=final_reply,
