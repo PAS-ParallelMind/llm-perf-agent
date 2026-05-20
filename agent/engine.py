@@ -40,6 +40,9 @@ class Engine:
             api_key=self.api_key,
             timeout=self.timeout,
         )
+        # Snapshot of the most recent request payload sent to the server,
+        # for trace/debugging. Populated by chat().
+        self.last_request: dict[str, Any] | None = None
 
     def chat(
         self,
@@ -56,6 +59,16 @@ class Engine:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+
+        # Snapshot exactly what we send. messages is copied because the
+        # loop keeps appending to the live list after this call returns.
+        self.last_request = {
+            "model": self.model,
+            "messages": [dict(m) for m in messages],
+            "tools": list(tools or []),
+            "params": {k: v for k, v in kwargs.items()
+                       if k in ("temperature", "max_tokens", "tool_choice")},
+        }
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):

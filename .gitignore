@@ -36,6 +36,10 @@ Thumbs.db
 DEV_NOTES.md
 eval/PLAN.md
 
+# Local chat configs — contain internal endpoints / paths
+chat.yaml
+chat.*.yaml
+
 # Eval sandbox + ad-hoc speedup playground (large binaries / nsys reports)
 eval/example_speedup/
 

@@ -13,7 +13,9 @@ set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${PORT:-9099}"
 SESSION="${SESSION:-webui}"
-PYTHON="/mnt/disk2/elton7318/venv/bin/python"
+# `uv run` resolves the project's .venv automatically. Override with
+# WEBUI_PYTHON=/path/to/python if you'd rather call an explicit interpreter.
+PYTHON_CMD="${WEBUI_PYTHON:-uv run python}"
 
 is_running() { tmux has-session -t "$SESSION" 2>/dev/null; }
 port_pids() {
@@ -36,7 +38,7 @@ case "$cmd" in
       exit 1
     fi
     tmux new-session -d -s "$SESSION" -c "$HARNESS_ROOT" \
-      "PORT=$PORT $PYTHON -m webui.backend.server"
+      "PORT=$PORT $PYTHON_CMD -m webui.backend.server"
     sleep 2
     echo "tmux session '$SESSION' started"
     echo "  → http://localhost:$PORT/"

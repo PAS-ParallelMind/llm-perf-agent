@@ -38,11 +38,12 @@ Two terminals:
 ```bash
 # 1. backend (with auto-reload)
 cd llm-perf-agent
-/mnt/disk2/elton7318/venv/bin/python -m webui.backend.server   # :8080
+uv run python -m webui.backend.server               # :8080
 
 # 2. frontend (Vite dev server, proxies /api → :8080)
 cd llm-perf-agent/webui/frontend
-npm run dev                                                     # :5173
+npm install                                         # one-time
+npm run dev                                         # :5173
 ```
 
 Open <http://localhost:5173>. Edits to `webui/frontend/src/**` hot-reload;
@@ -52,12 +53,11 @@ edits under `webui/backend/` trigger uvicorn reload.
 
 ```bash
 cd llm-perf-agent/webui/frontend
-npm run build                                                   # → dist/
+npm install                                         # one-time
+npm run build                                       # → dist/
 
 cd ../..
-/mnt/disk2/elton7318/venv/bin/python -m webui.backend.server   # serves
-                                                                # both /api
-                                                                # and /
+uv run python -m webui.backend.server               # serves /api AND /
 ```
 
 Single process on a single port. Mount `webui/backend/server.py` behind a
@@ -68,5 +68,18 @@ reverse proxy if you need to expose it externally.
 Override via `PORT` env var (default `8080`):
 
 ```bash
-PORT=9099 /mnt/disk2/elton7318/venv/bin/python -m webui.backend.server
+PORT=9099 uv run python -m webui.backend.server
 ```
+
+## tmux helper
+
+`webui/webui.sh` wraps the backend in a tmux session for long-running use:
+
+```bash
+./webui/webui.sh start    # start in tmux session 'webui' on PORT (default 9099)
+./webui/webui.sh status   # show session + port state
+./webui/webui.sh restart
+./webui/webui.sh stop
+```
+
+Override the interpreter with `WEBUI_PYTHON=/path/to/python`; defaults to `uv run python`.

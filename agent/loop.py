@@ -136,6 +136,9 @@ class ChatAgent:
         ]
         self.tool_call_log: list[dict[str, Any]] = []
         self.tool_call_counts: dict[str, int] = {}
+        # Per-call snapshots of the exact request payload sent to the
+        # engine (messages + tool schemas + sampling params), for debugging.
+        self.llm_requests: list[dict[str, Any]] = []
         self.turn_count = 0
 
     def reset(self) -> None:
@@ -146,6 +149,7 @@ class ChatAgent:
         ]
         self.tool_call_log = []
         self.tool_call_counts = {}
+        self.llm_requests = []
         self.turn_count = 0
 
     def _refresh_system(self) -> None:
@@ -169,6 +173,17 @@ class ChatAgent:
             llm_start = time.monotonic()
             msg = self.engine.chat(self.messages, tools=tool_schemas)
             llm_elapsed_ms = round((time.monotonic() - llm_start) * 1000)
+
+            # Capture the exact request payload that was just sent, for the
+            # trace / webui prompt-inspector.
+            req = getattr(self.engine, "last_request", None)
+            if req is not None:
+                self.llm_requests.append({
+                    "turn": self.turn_count,
+                    "step": step + 1,
+                    "elapsed_ms": llm_elapsed_ms,
+                    **req,
+                })
             llm_log = {
                 "turn": self.turn_count,
                 "step": step + 1,

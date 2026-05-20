@@ -25,12 +25,11 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 
-from . import memory  # noqa: F401  registers remember/recall tools
 from .config import AgentSettings, ChatConfig, ModelConfig, SessionConfig
 from .engine import Engine
 from .fake_engine import FakeEngine
 from .loop import ChatAgent, TurnResult
-from .tools import TOOLS  # noqa: F401  triggers tool registration
+from .tools import TOOLS  # noqa: F401  triggers tool registration (incl. remember/recall)
 from .types import SessionMeta
 from .workspace import set_root
 
@@ -115,6 +114,13 @@ def _export_trace(agent: ChatAgent, workspace: Path, meta: SessionMeta) -> None:
                 f.write(json.dumps(tc, default=str) + "\n")
     except Exception as e:
         console.print(f"[red]tool_calls export failed: {e}[/]")
+
+    try:
+        with (workspace / "llm_requests.jsonl").open("w") as f:
+            for req in agent.llm_requests:
+                f.write(json.dumps(req, default=str) + "\n")
+    except Exception as e:
+        console.print(f"[red]llm_requests export failed: {e}[/]")
 
     try:
         summary: dict[str, Any] = {

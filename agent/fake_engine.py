@@ -32,6 +32,7 @@ class FakeEngine:
 
     def __init__(self) -> None:
         self._turn_counter = itertools.count()
+        self.last_request: dict[str, Any] | None = None
 
     def _script(self, turn: int) -> list[SimpleNamespace]:
         return [
@@ -65,5 +66,13 @@ class FakeEngine:
             if m.get("role") == "tool":
                 step += 1
         turn = sum(1 for m in messages if m.get("role") == "user")
+        # Mirror Engine.chat's request snapshot so the trace/webui can show
+        # what a real call would have sent.
+        self.last_request = {
+            "model": self.model,
+            "messages": [dict(m) for m in messages],
+            "tools": list(tools or []),
+            "params": {"tool_choice": "auto" if tools else None},
+        }
         script = self._script(turn)
         return script[min(step, len(script) - 1)]

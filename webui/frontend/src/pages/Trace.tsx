@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
 import {
   api,
-  type AgentOutputEntry,
+  type LlmRequest,
   type RunSummary,
   type ToolCallLog,
   type TraceMessage,
@@ -62,6 +61,30 @@ function MessageContent({ content }: { content: string }) {
   return <pre className="whitespace-pre-wrap text-sm font-mono">{content}</pre>;
 }
 
+function ArgBlock({ name, value }: { name: string; value: unknown }) {
+  const isStr = typeof value === "string";
+  const display = isStr ? (value as string) : JSON.stringify(value, null, 2);
+  const isMultiline = display.includes("\n") || display.length > 60;
+  return (
+    <div>
+      <div className="text-[10px] uppercase text-slate-500 mb-0.5 flex items-center gap-2">
+        <span>{name}</span>
+        <button
+          type="button"
+          className="text-slate-400 hover:text-slate-700"
+          onClick={() => navigator.clipboard.writeText(display)}
+          title="copy"
+        >
+          📋
+        </button>
+      </div>
+      {isMultiline
+        ? <pre className="text-xs font-mono whitespace-pre-wrap bg-slate-50 dark:bg-slate-800 p-2 rounded max-h-64 overflow-auto">{display}</pre>
+        : <code className="text-xs font-mono">{display}</code>}
+    </div>
+  );
+}
+
 function ToolCalls({ msg }: { msg: TraceMessage }) {
   if (!msg.tool_calls?.length) return null;
   return (
@@ -94,30 +117,6 @@ function ToolCalls({ msg }: { msg: TraceMessage }) {
   );
 }
 
-function ArgBlock({ name, value }: { name: string; value: unknown }) {
-  const isStr = typeof value === "string";
-  const display = isStr ? (value as string) : JSON.stringify(value, null, 2);
-  const isMultiline = display.includes("\n") || display.length > 60;
-  return (
-    <div>
-      <div className="text-[10px] uppercase text-slate-500 mb-0.5 flex items-center gap-2">
-        <span>{name}</span>
-        <button
-          type="button"
-          className="text-slate-400 hover:text-slate-700"
-          onClick={() => navigator.clipboard.writeText(display)}
-          title="copy"
-        >
-          📋
-        </button>
-      </div>
-      {isMultiline
-        ? <pre className="text-xs font-mono whitespace-pre-wrap bg-slate-50 dark:bg-slate-800 p-2 rounded max-h-64 overflow-auto">{display}</pre>
-        : <code className="text-xs font-mono">{display}</code>}
-    </div>
-  );
-}
-
 function ToolResult({ msg, dur }: { msg: TraceMessage; dur?: number }) {
   const c = msg.content || "";
   const isLong = c.length > 800;
@@ -143,51 +142,111 @@ function countAsstUpTo(trace: TraceMessage[], i: number): number {
   return n;
 }
 
+// Renders the exact request payload sent to the model on each LLM call:
+// sampling params, tool schemas, and the full messages snapshot.
+function RequestInspector({ requests }: { requests: LlmRequest[] }) {
+  if (!requests.length) {
+    return (
+      <p className="text-xs text-slate-400 italic">
+        No llm_requests.jsonl for this session (predates the prompt-inspector,
+        or no LLM call was made).
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {requests.map((r, idx) => (
+        <details
+          key={idx}
+          className="border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-900/40"
+        >
+          <summary className="cursor-pointer px-3 py-2 text-xs font-mono select-none flex items-center gap-3">
+            <span className="text-violet-600 dark:text-violet-300 font-semibold">
+              call · turn {r.turn} · step {r.step}
+            </span>
+            <span className="text-slate-400">{r.model}</span>
+            <span className="text-slate-400">{r.messages.length} msgs</span>
+            <span className="text-slate-400">{r.tools.length} tools</span>
+            {r.elapsed_ms !== undefined && (
+              <span className="ml-auto text-slate-400">{fmtMs(r.elapsed_ms)}</span>
+            )}
+          </summary>
+          <div className="px-3 pb-3 space-y-3">
+            <div>
+              <div className="text-[10px] uppercase text-slate-500 mb-1">sampling params</div>
+              <pre className="text-xs font-mono bg-slate-50 dark:bg-slate-800 p-2 rounded">
+                {JSON.stringify(r.params, null, 2)}
+              </pre>
+            </div>
+
+            <details>
+              <summary className="cursor-pointer text-[10px] uppercase text-slate-500 select-none">
+                tools sent ({r.tools.length})
+              </summary>
+              <pre className="text-xs font-mono whitespace-pre-wrap bg-slate-50 dark:bg-slate-800 p-2 rounded mt-1 max-h-96 overflow-auto">
+                {JSON.stringify(r.tools, null, 2)}
+              </pre>
+            </details>
+
+            <details open>
+              <summary className="cursor-pointer text-[10px] uppercase text-slate-500 select-none">
+                messages sent ({r.messages.length})
+              </summary>
+              <pre className="text-xs font-mono whitespace-pre-wrap bg-slate-50 dark:bg-slate-800 p-2 rounded mt-1 max-h-[32rem] overflow-auto">
+                {JSON.stringify(r.messages, null, 2)}
+              </pre>
+            </details>
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
 export default function Trace() {
-  const [params, setParams] = useSearchParams();
-  const runName = params.get("run") ?? "";
-  const pid     = params.get("pid") ?? "";
+  const [runName, setRunName] = useState<string>("");
+  const [runs, setRuns]       = useState<RunSummary[]>([]);
+  const [trace, setTrace]     = useState<TraceMessage[] | null>(null);
+  const [tcLog, setTcLog]     = useState<ToolCallLog[]>([]);
+  const [llmReqs, setLlmReqs] = useState<LlmRequest[]>([]);
+  const [err, setErr]         = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  const [runs,    setRuns]   = useState<RunSummary[]>([]);
-  const [pids,    setPids]   = useState<AgentOutputEntry[]>([]);
-  const [trace,   setTrace]  = useState<TraceMessage[] | null>(null);
-  const [tcLog,   setTcLog]  = useState<ToolCallLog[]>([]);
-  const [err,     setErr]    = useState<string | null>(null);
-  const [loading, setLoading]= useState(false);
-
-  useEffect(() => { api.runs().then(setRuns).catch(e => setErr(String(e))); }, []);
-
-  // Reload problem list when run changes
   useEffect(() => {
-    if (!runName) { setPids([]); return; }
-    api.agentOutput(runName).then(setPids).catch(e => setErr(String(e)));
-  }, [runName]);
+    api.runs()
+      .then(rs => {
+        setRuns(rs);
+        // Auto-select the most recent run if none picked yet.
+        if (rs.length && !runName) setRunName(rs[0].name);
+      })
+      .catch(e => setErr(String(e)));
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Reload trace + tool_calls when (run, pid) change
   useEffect(() => {
-    if (!runName || !pid) { setTrace(null); setTcLog([]); return; }
+    if (!runName) { setTrace(null); setTcLog([]); setLlmReqs([]); return; }
     setLoading(true); setErr(null);
     Promise.allSettled([
-      api.trace(runName, pid),
-      api.toolCalls(runName, pid),
-    ]).then(([trc, tc]) => {
+      api.trace(runName),
+      api.toolCalls(runName),
+      api.llmRequests(runName),
+    ]).then(([trc, tc, lr]) => {
       if (trc.status === "fulfilled") setTrace(trc.value);
       else { setErr(String(trc.reason)); setTrace(null); }
       setTcLog(tc.status === "fulfilled" ? tc.value : []);
+      setLlmReqs(lr.status === "fulfilled" ? lr.value : []);
       setLoading(false);
     });
-  }, [runName, pid]);
+  }, [runName]);
 
-  // Per-message cumulative elapsed (sum of tool_calls.elapsed_ms up to
-  // that point). Maps message index → cumulative ms.
+  // Per-message cumulative elapsed: sum tool_calls.elapsed_ms by step,
+  // then walk the trace and attribute the cumulative total to each
+  // assistant/tool message.
   const cumByMsg = useMemo(() => {
     if (!trace || tcLog.length === 0) return new Map<number, number>();
-    // Map step → total ms for that step
     const perStep = new Map<number, number>();
     for (const e of tcLog) {
       perStep.set(e.step, (perStep.get(e.step) ?? 0) + e.elapsed_ms);
     }
-    // Walk trace messages, accumulate by assistant step counter
     const out = new Map<number, number>();
     let step = 0;
     let cum = 0;
@@ -204,21 +263,13 @@ export default function Trace() {
     return out;
   }, [trace, tcLog]);
 
-  // Tool durations indexed by tool_call_id (best effort: match by step + tool name).
+  // Tool durations indexed by "step:tool" — collisions rare unless
+  // multi-tool-call per step (and even then we only need approximate ms).
   const durBySig = useMemo(() => {
     const m = new Map<string, number>();
-    for (const e of tcLog) {
-      // Index by "step:tool" — collisions rare unless multi-tool-call per step.
-      m.set(`${e.step}:${e.tool}`, e.elapsed_ms);
-    }
+    for (const e of tcLog) m.set(`${e.step}:${e.tool}`, e.elapsed_ms);
     return m;
   }, [tcLog]);
-
-  const updateParam = (k: string, v: string) => {
-    const next = new URLSearchParams(params);
-    if (v) next.set(k, v); else next.delete(k);
-    setParams(next, { replace: true });
-  };
 
   const stats = useMemo(() => {
     if (!trace) return null;
@@ -228,45 +279,40 @@ export default function Trace() {
     return { total: trace.length, roles, tool_calls: ntcs };
   }, [trace]);
 
+  const currentRun = runs.find(r => r.name === runName);
+
   return (
     <div className="max-w-screen-xl mx-auto p-6 space-y-4">
       <div>
         <h2 className="text-2xl font-semibold mb-2">Trace</h2>
         <p className="text-sm text-slate-500">
-          Agent conversation log for a single (run, problem).
+          Conversation log for a single chat session.
         </p>
       </div>
 
       <div className="flex flex-wrap items-end gap-3 border-b border-slate-200 dark:border-slate-700 pb-3">
         <label className="flex flex-col text-xs uppercase text-slate-500">
-          run
+          session
           <select
             className="mt-1 border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-sm font-mono bg-white dark:bg-slate-800"
             value={runName}
-            onChange={(e) => updateParam("run", e.target.value)}
+            onChange={(e) => setRunName(e.target.value)}
           >
             <option value="">— select —</option>
             {runs.map((r) => (
-              <option key={r.name} value={r.name}>{r.name}</option>
-            ))}
-          </select>
-        </label>
-        <label className="flex flex-col text-xs uppercase text-slate-500">
-          problem
-          <select
-            className="mt-1 border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-sm font-mono bg-white dark:bg-slate-800"
-            value={pid}
-            onChange={(e) => updateParam("pid", e.target.value)}
-            disabled={!pids.length}
-          >
-            <option value="">— select —</option>
-            {pids.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.id} {p.submitted ? "✓" : "·"} ({p.steps} steps)
+              <option key={r.name} value={r.name}>
+                {r.name}
+                {r.turns !== undefined ? ` · ${r.turns}t / ${r.total_steps ?? 0}s` : ""}
               </option>
             ))}
           </select>
         </label>
+        {currentRun?.agent_model && (
+          <div className="text-xs text-slate-500 font-mono">
+            <span className="uppercase block text-[10px]">model</span>
+            {currentRun.agent_model}
+          </div>
+        )}
         {stats && (
           <div className="text-xs text-slate-500 font-mono ml-auto">
             {stats.total} msgs · {stats.tool_calls} tool calls · {stats.roles.assistant ?? 0} asst · {stats.roles.tool ?? 0} tool
@@ -277,7 +323,18 @@ export default function Trace() {
       {err && <pre className="text-red-600 text-sm">{err}</pre>}
       {loading && <p className="text-slate-500 text-sm">Loading…</p>}
       {!trace && !loading && !err && (
-        <p className="text-slate-500 text-sm">Pick a run + problem above.</p>
+        <p className="text-slate-500 text-sm">Pick a session above.</p>
+      )}
+
+      {trace && (
+        <details className="border border-violet-200 dark:border-violet-800/60 rounded bg-violet-50/40 dark:bg-violet-900/10">
+          <summary className="cursor-pointer px-4 py-2 text-sm font-medium select-none text-violet-700 dark:text-violet-300">
+            Raw LLM requests — exact payload sent to vLLM ({llmReqs.length} call{llmReqs.length === 1 ? "" : "s"})
+          </summary>
+          <div className="px-4 pb-4 pt-1">
+            <RequestInspector requests={llmReqs} />
+          </div>
+        </details>
       )}
 
       {trace && (
