@@ -31,7 +31,9 @@ agent/
     fs.py            read / write / edit / glob / grep
     bash.py          sandboxed shell
     benchmarking/
-      benchmark.py   ⏳ placeholder — probe a running inference endpoint
+      benchmark.py     benchmark_serving — MEASURED TTFT/TPOT/throughput
+                       (wraps `vllm bench serve` against a live endpoint)
+      measurements.py  record_measurement / lookup_measurements store
     modeling/
       memory.py      estimate_memory    — weights + KV cache VRAM breakdown
       latency.py     estimate_latency   — single forward-pass roofline
@@ -46,9 +48,11 @@ webui/               legacy web UI from the previous incarnation; useful
                      artifacts that no longer exist and will be blank.
 ```
 
-The `benchmarking/benchmark` tool is still a stub — it will eventually
-probe a running OpenAI-compatible endpoint and return measured latency
-and throughput. The three modeling tools under `modeling/` are real.
+The three modeling tools under `modeling/` are analytical (roofline).
+The `benchmarking/benchmark_serving` tool is the **measured** counterpart:
+it drives a synthetic workload through a *running* OpenAI-compatible
+server with `vllm bench serve` and reports real TTFT / TPOT / throughput,
+then records the result so estimates can be calibrated against it.
 
 ## Performance modeling tools
 
@@ -103,6 +107,85 @@ uv run python -m agent.tools.modeling.serving \
     --model openai/gpt-oss-20b --gpu h100-sxm \
     --num-concurrency 16 --input-len 128 --output-len 64 --num-requests 64
 ```
+
+## Measured benchmarking tool
+
+### `benchmark_serving`
+
+The measured counterpart to `simulate_serving`. Drives a synthetic
+`random` workload through a **running** OpenAI-compatible server (e.g.
+vLLM) with `vllm bench serve` and reports real TTFT / TPOT / ITL / E2EL
+(mean / median / p99) plus request and token throughput. The parameters
+mirror `simulate_serving` so a modeled estimate and a real measurement
+sit side by side. On success it records the result to the measurement
+store (see below) — which **also stores the corresponding theoretical
+roofline and the efficiency factor**, so each record documents reality
+and theory together.
+
+```
+benchmark_serving(base_url, model, concurrency, input_len, output_len,
+                  num_requests, request_rate="inf", range_ratio=0.0,
+                  endpoint="/v1/completions", gpu="",
+                  tensor_parallel=1, pipeline_parallel=1, data_parallel=1,
+                  expert_parallel=False, ignore_eos=True) -> report
+```
+
+- `base_url` is the server **root** (`http://host:8000`); a trailing
+  `/v1` is stripped automatically.
+- `model` is a single identifier — prefer a `PRESET_MODELS` key / HF id
+  (e.g. `openai/gpt-oss-20b`). It is the tokenizer source *and* the key
+  that lets the recorded theoretical baseline be computed. If the server
+  serves under a different id (e.g. a local path), the tool auto-detects
+  it from `/v1/models` and passes `--served-model-name` for you — the
+  report's "Served as" line shows which id requests actually used.
+- `gpu` is optional but recommended: it tags the recorded measurement so
+  later lookups can calibrate by hardware, and (with a single-GPU,
+  preset model+GPU) enables the stored theoretical baseline. Prefer a
+  `PRESET_GPUS` name.
+- `tensor_parallel` / `pipeline_parallel` / `data_parallel` /
+  `expert_parallel` describe the **server's** parallelism layout (TP / PP
+  / DP / EP). `vllm bench serve` is a *client* — it can't change how the
+  server is sharded — so these are descriptive metadata: they're echoed
+  in the report (total GPUs = TP×PP×DP) and stored on the measurement so
+  results from different layouts aren't conflated on lookup. (The roofline
+  baseline is only computed for single-GPU deployments; the modeling tools
+  don't yet model TP/PP/DP scaling.)
+- `request_rate="inf"` sends all requests at once (closed-loop, bounded
+  only by `concurrency`); a finite value sets an open-loop arrival rate.
+
+Requires `vllm` installed and a reachable, already-running server. Also
+runnable as a CLI:
+
+```bash
+uv run python -m agent.tools.benchmarking.benchmark \
+    --base-url http://localhost:8000 --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --concurrency 32 --input-len 1024 --output-len 128 --num-requests 200 \
+    --gpu h100-sxm
+```
+
+### Measurement store (`record_measurement` / `lookup_measurements`)
+
+Successful benchmarks (and user-reported numbers) are persisted to a
+shared, cross-session JSONL store under `$AGENT_MEASUREMENTS_DIR`
+(default `measurements/`). Each record captures the measured metrics
+**and the corresponding theoretical roofline** — computed from the same
+preset model + GPU at the same operating point via the serving simulator
+— plus the **efficiency factor** (fraction of the roofline achieved:
+throughput = measured ÷ theory, latency = theory ÷ measured). So a single
+record reads, e.g.:
+
+```
+gpt-oss-20b on 4090 | c=8 in=256 out=64 tp=1
+  measured: out=716 tok/s, TTFT=136ms, TPOT=9.16ms
+  theory (single-GPU roofline): out=791 tok/s, TTFT=77ms, TPOT=9.05ms
+                                | efficiency: output tput 90%, TPOT 99%
+```
+
+`lookup_measurements(model, gpu)` returns matching records so the agent
+can reality-adjust a fresh estimate. Theory is computed only when the
+model and GPU are exact preset names and the deployment is single-GPU
+(the modeling tools don't yet model TP/PP/DP scaling); otherwise the
+record stores a short note explaining why theory was skipped.
 
 ## Quick start
 
@@ -192,12 +275,15 @@ Edit `PRESET_MODELS` in [agent/tools/modeling/configs/model_specs.py](agent/tool
 or `PRESET_GPUS` in [agent/tools/modeling/configs/hw_specs.py](agent/tools/modeling/configs/hw_specs.py).
 All three modeling tools will pick it up automatically.
 
-### Wire up the benchmark tool
+### Extend the benchmark tool
 
-The `benchmark` placeholder lives at
-[agent/tools/benchmarking/benchmark.py](agent/tools/benchmarking/benchmark.py).
-Implementations should accept an endpoint + load shape and return
-measured latency / throughput / TTFT / TPOT.
+`benchmark_serving` lives at
+[agent/tools/benchmarking/benchmark.py](agent/tools/benchmarking/benchmark.py)
+and wraps `vllm bench serve` (subprocess) against a live endpoint. To add
+a different load shape (e.g. a ShareGPT dataset, a concurrency sweep, or
+a single-stream latency probe), add a sibling `@tool` that builds a
+different `vllm bench serve` argument list and parses its `--save-result`
+JSON via the same `ReportBuilder` and `record_measurement` plumbing.
 
 ### Add a new tool
 

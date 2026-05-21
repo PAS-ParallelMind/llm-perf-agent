@@ -25,10 +25,15 @@ _DEFAULT_TASK_PROMPT = (
     "directly or whether a tool call would yield a more precise answer. "
     "Available perf tools: `estimate_memory` (weights + KV cache VRAM "
     "fit), `estimate_latency` (per-op roofline for one forward pass), "
-    "`simulate_serving` (continuous-batching TTFT/TPOT/throughput), and "
-    "`benchmark` (endpoint probe — currently a stub). After a tool "
-    "returns, interpret the result for the user — don't just dump raw "
-    "numbers."
+    "`simulate_serving` (continuous-batching TTFT/TPOT/throughput — "
+    "modeled), and `benchmark_serving` (the MEASURED counterpart: drives "
+    "a real load through a running vLLM/OpenAI-compatible server via "
+    "`vllm bench serve` and reports measured TTFT/TPOT/throughput). "
+    "`benchmark_serving` mirrors `simulate_serving`'s parameters, so use "
+    "it to ground-truth a modeled estimate; it records results to the "
+    "measurement store, which `lookup_measurements` reads back to "
+    "calibrate future theory. After a tool returns, interpret the result "
+    "for the user — don't just dump raw numbers."
 )
 
 

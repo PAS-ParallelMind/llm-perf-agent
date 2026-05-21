@@ -13,6 +13,9 @@ workspace/
 # Agent memory (per-instance)
 memory/
 
+# Measured-performance store (per-instance calibration data)
+measurements/
+
 # Python
 __pycache__/
 *.pyc

@@ -104,7 +104,9 @@ and `tools.base.dispatch(name, args)` to execute each call.
 | `glob`              | tools/fs.py                         | List matching paths                                    |
 | `grep`              | tools/fs.py                         | Regex across workspace                                 |
 | `bash`              | tools/bash.py                       | Shell exec, timeout-bounded                            |
-| `benchmark`         | tools/benchmarking/benchmark.py     | ⏳ placeholder — endpoint latency/throughput probe     |
+| `benchmark_serving` | tools/benchmarking/benchmark.py     | MEASURED serving probe: wraps `vllm bench serve` → TTFT/TPOT/throughput |
+| `record_measurement`| tools/benchmarking/measurements.py  | Persist a measured result to the cross-session store    |
+| `lookup_measurements`| tools/benchmarking/measurements.py | Read back measured results to calibrate estimates       |
 | `estimate_memory`   | tools/modeling/memory.py            | VRAM breakdown: weights + KV cache (per model/concurrency/context) |
 | `estimate_latency`  | tools/modeling/latency.py           | Single-pass roofline: per-op compute vs. memory bound  |
 | `simulate_serving`  | tools/modeling/serving.py           | Continuous-batching workload sim: TTFT / TPOT / throughput |
@@ -114,8 +116,14 @@ and `tools.base.dispatch(name, args)` to execute each call.
 The three modeling tools take structured kwargs (model + GPU preset
 names from `tools/modeling/configs/`, plus workload-shape ints) and
 return a formatted text report rendered via `tools/modeling/report.py`.
-The `benchmark` tool is still a stub with a loose `spec: str` schema;
-tighten it when the endpoint probe lands.
+`benchmark_serving` is the measured counterpart to `simulate_serving`:
+it shells out to `vllm bench serve` (keeping vLLM's torch/CUDA import out
+of the agent process), parses the `--save-result` JSON, renders via the
+same `ReportBuilder`, and on success records the result through
+`record_measurement` so `lookup_measurements` can calibrate later
+estimates. It needs `vllm` installed and a reachable running server, and
+takes real wall-clock time — the loop's per-turn anti-thrash cap keeps it
+from being re-fired blindly.
 
 ---
 
