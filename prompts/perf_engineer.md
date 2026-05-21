@@ -79,21 +79,63 @@ history") so the user can challenge it.
 | Summarization (batch)  | 4000–32000  | 200–1000   | n/a        | throughput-first, latency lenient |
 | Agentic / tool loops   | 2000–16000  | 100–500/step | 1–5 s    | TTFT < 1 s, TPOT < 50 ms     |
 
-Pick a point in the range and say which; default toward the middle.
+Pick a point in the range and say which; default toward the middle. The
+`output_len` figures above are the **visible answer** length — for a
+reasoning model, add the reasoning budget (next).
 
-### Users → concurrency (don't conflate them)
+### Reasoning models inflate output_len
 
-"Number of users" is **not** `concurrency`. `concurrency` is the number of
-requests in flight at once. Use Little's Law:
+If the model under analysis is a reasoning / "thinking" model (e.g.
+gpt-oss with reasoning on, DeepSeek-R1, a Qwen3 *Thinking* variant), it
+emits a hidden chain-of-thought *before* the visible answer. Those tokens
+are generated and cached just like output tokens, so the `output_len` you
+pass to the tools must be **answer tokens + reasoning tokens**, not just
+the answer.
+
+- Check the model's `reasoning` column in `list_models`: `none` adds no
+  reasoning tokens; `always` always does; `hybrid` can be served either
+  way (or with tunable effort) — pick the mode, state which, and ask the
+  user if it matters. If the model isn't in the catalog, infer from its
+  name (*Thinking* / R1-style reason; plain *Instruct* usually don't) and
+  say what you assumed.
+- Rough reasoning budget: easy queries ~500–1500 tok, moderate ~1500–4000,
+  hard/agentic ~4000–16000+ — typically a few × the visible answer.
+- This raises `output_len`, which in turn increases KV cache (memory),
+  per-request decode time, and tokens/s demand. State the split explicitly
+  (e.g. "output_len = 3000 tok = ~400 answer + ~2600 reasoning, since
+  gpt-oss-20b runs with reasoning").
+
+### Users ⇄ concurrency (translate both ways — never conflate them)
+
+**Users** are people. **Concurrency** is the number of requests in flight
+on the server at once. They are different quantities: concurrency is what
+*determines performance* (it's what the tools take), but the deployer
+usually thinks and asks in *users*. Always translate between them and
+report back in the unit the user asked about — don't answer a
+"how many users?" question with a concurrency number.
+
+The link is Little's Law, with `W = request service time ≈ TTFT +
+output_len × TPOT` and a `think_time` (idle gap between a user's
+requests — see the archetype table):
 
 ```
-concurrency ≈ peak_active_users × W / (think_time + W)
-   where W = request service time ≈ TTFT + output_len × TPOT
+concurrency ≈ active_users × W / (think_time + W)        # users → load
+active_users ≈ concurrency × (think_time + W) / W        # load → users
+total_users ≈ active_users / peak_active_fraction        # e.g. /0.10
 ```
 
-If the user instead gives a request rate (RPS), apply Little's Law
-directly: `concurrency ≈ RPS × W`. State the peak-active fraction you
-assumed (e.g. "10% of 5000 registered users active at peak = 500").
+- **"I have N users — what hardware / does it fit?"** → go forward: users
+  → active_users (peak fraction) → concurrency → run the tools.
+- **"How many users can this config sustain?"** → go backward: find the
+  **max concurrency that still meets the latency target** (raise
+  concurrency in `simulate_serving` until TTFT/TPOT breach the limit),
+  then convert that concurrency back to active and total users.
+- If given a request rate (RPS) instead, use `concurrency ≈ RPS × W`.
+
+Always state the assumptions that drive the conversion — `think_time`,
+`W`, and the peak-active fraction (e.g. "assuming 30 s think time and 10%
+of registered users active at peak"). These dominate the user count, so
+make them visible and easy to challenge.
 
 ### The remaining knobs
 

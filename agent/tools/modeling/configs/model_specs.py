@@ -73,6 +73,14 @@ class ModelConfig:
     max_seq_len: int
     sliding_window: Optional[int] = None
 
+    # Reasoning behaviour, which drives how much output (hidden chain-of-
+    # thought + answer) a request generates:
+    #   "none"   — never emits reasoning tokens (e.g. plain Instruct models)
+    #   "hybrid" — can switch on/off or tune effort (e.g. Qwen3 think/no-think,
+    #              gpt-oss reasoning effort); the served mode must be chosen
+    #   "always" — always reasons (e.g. DeepSeek-R1 style)
+    reasoning_mode: str = "none"
+
     def layer_uses_sliding_window(self, layer_idx: int) -> bool:
         """True if the given layer applies sliding-window attention.
 
@@ -112,6 +120,7 @@ PRESET_MODELS: dict[str, ModelConfig] = {
         top_k=4,
         max_seq_len=131072,
         sliding_window=128,
+        reasoning_mode="hybrid",  # configurable reasoning effort (low/med/high)
     ),
     "Qwen/Qwen3-Coder-30B-A3B-Instruct": ModelConfig(
         name="Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -131,6 +140,7 @@ PRESET_MODELS: dict[str, ModelConfig] = {
         n_experts=128,
         top_k=8,
         max_seq_len=262144,
+        reasoning_mode="none",  # Coder Instruct is non-thinking
     ),
     "cpatonn/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit": ModelConfig(
         name="cpatonn/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit",
@@ -150,5 +160,6 @@ PRESET_MODELS: dict[str, ModelConfig] = {
         n_experts=128,
         top_k=8,
         max_seq_len=262144,
+        reasoning_mode="none",  # Coder Instruct is non-thinking
     ),
 }

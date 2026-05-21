@@ -54,7 +54,7 @@ def list_gpus() -> str:
     "model is not listed, say so and ask to add it as a preset."
 )
 def list_models() -> str:
-    rb = ReportBuilder(width=96)
+    rb = ReportBuilder(width=104)
     rb.banner("AVAILABLE MODEL PRESETS")
     rows = []
     for key, m in PRESET_MODELS.items():
@@ -66,11 +66,17 @@ def list_models() -> str:
             str(m.hidden_size),
             experts,
             f"{m.max_seq_len:,}",
+            m.reasoning_mode,
         ])
     rb.table(
-        headers=["preset", "ffn dtype", "layers", "hidden", "experts/top_k", "max_seq_len"],
+        headers=["preset", "ffn dtype", "layers", "hidden", "experts/top_k",
+                 "max_seq_len", "reasoning"],
         rows=rows,
-        col_widths=[46, 10, 7, 8, 14, 12],
+        col_widths=[46, 10, 7, 8, 14, 12, 9],
     )
+    rb.line()
+    rb.line("reasoning: none = no thinking tokens; hybrid = can toggle / tune "
+            "effort (pick the served mode); always = always reasons.")
+    rb.line("For hybrid/always, add the reasoning budget to output_len.")
     rb.rule("=")
     return rb.build()
