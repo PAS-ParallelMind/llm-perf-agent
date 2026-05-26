@@ -1,6 +1,46 @@
+/* KaTeX styles — needed by rehype-katex to render $...$ / $$...$$ blocks.
+   Must come before @tailwind since CSS spec requires @import first. */
+@import "katex/dist/katex.min.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Lightweight prose tuning for react-markdown output. Tailwind's
+   typography plugin would do more but isn't installed; this gets us
+   readable headings, lists, tables, and code without it. */
+.md {
+  @apply text-sm leading-relaxed;
+}
+.md > * + * { @apply mt-3; }
+.md h1 { @apply text-xl font-semibold mt-4 mb-2; }
+.md h2 { @apply text-lg font-semibold mt-4 mb-2; }
+.md h3 { @apply text-base font-semibold mt-3 mb-1; }
+.md h4 { @apply text-sm font-semibold mt-3 mb-1; }
+.md p  { @apply my-2; }
+.md ul { @apply list-disc pl-6 my-2 space-y-1; }
+.md ol { @apply list-decimal pl-6 my-2 space-y-1; }
+.md li > p { @apply my-0; }
+.md a  { @apply text-indigo-600 dark:text-indigo-300 underline; }
+.md strong { @apply font-semibold; }
+.md blockquote {
+  @apply border-l-2 border-slate-300 dark:border-slate-600 pl-3 italic text-slate-600 dark:text-slate-300;
+}
+.md hr { @apply border-slate-200 dark:border-slate-700 my-4; }
+.md table {
+  @apply text-xs border-collapse my-2;
+}
+.md th, .md td {
+  @apply border border-slate-300 dark:border-slate-600 px-2 py-1;
+}
+.md th { @apply bg-slate-100 dark:bg-slate-800 font-semibold; }
+.md :not(pre) > code {
+  @apply text-xs font-mono px-1 py-0.5 rounded bg-slate-200/70 dark:bg-slate-700/70;
+}
+.md pre {
+  @apply text-xs font-mono bg-slate-900 text-slate-100 rounded p-3 overflow-auto my-2;
+}
+.md pre code { @apply bg-transparent p-0; }
 
 html, body, #root {
   height: 100%;

@@ -24,10 +24,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+from .chat import SessionStore, cfg_from_form, discover_presets
 
 
 # ---------------------------------------------------------------------------
@@ -37,11 +39,15 @@ from fastapi.staticfiles import StaticFiles
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", HARNESS_ROOT / "runs" / "chat")).resolve()
 FRONTEND_DIST = HARNESS_ROOT / "webui" / "frontend" / "dist"
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Each chat session uses a fixed single-workspace name under ``batch/``
 # (see agent.main._init_session). We don't expose the per-task fanout the
 # old kernel-eval harness needed.
 _SESSION_WORKSPACE = "session"
+
+# Live chat-session registry shared across requests.
+STORE = SessionStore(RUNS_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +218,84 @@ def run_llm_requests(name: str) -> list[dict[str, Any]]:
         # so the UI degrades gracefully.
         return []
     return _read_jsonl(p)
+
+
+# ---------------------------------------------------------------------------
+# Live chat — POST endpoints that actually run the agent
+# ---------------------------------------------------------------------------
+
+@app.get("/api/presets")
+def list_presets() -> list[dict[str, Any]]:
+    """Snapshots of every chat-config YAML in the harness root the new-
+    session form can pre-fill from. Includes a built-in fake-dry-run
+    preset for testing without a vLLM server."""
+    return discover_presets(HARNESS_ROOT)
+
+
+@app.post("/api/sessions")
+def create_session(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Create a new chat session and return its summary.
+
+    Body (all fields under model are passed straight to ModelConfig):
+
+        {
+          "name":       "optional-session-slug",
+          "max_steps":  20,
+          "system_prompt":      "...",   // inline, takes precedence
+          "system_prompt_file": "prompts/perf_engineer.md",
+          "model": {
+            "name":              "/path/or/openai-id",
+            "base_url":          "http://...",
+            "api_key":           "EMPTY",
+            "temperature":       0.0,
+            "max_output_tokens": 4096,
+            "max_model_len":     32768,
+            "reasoning":         false
+          }
+        }
+    """
+    try:
+        cfg = cfg_from_form(payload, RUNS_DIR)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"invalid config: {e}") from e
+    try:
+        name = STORE.create(cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return _run_summary(_safe_run_dir(name))
+
+
+@app.post("/api/runs/{name}/chat")
+def chat(name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Send one user message and block until the agent's reply is ready.
+
+    Returns the final assistant text, the steps the loop consumed, the
+    elapsed wall time, and the full updated message list so the UI can
+    re-render the conversation without a second round-trip."""
+    msg = (payload.get("message") or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+    # Validate the session exists / can be resumed before delegating, so
+    # we return a clean 404 instead of a 500 from inside the store.
+    _safe_run_dir(name)
+    try:
+        return STORE.chat(name, msg)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        # Engine errors (vLLM down, bad model name, etc.) surface here.
+        raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.post("/api/runs/{name}/reset")
+def reset(name: str) -> dict[str, Any]:
+    """Drop conversation history but keep the session dir + engine."""
+    _safe_run_dir(name)
+    try:
+        STORE.reset(name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return _run_summary(_safe_run_dir(name))
 
 
 # ---------------------------------------------------------------------------
