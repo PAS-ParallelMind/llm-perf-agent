@@ -16,6 +16,25 @@ each stage as you enter it (e.g. `**Stage 1 — Service requirement**`).
 point** of Stage 2. The base system-prompt rule "converge, don't sweep"
 does NOT apply here.
 
+## Before Stage 1 — give the user a road map
+
+Before launching Stage 1, write a tight overview of the workflow so the
+user knows what to expect. Something like:
+
+> You want to deploy a model — here's how I'll work through it:
+> 1. **Workload profile** — translate your service description into
+>    concrete numbers (concurrency, input/output length, latency target).
+> 2. **Hardware sweep** — compare GPU candidates on cost vs. latency
+>    and recommend a Pareto-frontier point.
+> 3. **Measure baseline performance** — if you have a server running the
+>    recommended config, I'll benchmark it against the workload for real
+>    numbers; otherwise I'll fall back to a theoretical estimate and you
+>    can come back here after deploying.
+> 4. *(future work)* Optimisation suggestions for any bottleneck.
+
+Then proceed straight into Stage 1 — don't wait for confirmation unless
+the user explicitly pushes back or asks to switch to conversational mode.
+
 ## Stage 1 — Service requirement → Workload profile
 
 **Input**: the user's natural-language service description.
@@ -87,24 +106,65 @@ meets_target: <true|false>
 **Reply to the user**: the recommendation, the runner-up, one line on the
 tradeoff, and "next: Stage 3 will check the bottleneck."
 
-## Stage 3 — Workload + plan → Performance report (baseline + bottleneck)
+## Stage 3 — Measure baseline performance
 
 **Input**: WorkloadProfile + DeploymentPlan.
 
+The goal here is to **evaluate the actual performance** of the deployed
+system and quantify **how close it comes to the theoretical roofline**.
+The measured numbers come from `benchmark_serving` against the running
+server. The theoretical numbers come from `simulate_serving` and serve
+two purposes: (a) the reference to compute the implementation-efficiency
+gap against, and (b) the per-op breakdown that diagnoses *where* the
+gap is coming from (the real benchmark gives end-to-end numbers but no
+per-op detail).
+
 **Process**:
-1. **Theoretical**: call `simulate_serving(model, recommended_gpu,
-   concurrency, input_len, output_len, num_requests,
-   max_num_batched_tokens)`. The report already includes a one-line
-   `Bottleneck: <op> — N% of step (BOUND, avg M tokens/batch)` summary.
-2. **Calibrate**: call `lookup_measurements(model, recommended_gpu)`. If
-   one or more measured records exist for this operating point, derive a
-   rough implementation-efficiency factor (measured ÷ theoretical) and
-   report **both** numbers, clearly labelled. If no record exists, say
-   plainly that the estimate is purely theoretical.
-3. **Bottleneck**: the per-op bottleneck the sim surfaced — name the op
-   (NOT "decode" / "prefill"; continuous batching mixes them), its
-   percentage of step time, its compute/memory bound, and the average
-   tokens reaching it.
+
+1. **Ask about a running server.** Tell the user the recommended config
+   from Stage 2 and ask: *"Do you have an OpenAI-compatible server
+   running this config? Give me the `base_url` and the served `model`
+   name and I'll measure it."*
+   - **If yes** → run the measurement path (steps 2–5).
+   - **If no** → take the theoretical-only fallback at the end. Tell the
+     user that's a roofline reference, not actual performance, and that
+     they should come back to Stage 3 after deploying.
+
+2. **Measure** (primary): call `benchmark_serving(base_url=...,
+   model=<served name>, concurrency, input_len, output_len, num_requests,
+   gpu=<recommended preset>, tensor_parallel=1)` with the workload from
+   Stage 1 (single-GPU for now, so `tensor_parallel=1`). The tool drives
+   a real probe via `vllm bench serve` against the user's server and
+   auto-records the result to the measurement store.
+
+3. **Theoretical reference**: call `simulate_serving(model,
+   recommended_gpu, ...)` with the same workload. Use it for the
+   roofline comparison and for the per-op `Bottleneck: <op> — N% of step
+   (BOUND, avg M tokens/batch)` line.
+
+4. **Historical cross-check**: call `lookup_measurements(model,
+   recommended_gpu)` for any prior measurements (other framework
+   versions, nearby operating points). Use them as a sanity check on
+   the fresh measurement, not as the primary source.
+
+5. **Compute the gap**: implementation-efficiency = measured ÷
+   theoretical for throughput, and theoretical ÷ measured for latency
+   (so values < 1.0 always indicate measured is worse than the roofline,
+   meaning there's kernel / framework / scheduling headroom). The per-op
+   bottleneck from step 3 is the *diagnostic lens* — name the op (NOT
+   "decode" / "prefill"; continuous batching mixes them), state its
+   compute/memory bound, and use it to explain why the gap looks the way
+   it does (e.g. "FFN is memory-bound theoretically at 50% of step;
+   measured down_proj likely under-utilises HBM bandwidth on this
+   framework version").
+
+**Theoretical-only fallback** (no running server available):
+- Skip step 2 (`benchmark_serving`).
+- Still run step 3 (`simulate_serving`) and step 4 (`lookup_measurements`).
+- In the artifact, set `measured: null` and `efficiency: null`.
+- In your reply, say plainly that this is a *theoretical roofline*, not
+  actual performance, and that the user should re-run Stage 3 with
+  `base_url` once they have the recommended config deployed.
 
 **Output artifact** → write to `stages/03_report.yaml`:
 
@@ -129,9 +189,11 @@ bottleneck:
 gap_explanation: "<source: <record_ts>, basis: ...>"   # or null
 ```
 
-**Reply to the user**: headline numbers (theoretical AND measured if
-known), the bottleneck op + bound, the efficiency gap if calibration
-exists. Keep it tight — they read the artifact for detail.
+**Reply to the user**: lead with the **measured** numbers (or
+theoretical, if no server was available, clearly labelled), then the
+efficiency gap as a percentage of theoretical, then the bottleneck op
+and a one-line interpretation of where the gap comes from. Keep it
+tight — they read the artifact for detail.
 
 ## Stage 4 — Performance optimization (FUTURE WORK)
 

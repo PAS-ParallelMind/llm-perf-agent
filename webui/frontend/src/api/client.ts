@@ -92,6 +92,39 @@ export type ChatResponse = {
   turns: number;
 };
 
+// Live events emitted by the agent loop and streamed over SSE.
+// `final` carries the same fields as ChatResponse; `error` carries `error`.
+export type TurnEvent =
+  | { type: "ready" }
+  | { type: "step_start"; step: number; max_steps: number }
+  | {
+      type: "assistant";
+      step: number;
+      content: string;
+      tool_calls: NonNullable<TraceMessage["tool_calls"]>;
+      has_tool_calls: boolean;
+      llm_elapsed_ms: number;
+    }
+  | {
+      type: "tool_start";
+      step: number;
+      id: string;
+      name: string;
+      arguments: string;
+    }
+  | {
+      type: "tool_done";
+      step: number;
+      id: string;
+      name: string;
+      elapsed_ms: number;
+      preview: string;
+      result_chars: number;
+    }
+  | { type: "synthesis_start"; reason: string; max_steps: number }
+  | ({ type: "final" } & ChatResponse)
+  | { type: "error"; error: string };
+
 async function get<T>(path: string): Promise<T> {
   const resp = await fetch(path);
   if (!resp.ok) throw new Error(`${resp.status} ${path}: ${await resp.text()}`);
@@ -108,6 +141,73 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return resp.json();
 }
 
+// POST + SSE: post the message and stream events as they arrive. Browser
+// EventSource doesn't support POST, so we drive fetch's response stream
+// ourselves and parse the "data: ...\n\n" framing manually.
+//
+// Returns a promise that resolves when the stream ends. `onEvent` is
+// called with each parsed event in order. Throws on HTTP errors.
+async function chatStream(
+  name: string,
+  message: string,
+  onEvent: (ev: TurnEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const resp = await fetch(
+    `/api/runs/${encodeURIComponent(name)}/chat_stream`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+      signal,
+    },
+  );
+  if (!resp.ok || !resp.body) {
+    throw new Error(`${resp.status}: ${await resp.text()}`);
+  }
+
+  const reader  = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by a blank line. Handle either \n\n or
+    // \r\n\r\n to be tolerant of proxies that normalize line endings.
+    let sep: number;
+    while (
+      (sep = (() => {
+        const a = buf.indexOf("\n\n");
+        const b = buf.indexOf("\r\n\r\n");
+        if (a === -1) return b;
+        if (b === -1) return a;
+        return Math.min(a, b);
+      })()) !== -1
+    ) {
+      const skip = buf.startsWith("\r\n\r\n", sep) ? 4 : 2;
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + skip);
+
+      // Each frame may have multiple `data:` lines; concatenate them.
+      const data = frame
+        .split(/\r?\n/)
+        .filter(l => l.startsWith("data:"))
+        .map(l => l.slice(5).replace(/^ /, ""))
+        .join("\n");
+      if (!data) continue;
+      try {
+        onEvent(JSON.parse(data) as TurnEvent);
+      } catch {
+        // Malformed frame — surface as an error event so the UI can react.
+        onEvent({ type: "error", error: `bad SSE frame: ${data.slice(0, 200)}` });
+      }
+    }
+  }
+}
+
 export const api = {
   runs:        () => get<RunSummary[]>("/api/runs"),
   run:         (name: string) => get<RunSummary>(`/api/runs/${encodeURIComponent(name)}`),
@@ -119,6 +219,7 @@ export const api = {
   newSession:  (req: NewSessionRequest) => post<RunSummary>("/api/sessions", req),
   chat:        (name: string, message: string) =>
     post<ChatResponse>(`/api/runs/${encodeURIComponent(name)}/chat`, { message }),
+  chatStream,
   reset:       (name: string) =>
     post<RunSummary>(`/api/runs/${encodeURIComponent(name)}/reset`, {}),
 };

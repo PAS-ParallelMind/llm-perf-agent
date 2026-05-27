@@ -17,16 +17,19 @@ writes chat sessions). Override with ``RUNS_DIR=/path/to/dir``.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import queue
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import yaml
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .chat import SessionStore, cfg_from_form, discover_presets
@@ -285,6 +288,70 @@ def chat(name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     except Exception as e:
         # Engine errors (vLLM down, bad model name, etc.) surface here.
         raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.post("/api/runs/{name}/chat_stream")
+async def chat_stream(name: str,
+                      payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    """Same as ``/chat`` but streams progress events as Server-Sent Events.
+
+    The blocking agent loop runs in a worker thread; each callback the loop
+    fires goes into a thread-safe queue, and this handler's async generator
+    drains the queue (via ``asyncio.to_thread`` so we don't block the event
+    loop) and emits SSE frames. Two sentinel events bookend a turn:
+
+      * ``ready``           — connection open, worker started
+      * ``final`` / ``error`` — terminal; the worker has exited
+    """
+    msg = (payload.get("message") or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+    _safe_run_dir(name)
+
+    # SimpleQueue is sufficient and slightly faster than Queue (no task
+    # accounting); we just need a thread-safe put/get.
+    q: queue.SimpleQueue[dict[str, Any] | None] = queue.SimpleQueue()
+
+    def worker() -> None:
+        try:
+            result = STORE.chat(name, msg, on_event=q.put)
+            q.put({"type": "final", **result})
+        except FileNotFoundError as e:
+            q.put({"type": "error", "error": f"session not found: {e}"})
+        except Exception as e:
+            q.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
+        finally:
+            # Sentinel — tells the generator no more events are coming.
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def gen() -> AsyncIterator[bytes]:
+        # Initial frame so the browser sees the stream is alive even if
+        # the first agent step takes a while.
+        yield _sse({"type": "ready"})
+        while True:
+            ev = await asyncio.to_thread(q.get)
+            if ev is None:
+                return
+            yield _sse(ev)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            # Disable buffering on nginx-style reverse proxies so events
+            # arrive incrementally rather than at end-of-response.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(ev: dict[str, Any]) -> bytes:
+    """Format one SSE frame. ``default=str`` is for stray non-JSON values
+    that might appear in event payloads (e.g. exceptions)."""
+    return f"data: {json.dumps(ev, default=str)}\n\n".encode("utf-8")
 
 
 @app.post("/api/runs/{name}/reset")

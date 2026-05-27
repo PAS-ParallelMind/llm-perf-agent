@@ -11,9 +11,15 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console
+
+# Type alias for the optional progress callback. The webui's SSE endpoint
+# supplies one of these to push live events to the browser as each step
+# happens. None means "fire-and-forget the CLI / synchronous path".
+TurnEvent = dict[str, Any]
+OnEvent = Callable[[TurnEvent], None]
 
 from .engine import ContextLengthExceeded, Engine
 from .memory import load_index
@@ -235,8 +241,24 @@ class ChatAgent:
         self.messages.append({"role": "assistant", "content": reply})
         return reply or "[reached the tool-call budget; no final summary produced]"
 
-    def chat(self, user_message: str) -> TurnResult:
-        """Run one user turn and return the assistant's final reply."""
+    def chat(self, user_message: str,
+             on_event: OnEvent | None = None) -> TurnResult:
+        """Run one user turn and return the assistant's final reply.
+
+        If ``on_event`` is supplied, the loop emits dicts at key points so
+        callers (e.g. the webui's SSE endpoint) can render live progress.
+        Event ``type``s: ``step_start``, ``assistant``, ``tool_start``,
+        ``tool_done``. Exceptions inside the callback are swallowed so a
+        broken consumer can't take the turn down with it.
+        """
+        def emit(ev: TurnEvent) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+
         self._refresh_system()
         self.messages.append({"role": "user", "content": user_message})
         self.turn_count += 1
@@ -247,6 +269,8 @@ class ChatAgent:
         final_reply = ""
 
         for step in range(self.max_steps):
+            emit({"type": "step_start",
+                  "step": step + 1, "max_steps": self.max_steps})
             # Proactively trim before sending so we stay under the window.
             if self._context_chars(tool_schemas) > self._input_budget_chars:
                 n = self._trim_context(tool_schemas)
@@ -299,6 +323,15 @@ class ChatAgent:
                 asst["tool_calls"] = tool_calls
             self.messages.append(asst)
 
+            emit({
+                "type":            "assistant",
+                "step":            step + 1,
+                "content":         content,
+                "tool_calls":      tool_calls,
+                "has_tool_calls":  bool(tool_calls),
+                "llm_elapsed_ms":  llm_elapsed_ms,
+            })
+
             # No tool calls = this is the assistant's reply to the user.
             if not tool_calls:
                 final_reply = content
@@ -308,6 +341,13 @@ class ChatAgent:
                 name = tc["function"]["name"]
                 args = tc["function"]["arguments"]
                 console.print(f"[dim]· tool[/] [cyan]{name}[/] {args}")
+                emit({
+                    "type":      "tool_start",
+                    "step":      step + 1,
+                    "id":        tc["id"],
+                    "name":      name,
+                    "arguments": args,
+                })
 
                 tc_start = time.monotonic()
                 sig = _tool_signature(tc)
@@ -346,11 +386,23 @@ class ChatAgent:
                 }
                 turn_tool_log.append(entry)
                 self.tool_call_log.append(entry)
+                emit({
+                    "type":        "tool_done",
+                    "step":        step + 1,
+                    "id":          tc["id"],
+                    "name":        name,
+                    "elapsed_ms":  round(tc_elapsed * 1000),
+                    "preview":     preview,
+                    "result_chars": len(result),
+                })
         else:
             # Step budget exhausted while still tool-calling. Force one
             # tools-disabled call so the model synthesizes an answer from
             # what it gathered, instead of returning a useless placeholder.
             truncated = True
+            emit({"type": "synthesis_start",
+                  "reason": "step-budget-exhausted",
+                  "max_steps": self.max_steps})
             final_reply = self._forced_synthesis(tool_schemas, step + 1)
 
         return TurnResult(

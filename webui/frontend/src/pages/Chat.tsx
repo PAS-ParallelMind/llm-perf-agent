@@ -1,12 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type RunSummary, type TraceMessage } from "../api/client";
+import {
+  api,
+  type RunSummary,
+  type TraceMessage,
+  type TurnEvent,
+} from "../api/client";
 import Markdown from "../components/Markdown";
 import NewSessionModal from "../components/NewSessionModal";
 
 // Conversational view of a chat session: markdown-rendered user /
 // assistant turns with tool calls + results folded behind disclosures.
-// System messages and the harness's [previous analysis] reasoning echo
-// are hidden by default; toggle them via the header chips.
+// While a turn is in flight, a "live" bubble below the user message
+// renders step / tool events as they stream from /chat_stream — so the
+// user sees exactly which tool the agent is calling, not just a vague
+// "thinking…" indicator.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function tryParseJSON(s: string): unknown {
   try { return JSON.parse(s); } catch { return null; }
@@ -19,22 +30,124 @@ function stripPreviousAnalysis(content: string): string {
   return content.replace(/^\[previous analysis\][\s\S]*?(?:\n\n|\n*$)/, "");
 }
 
-// One conversational turn: an optional assistant text bubble + the tool
-// calls/results that fired during that step. Tool calls have no content
-// of their own — the assistant message is what kicks them off — so we
-// fold them into the same bubble.
+function fmtMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms - m * 60_000) / 1000);
+  return `${m}m${s.toString().padStart(2, "0")}s`;
+}
+
+function summarizeArgs(raw: string): string {
+  const parsed = tryParseJSON(raw);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return Object.entries(parsed as Record<string, unknown>)
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+      .join(" ")
+      .slice(0, 140);
+  }
+  return (raw || "").slice(0, 140);
+}
+
+// ---------------------------------------------------------------------------
+// Live timeline state
+// ---------------------------------------------------------------------------
+
+type LiveTool = {
+  id: string;
+  name: string;
+  arguments: string;
+  status: "running" | "done";
+  elapsedMs?: number;
+  resultChars?: number;
+  preview?: string;
+};
+
+type LiveStep = {
+  step: number;
+  assistantText?: string;
+  llmElapsedMs?: number;
+  tools: LiveTool[];
+};
+
+type LiveState = {
+  steps: LiveStep[];
+  synthesizing: boolean;
+};
+
+const EMPTY_LIVE: LiveState = { steps: [], synthesizing: false };
+
+function applyEvent(state: LiveState, ev: TurnEvent): LiveState {
+  switch (ev.type) {
+    case "ready":
+      return EMPTY_LIVE;
+    case "step_start":
+      return {
+        ...state,
+        steps: [...state.steps, { step: ev.step, tools: [] }],
+      };
+    case "assistant": {
+      const steps = state.steps.slice();
+      const idx = steps.findIndex(s => s.step === ev.step);
+      if (idx >= 0) {
+        steps[idx] = {
+          ...steps[idx],
+          assistantText: ev.content,
+          llmElapsedMs: ev.llm_elapsed_ms,
+        };
+      }
+      return { ...state, steps };
+    }
+    case "tool_start": {
+      const steps = state.steps.slice();
+      const idx = steps.findIndex(s => s.step === ev.step);
+      if (idx >= 0) {
+        steps[idx] = {
+          ...steps[idx],
+          tools: [...steps[idx].tools, {
+            id:        ev.id,
+            name:      ev.name,
+            arguments: ev.arguments,
+            status:    "running",
+          }],
+        };
+      }
+      return { ...state, steps };
+    }
+    case "tool_done": {
+      const steps = state.steps.slice();
+      const idx = steps.findIndex(s => s.step === ev.step);
+      if (idx >= 0) {
+        steps[idx] = {
+          ...steps[idx],
+          tools: steps[idx].tools.map(t =>
+            t.id === ev.id
+              ? { ...t, status: "done",
+                  elapsedMs:   ev.elapsed_ms,
+                  resultChars: ev.result_chars,
+                  preview:     ev.preview }
+              : t),
+        };
+      }
+      return { ...state, steps };
+    }
+    case "synthesis_start":
+      return { ...state, synthesizing: true };
+    default:
+      return state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Presentational components
+// ---------------------------------------------------------------------------
+
 function ToolCallBlock({ tc, result }: {
   tc: NonNullable<TraceMessage["tool_calls"]>[number];
   result?: TraceMessage;
 }) {
   const args = tryParseJSON(tc.function.arguments);
-  const argSummary = args && typeof args === "object" && !Array.isArray(args)
-    ? Object.entries(args as Record<string, unknown>)
-        .map(([k, v]) => `${k}=${typeof v === "string" ? JSON.stringify(v) : JSON.stringify(v)}`)
-        .join(" ")
-        .slice(0, 120)
-    : (tc.function.arguments || "").slice(0, 120);
-
+  const argSummary = summarizeArgs(tc.function.arguments);
   const out = result?.content ?? "";
   return (
     <details className="border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/40 my-1">
@@ -64,6 +177,78 @@ function ToolCallBlock({ tc, result }: {
         </div>
       </div>
     </details>
+  );
+}
+
+function LiveToolRow({ tool }: { tool: LiveTool }) {
+  const argSummary = summarizeArgs(tool.arguments);
+  return (
+    <details className="border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/40 my-1">
+      <summary className="cursor-pointer px-3 py-1.5 text-xs font-mono select-none flex items-center gap-2">
+        <span
+          className={
+            "inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] " +
+            (tool.status === "running"
+              ? "bg-amber-400 text-amber-900 animate-pulse"
+              : "bg-emerald-500 text-white")
+          }
+          title={tool.status}
+        >
+          {tool.status === "running" ? "…" : "✓"}
+        </span>
+        <span className="text-indigo-600 dark:text-indigo-300 font-semibold">
+          ⚒ {tool.name}
+        </span>
+        <span className="text-slate-500 truncate">{argSummary}</span>
+        {tool.status === "done" && (
+          <span className="ml-auto text-slate-400 flex items-center gap-2">
+            {tool.elapsedMs !== undefined && <span>{fmtMs(tool.elapsedMs)}</span>}
+            {tool.resultChars !== undefined && <span>{tool.resultChars} chars</span>}
+          </span>
+        )}
+      </summary>
+      {tool.preview && (
+        <pre className="text-xs font-mono whitespace-pre-wrap bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-700 rounded m-2 p-2 max-h-64 overflow-auto">
+          {tool.preview}
+        </pre>
+      )}
+    </details>
+  );
+}
+
+function LiveAssistantBubble({ state }: { state: LiveState }) {
+  const empty = state.steps.length === 0;
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-3xl bg-white dark:bg-slate-800/60 border border-indigo-200 dark:border-indigo-800 rounded-lg px-4 py-2 w-full">
+        <div className="text-[10px] uppercase text-indigo-600 dark:text-indigo-300 font-bold mb-1 flex items-center gap-2">
+          <span>assistant</span>
+          <span className="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
+          <span className="text-slate-500 normal-case font-normal">
+            {empty ? "connecting…" : `step ${state.steps[state.steps.length - 1].step} · live`}
+          </span>
+          {state.synthesizing && (
+            <span className="text-amber-600 dark:text-amber-300 normal-case font-normal">
+              · step budget hit — synthesizing final answer
+            </span>
+          )}
+        </div>
+        {empty && (
+          <div className="text-sm text-slate-500 italic">
+            Waiting for the model's first step…
+          </div>
+        )}
+        {state.steps.map((s) => {
+          const text = (s.assistantText ?? "").trim();
+          return (
+            <div key={s.step} className="mt-1">
+              {text && <Markdown>{stripPreviousAnalysis(text)}</Markdown>}
+              {s.tools.map(t => <LiveToolRow key={t.id} tool={t} />)}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -113,6 +298,10 @@ function SystemBubble({ content }: { content: string }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
 export default function Chat() {
   const [runs, setRuns]       = useState<RunSummary[]>([]);
   const [runName, setRunName] = useState<string>("");
@@ -123,6 +312,8 @@ export default function Chat() {
   const [showNew, setShowNew] = useState(false);
   const [err, setErr]         = useState<string | null>(null);
   const [lastInfo, setInfo]   = useState<string>("");
+  const [live, setLive]       = useState<LiveState>(EMPTY_LIVE);
+  const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Initial session list. Pick the most recent so the page is never empty.
@@ -132,8 +323,12 @@ export default function Chat() {
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Load the selected session's trace whenever it changes.
+  // Load the selected session's trace whenever it changes. Cancel any
+  // in-flight stream from a previous session so its events don't leak in.
   useEffect(() => {
+    abortRef.current?.abort();
+    setLive(EMPTY_LIVE);
+    setSending(false);
     if (!runName) { setMsgs([]); return; }
     setErr(null);
     api.trace(runName)
@@ -141,10 +336,16 @@ export default function Chat() {
       .catch(e => { setErr(String(e)); setMsgs([]); });
   }, [runName]);
 
-  // Auto-scroll to the bottom whenever the message list grows.
+  // Auto-scroll to the bottom whenever new content lands. The dep on
+  // live.steps.length + live tools' status changes covers in-flight tool
+  // events, not just message-list growth.
+  const liveSig = useMemo(
+    () => live.steps.map(s => `${s.step}:${s.tools.length}:${s.tools.map(t => t.status).join("")}`).join("|"),
+    [live],
+  );
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, sending]);
+  }, [messages.length, sending, liveSig]);
 
   async function refreshRuns(): Promise<RunSummary[]> {
     try {
@@ -160,19 +361,33 @@ export default function Chat() {
   async function send() {
     const msg = draft.trim();
     if (!msg || !runName || sending) return;
-    setSending(true); setErr(null); setInfo("");
-    // Optimistic append so the user sees their bubble immediately.
+    setSending(true); setErr(null); setInfo(""); setLive(EMPTY_LIVE);
     setMsgs(prev => [...prev, { role: "user", content: msg }]);
     setDraft("");
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
     try {
-      const resp = await api.chat(runName, msg);
-      setMsgs(resp.messages);
-      setInfo(`turn ${resp.turns} · ${resp.steps} step(s) · ${resp.elapsed_s}s`
-              + (resp.truncated ? " · truncated" : ""));
-      refreshRuns();
+      await api.chatStream(runName, msg, (ev) => {
+        if (ev.type === "final") {
+          setMsgs(ev.messages);
+          setLive(EMPTY_LIVE);
+          setInfo(`turn ${ev.turns} · ${ev.steps} step(s) · ${ev.elapsed_s}s`
+                  + (ev.truncated ? " · truncated" : ""));
+          refreshRuns();
+        } else if (ev.type === "error") {
+          setErr(ev.error);
+        } else {
+          setLive(prev => applyEvent(prev, ev));
+        }
+      }, ctrl.signal);
     } catch (e) {
-      setErr(String(e));
+      // AbortError is expected when the user switches sessions mid-turn.
+      const name = (e as Error)?.name;
+      if (name !== "AbortError") setErr(String(e));
     } finally {
+      if (abortRef.current === ctrl) abortRef.current = null;
       setSending(false);
     }
   }
@@ -190,9 +405,9 @@ export default function Chat() {
     }
   }
 
-  // Build the renderable list: pair each assistant message with its tool
-  // results by tool_call_id. Hide standalone tool messages — they're
-  // surfaced inside the assistant bubble that requested them.
+  // Pair each assistant message with its tool results by tool_call_id.
+  // Standalone tool messages are surfaced inside the assistant bubble that
+  // requested them — don't render them again at the top level.
   const view = useMemo(() => {
     const resultsById = new Map<string, TraceMessage>();
     for (const m of messages) {
@@ -259,7 +474,7 @@ export default function Chat() {
           </p>
         )}
 
-        {runName && view.items.length === 0 && !err && (
+        {runName && view.items.length === 0 && !err && !sending && (
           <p className="text-slate-500 text-sm">Empty session — say hello below.</p>
         )}
 
@@ -282,17 +497,10 @@ export default function Chat() {
               />
             );
           }
-          // tool role: rendered inside the assistant bubble — skip here.
           return null;
         })}
 
-        {sending && (
-          <div className="flex justify-start">
-            <div className="bg-white dark:bg-slate-800/60 border border-indigo-200 dark:border-indigo-800 rounded-lg px-4 py-2 text-sm text-slate-500 italic">
-              Agent is thinking…
-            </div>
-          </div>
-        )}
+        {sending && <LiveAssistantBubble state={live} />}
 
         <div ref={bottomRef} />
       </div>

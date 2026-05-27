@@ -23,7 +23,7 @@ import yaml
 from agent.config import AgentSettings, ChatConfig, ModelConfig, SessionConfig
 from agent.engine import Engine
 from agent.fake_engine import FakeEngine
-from agent.loop import ChatAgent, TurnResult
+from agent.loop import ChatAgent, OnEvent, TurnResult
 from agent.tools import TOOLS  # noqa: F401 — triggers tool registration
 from agent.types import SessionMeta
 from agent.workspace import set_root
@@ -180,13 +180,21 @@ class SessionStore:
 
     # -- chat ---------------------------------------------------------------
 
-    def chat(self, name: str, message: str) -> dict[str, Any]:
+    def chat(self, name: str, message: str,
+             on_event: OnEvent | None = None) -> dict[str, Any]:
+        """Run one turn synchronously and persist the trace.
+
+        ``on_event`` is forwarded straight to :meth:`ChatAgent.chat` so the
+        SSE endpoint can stream step / tool events to the browser as they
+        happen. The per-session lock means concurrent callers for the same
+        session serialize (later one waits for the in-flight turn).
+        """
         entry = self._get_or_resume(name)
         with entry.lock:
             # Re-point the workspace anchor at this session's dir in case
             # another session was used in between.
             set_root(entry.workspace)
-            result: TurnResult = entry.agent.chat(message)
+            result: TurnResult = entry.agent.chat(message, on_event=on_event)
             entry.meta.turns += 1
             entry.meta.total_steps += result.steps
             entry.meta.total_elapsed_s += result.elapsed_s
