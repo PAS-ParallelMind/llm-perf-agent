@@ -16,10 +16,18 @@ each stage as you enter it (e.g. `**Stage 1 — Service requirement**`).
 point** of Stage 2. The base system-prompt rule "converge, don't sweep"
 does NOT apply here.
 
-## Before Stage 1 — give the user a road map
+## STEP 0 — REQUIRED road-map (write this FIRST, do not skip)
 
-Before launching Stage 1, write a tight overview of the workflow so the
-user knows what to expect. Something like:
+**This step is mandatory.** Your very next user-facing reply after
+invoking this skill MUST present the workflow road-map. Do NOT silently
+jump into Stage 1's tool calls — the user must see the structure first.
+
+Concretely: the assistant message in which you make your first tool
+call for Stage 1 must have **content** that begins with this road-map,
+*then* the Stage 1 header (`**Stage 1 — Service requirement**`), and
+*then* whatever brief setup text Stage 1 needs. Include the road-map
+verbatim or lightly paraphrased — the four numbered bullets and the
+closing "let me know" line are required:
 
 > You want to deploy a model — here's how I'll work through it:
 > 1. **Workload profile** — translate your service description into
@@ -31,11 +39,21 @@ user knows what to expect. Something like:
 >    numbers; otherwise I'll fall back to a theoretical estimate and you
 >    can come back here after deploying.
 > 4. *(future work)* Optimisation suggestions for any bottleneck.
+>
+> Let me know if you'd rather just chat about specific numbers instead.
 
-Then proceed straight into Stage 1 — don't wait for confirmation unless
-the user explicitly pushes back or asks to switch to conversational mode.
+You do NOT need to wait for the user to acknowledge — emit this in the
+same assistant message that starts Stage 1, then continue.
+
+**Checklist before Stage 1**: did your reply contain the four numbered
+road-map bullets? If not, you skipped Step 0 — fix it before any
+Stage-1 tool call.
 
 ## Stage 1 — Service requirement → Workload profile
+
+**Gate**: before reading anything else in this section, confirm the
+Step-0 road-map is in your reply for this turn. If it isn't, stop —
+prepend it before any Stage-1 work.
 
 **Input**: the user's natural-language service description.
 
@@ -49,11 +67,14 @@ ask the user — proceed with stated assumptions and let them override.
 
 ```yaml
 model: <PRESET_MODELS key>
-concurrency: <int>
+request_rate: <float>              # req/s, Poisson arrivals (NOT concurrency)
 input_len: <int>
 output_len: <int>                  # incl. reasoning budget if model reasons
-num_requests: <int>                # 20× concurrency (short out) or 5× (long)
-max_num_batched_tokens: <int>
+num_requests: <int>                # max(200, ~10 × request_rate) for stable percentiles
+max_num_batched_tokens: <int>      # vLLM --max-num-batched-tokens (e.g. 8192)
+max_concurrent_requests: <int>     # vLLM --max-num-seqs server cap (e.g. 1024)
+range_ratio: <float>               # 0.0 = fixed lengths (clean modeled-vs-measured
+                                   # comparison); 0.1 = ±10% per-request jitter
 target_request_latency_s: <float>  # end-to-end per-request seconds
 assumptions:
   archetype: <chat|RAG|code|summarization|agentic>
@@ -63,6 +84,11 @@ assumptions:
   notes: "<anything else worth surfacing>"
 ```
 
+Concurrency is **not** a workload knob in this schema — it's a *result*
+of running the workload through the server (the simulator and benchmark
+both report observed peak / mean in-flight). The deployer's lever is
+the arrival rate.
+
 **Reply to the user**: a tight summary — the workload knobs you chose, the
 assumptions you made, and a one-line invitation to override.
 
@@ -71,13 +97,26 @@ assumptions you made, and a one-line invitation to override.
 **Input**: WorkloadProfile from Stage 1.
 
 **Process**:
-1. **Candidates**: if the user named hardware, use that set. Otherwise
-   call `list_gpus` to see options and **ask the user** which to
-   evaluate — don't silently sweep all GPUs.
-2. **Sweep**: call `pareto_sweep(model, candidates, concurrency,
-   input_len, output_len, num_requests, max_num_batched_tokens,
-   target_request_latency_s)`. The result has fit checks, $/1M-token
-   cost, request latency, and Pareto-frontier markers.
+1. **Candidates**:
+   - **If the user named hardware**, validate each name against the
+     catalog (`list_gpus` keys). For any name **not** in the catalog,
+     tell the user plainly: *"I can't evaluate `<name>` — it isn't in
+     my preset catalog. I can use the closest match (`<key>`), or you
+     can drop it."* Do NOT attempt to run `pareto_sweep` with an
+     unknown name; the modeling tools key on preset keys. Proceed only
+     with the validated subset (plus any closest-match substitutions
+     the user accepts).
+   - **If the user didn't name hardware**, ask them what they're
+     considering — *don't* paste the catalog list. Their actual
+     hardware may not even be in the catalog, and offering a menu
+     biases them toward your presets. Only after they answer do you
+     validate as above.
+2. **Sweep**: call `pareto_sweep(workload_file="stages/01_workload.yaml",
+   candidates=[...])`. The workload knobs come from the YAML; you only
+   pass the candidates. The result has fit checks, $/1M-token cost,
+   request latency, and Pareto-frontier markers. (Saturated candidates
+   are excluded from the frontier — their latency numbers under
+   saturation are meaningless.)
 3. **Recommend**: pick one Pareto-frontier point matching the user's
    stated preference. If they didn't state one, default to the **cheapest
    candidate that meets the latency target** and offer the
@@ -130,17 +169,20 @@ per-op detail).
      user that's a roofline reference, not actual performance, and that
      they should come back to Stage 3 after deploying.
 
-2. **Measure** (primary): call `benchmark_serving(base_url=...,
-   model=<served name>, concurrency, input_len, output_len, num_requests,
-   gpu=<recommended preset>, tensor_parallel=1)` with the workload from
-   Stage 1 (single-GPU for now, so `tensor_parallel=1`). The tool drives
-   a real probe via `vllm bench serve` against the user's server and
-   auto-records the result to the measurement store.
+2. **Measure** (primary): call `benchmark_serving(
+   base_url=..., workload_file="stages/01_workload.yaml",
+   gpu=<recommended preset>, tensor_parallel=1)`. The workload knobs
+   come from the YAML; you only pass server-side info (base_url, gpu,
+   parallelism). Override `model` if the server is serving under a
+   different id than the workload's `model`. Single-GPU for now, so
+   `tensor_parallel=1`. The tool drives a real probe via `vllm bench
+   serve` and auto-records the result to the measurement store.
 
-3. **Theoretical reference**: call `simulate_serving(model,
-   recommended_gpu, ...)` with the same workload. Use it for the
-   roofline comparison and for the per-op `Bottleneck: <op> — N% of step
-   (BOUND, avg M tokens/batch)` line.
+3. **Theoretical reference**: call `simulate_serving(
+   workload_file="stages/01_workload.yaml", gpu=<recommended preset>)`.
+   Same workload, hardware filled in. Use it for the roofline comparison
+   and for the per-op `Bottleneck: <op> — N% of step (BOUND, avg M
+   tokens/batch)` line.
 
 4. **Historical cross-check**: call `lookup_measurements(model,
    recommended_gpu)` for any prior measurements (other framework

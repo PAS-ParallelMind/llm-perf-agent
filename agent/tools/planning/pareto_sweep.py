@@ -35,6 +35,7 @@ class _CandidateRow:
     cost_per_hour: float
     cost_per_mtok: float | None   # USD per 1M output tokens
     meets_target: bool | None
+    saturated: bool = False        # diverging latency; excluded from frontier
     note: str = ""
 
     @property
@@ -45,18 +46,25 @@ class _CandidateRow:
 def _evaluate(
     model: str,
     gpu_key: str,
-    concurrency: int,
+    request_rate: float,
     input_len: int,
     output_len: int,
     num_requests: int,
     max_num_batched_tokens: int,
+    max_concurrent_requests: int,
+    range_ratio: float,
     target_latency: float | None,
 ) -> _CandidateRow:
     gpu = PRESET_GPUS[gpu_key]
     model_spec = PRESET_MODELS[model]
 
+    # Worst-case fit check: assume all `max_concurrent_requests` requests
+    # are simultaneously holding their full KV. Actual peak in-flight may
+    # be lower (the simulator admits subject to its own KV budget), but
+    # if even the worst case doesn't fit, the deployment is too tight.
     weights_g = weights_vram_gib(model_spec)
-    kv_g = kv_cache_vram_gib(model_spec, concurrency, input_len + output_len)
+    kv_g = kv_cache_vram_gib(model_spec, max_concurrent_requests,
+                              input_len + output_len)
     vram_used = weights_g + kv_g
     vram_cap = gpu.mem_capacity / (1024 ** 3) * _VRAM_HEADROOM
 
@@ -67,19 +75,21 @@ def _evaluate(
             request_latency_s=None, output_throughput_tps=None,
             cost_per_hour=gpu.cost_per_hour, cost_per_mtok=None,
             meets_target=None,
-            note=f"doesn't fit: {vram_used:.1f} > {vram_cap:.1f} GiB usable",
+            note=f"doesn't fit (worst case @ max_concurrent={max_concurrent_requests}): "
+                 f"{vram_used:.1f} > {vram_cap:.1f} GiB usable",
         )
 
     result = run_simulation(
         model_name=model, gpu_name=gpu_key,
-        concurrency=concurrency,
+        request_rate=request_rate,
         input_len=input_len, output_len=output_len,
         n_requests=num_requests,
         max_batched_tokens=max_num_batched_tokens,
-        jitter=0.0,
+        max_concurrent_requests=max_concurrent_requests,
+        jitter=range_ratio,
     )
     s = summarize_run(result)
-    if s is None or s.output_throughput_tps <= 0:
+    if s is None or s.served_rate <= 0:
         return _CandidateRow(
             gpu=gpu_key, fits=True,
             vram_used_gib=vram_used, vram_cap_gib=vram_cap,
@@ -89,19 +99,25 @@ def _evaluate(
             note="simulation produced no usable result",
         )
 
+    # served_rate is requests/s; multiply by output_len for output tokens/s.
+    output_throughput_tps = s.served_rate * output_len
+    request_latency_s = s.e2e_s.mean
     cost_per_mtok = (
-        (gpu.cost_per_hour / 3600.0) * 1e6 / s.output_throughput_tps
-        if gpu.cost_per_hour > 0 else None
+        (gpu.cost_per_hour / 3600.0) * 1e6 / output_throughput_tps
+        if gpu.cost_per_hour > 0 and output_throughput_tps > 0 else None
     )
-    meets = (s.avg_request_s <= target_latency) if target_latency is not None else None
+    meets = (request_latency_s <= target_latency) if target_latency is not None else None
+    note = f"saturated: {s.saturation_reason}" if s.saturated else ""
     return _CandidateRow(
         gpu=gpu_key, fits=True,
         vram_used_gib=vram_used, vram_cap_gib=vram_cap,
-        request_latency_s=s.avg_request_s,
-        output_throughput_tps=s.output_throughput_tps,
+        request_latency_s=request_latency_s,
+        output_throughput_tps=output_throughput_tps,
         cost_per_hour=gpu.cost_per_hour,
         cost_per_mtok=cost_per_mtok,
         meets_target=meets,
+        saturated=s.saturated,
+        note=note,
     )
 
 
@@ -113,7 +129,8 @@ def _pareto_mark(rows: list[_CandidateRow]) -> set[str]:
     no worse on both axes AND strictly better on at least one.
     """
     eligible = [r for r in rows
-                if r.is_evaluated and r.cost_per_mtok is not None]
+                if r.is_evaluated and r.cost_per_mtok is not None
+                and not r.saturated]
     on_pareto: set[str] = set()
     for r in eligible:
         dominated = False
@@ -185,47 +202,58 @@ def _format_table(
     "Stage 2 of the deployment-planning workflow: evaluate a list of "
     "single-GPU hardware candidates against a workload and return a "
     "cost-vs-latency Pareto table. For each candidate it checks single-"
-    "GPU memory fit, runs the serving simulator, and computes $/1M output "
-    "tokens; candidates that don't fit are excluded from the frontier. "
-    "Pass the workload params you derived in stage 1.",
-    model="Preset model name (PRESET_MODELS key).",
+    "GPU memory fit (worst-case at `max_concurrent_requests`), runs the "
+    "serving simulator under Poisson arrivals, and computes $/1M output "
+    "tokens. Candidates that don't fit or that saturate at this rate are "
+    "excluded from the frontier. All workload knobs come from the YAML; "
+    "you only pass the candidate hardware list.",
+    workload_file="Workspace-relative path to a WorkloadProfile YAML "
+                  "(e.g. 'stages/01_workload.yaml'). Must contain `model`, "
+                  "`request_rate`, `input_len`, `output_len`, `num_requests`, "
+                  "`max_num_batched_tokens`. `max_concurrent_requests` and "
+                  "`target_request_latency_s` are optional.",
     candidates="List of GPU preset names (PRESET_GPUS keys). Ask the user "
                "to confirm the candidate set; don't silently sweep all GPUs.",
-    concurrency="Max in-flight requests (from the workload profile).",
-    input_len="Input tokens per request.",
-    output_len="Output tokens per request (incl. reasoning budget).",
-    num_requests="Number of requests to simulate (see the sizing rule in "
-                 "the prompt: ~20× concurrency for short outputs, "
-                 "~5× concurrency for long outputs).",
-    max_num_batched_tokens="Scheduler's max-batched-token budget.",
-    target_request_latency_s="Hard latency target from the workload "
-                              "profile; rows are flagged ✓/✗. Optional.",
 )
 def pareto_sweep(
-    model: str,
+    workload_file: str,
     candidates: list,
-    concurrency: int,
-    input_len: int,
-    output_len: int,
-    num_requests: int,
-    max_num_batched_tokens: int,
-    target_request_latency_s: float = 0.0,
 ) -> str:
+    try:
+        from ...workspace import resolve
+        import yaml
+        wf = yaml.safe_load(resolve(workload_file).read_text()) or {}
+    except Exception as e:
+        return f"ERROR: could not load workload_file {workload_file!r}: {type(e).__name__}: {e}"
+
+    model = wf.get("model", "")
+    request_rate = wf.get("request_rate", 0.0)
+    input_len = wf.get("input_len", 0)
+    output_len = wf.get("output_len", 0)
+    num_requests = wf.get("num_requests", 0)
+    max_num_batched_tokens = wf.get("max_num_batched_tokens", 0)
+    max_concurrent_requests = wf.get("max_concurrent_requests", 0) or 1024
+    range_ratio = float(wf.get("range_ratio", 0.0))
+    target_request_latency_s = wf.get("target_request_latency_s", 0.0)
+
     if model not in PRESET_MODELS:
         return (f"ERROR: unknown model {model!r}. "
                 f"Available: {', '.join(sorted(PRESET_MODELS))}")
     if not candidates:
         return ("ERROR: no candidates provided. Ask the user which GPUs to "
-                "evaluate (use list_gpus to show the available presets).")
+                "evaluate.")
     unknown = [c for c in candidates if c not in PRESET_GPUS]
     if unknown:
         return (f"ERROR: unknown gpu(s) {unknown}. "
                 f"Available: {', '.join(sorted(PRESET_GPUS))}")
+    if request_rate <= 0:
+        return "ERROR: request_rate must be > 0."
 
     target = target_request_latency_s if target_request_latency_s > 0 else None
     rows = [
-        _evaluate(model, c, concurrency, input_len, output_len,
-                  num_requests, max_num_batched_tokens, target)
+        _evaluate(model, c, request_rate, input_len, output_len,
+                  num_requests, max_num_batched_tokens,
+                  max_concurrent_requests, range_ratio, target)
         for c in candidates
     ]
     on_pareto = _pareto_mark(rows)

@@ -123,8 +123,8 @@ roofline and the efficiency factor**, so each record documents reality
 and theory together.
 
 ```
-benchmark_serving(base_url, model, concurrency, input_len, output_len,
-                  num_requests, request_rate="inf", range_ratio=0.0,
+benchmark_serving(base_url, model, request_rate, input_len, output_len,
+                  num_requests, max_concurrency=0, range_ratio=0.0,
                   endpoint="/v1/completions", gpu="",
                   tensor_parallel=1, pipeline_parallel=1, data_parallel=1,
                   expert_parallel=False, ignore_eos=True) -> report
@@ -138,10 +138,18 @@ benchmark_serving(base_url, model, concurrency, input_len, output_len,
   serves under a different id (e.g. a local path), the tool auto-detects
   it from `/v1/models` and passes `--served-model-name` for you — the
   report's "Served as" line shows which id requests actually used.
+- `request_rate` is the load knob (req/s, Poisson arrivals — mirrors
+  `simulate_serving`). Pass `"inf"` to send everything at once
+  (closed-loop, bounded by `max_concurrency`); in that mode the recorded
+  theoretical baseline is skipped with a note, since the modeling
+  simulator is open-loop.
+- `max_concurrency` is an optional in-flight cap (default `0` = no cap —
+  pure open-loop at `request_rate`). Concurrency is now a **result** of
+  the run (observed peak in-flight), not an input.
 - `gpu` is optional but recommended: it tags the recorded measurement so
   later lookups can calibrate by hardware, and (with a single-GPU,
-  preset model+GPU) enables the stored theoretical baseline. Prefer a
-  `PRESET_GPUS` name.
+  preset model+GPU and a finite `request_rate`) enables the stored
+  theoretical baseline. Prefer a `PRESET_GPUS` name.
 - `tensor_parallel` / `pipeline_parallel` / `data_parallel` /
   `expert_parallel` describe the **server's** parallelism layout (TP / PP
   / DP / EP). `vllm bench serve` is a *client* — it can't change how the
@@ -150,8 +158,6 @@ benchmark_serving(base_url, model, concurrency, input_len, output_len,
   results from different layouts aren't conflated on lookup. (The roofline
   baseline is only computed for single-GPU deployments; the modeling tools
   don't yet model TP/PP/DP scaling.)
-- `request_rate="inf"` sends all requests at once (closed-loop, bounded
-  only by `concurrency`); a finite value sets an open-loop arrival rate.
 
 Requires `vllm` installed and a reachable, already-running server. Also
 runnable as a CLI:
@@ -159,7 +165,7 @@ runnable as a CLI:
 ```bash
 uv run python -m agent.tools.benchmarking.benchmark \
     --base-url http://localhost:8000 --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
-    --concurrency 32 --input-len 1024 --output-len 128 --num-requests 200 \
+    --request-rate 10 --input-len 1024 --output-len 128 --num-requests 200 \
     --gpu h100-sxm
 ```
 
@@ -175,10 +181,10 @@ throughput = measured ÷ theory, latency = theory ÷ measured). So a single
 record reads, e.g.:
 
 ```
-gpt-oss-20b on 4090 | c=8 in=256 out=64 tp=1
-  measured: out=716 tok/s, TTFT=136ms, TPOT=9.16ms
-  theory (single-GPU roofline): out=791 tok/s, TTFT=77ms, TPOT=9.05ms
-                                | efficiency: output tput 90%, TPOT 99%
+gpt-oss-20b on 4090 | rate=5 req/s, c=11 (peak in-flight) in=256 out=64 tp=1
+  measured: out=305 tok/s, TTFT=43ms, TPOT=7.4ms
+  theory  : out=267 tok/s, TTFT=15ms, TPOT=4.4ms  [SATURATED in theory]
+            | efficiency: output tput 114%, TPOT 60% of ideal
 ```
 
 `lookup_measurements(model, gpu)` returns matching records so the agent

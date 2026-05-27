@@ -57,7 +57,7 @@ def _load_all() -> list[dict]:
 def _theoretical(
     model: str,
     gpu: str,
-    concurrency: int,
+    request_rate: str,
     input_len: int,
     output_len: int,
     n_gpus: int,
@@ -68,7 +68,9 @@ def _theoretical(
     the model being computable.
 
     ``model`` / ``gpu`` must be exact PRESET keys (the modeling tools key on
-    those); pass the same preset names you give the modeling tools."""
+    those); pass the same preset names you give the modeling tools. The
+    simulator is request-rate-driven (Poisson arrivals); ``request_rate`` must
+    parse to a finite positive float."""
     # Lazy imports: keep the modeling stack (numpy) off the import path until a
     # record actually needs it.
     from ..modeling.configs.model_specs import PRESET_MODELS
@@ -84,23 +86,40 @@ def _theoretical(
                         "TP/PP/DP scaling, so a single-GPU roofline wouldn't "
                         "correspond"}
     try:
+        rate_f = float(request_rate)
+    except (TypeError, ValueError):
+        rate_f = 0.0
+    if not (rate_f > 0 and rate_f != float("inf")):
+        return {"note": f"not computed: request_rate={request_rate!r} is not "
+                        "a finite positive number (the simulator is Poisson-"
+                        "arrival-driven; closed-loop runs aren't directly "
+                        "comparable to its open-loop baseline)"}
+    try:
         from ..modeling.serving import run_simulation, summarize_run
-        n_req = max(2 * concurrency, 16)  # enough to fill the pipeline; bounded
+        # ~10 s of simulated traffic — enough for stable percentiles at any
+        # rate, bounded so cheap rates don't blow up the run.
+        n_req = max(int(rate_f * 10), 32)
         result = run_simulation(
-            model_name=model, gpu_name=gpu, concurrency=concurrency,
+            model_name=model, gpu_name=gpu, request_rate=rate_f,
             input_len=input_len, output_len=output_len,
             n_requests=n_req, max_batched_tokens=8192, jitter=0.0,
         )
         s = summarize_run(result)
         if s is None:
             return {"note": "not computed: simulation produced no finished requests"}
-        return {
-            "basis": "single-GPU roofline (simulate_serving)",
-            "output_throughput_tps": round(s.output_throughput_tps, 3),
-            "total_throughput_tps": round(s.total_throughput_tps, 3),
-            "ttft_ms": round((s.avg_waiting_s + s.avg_prefill_s) * 1000, 3),
-            "tpot_ms": round(s.avg_decode_per_token_s * 1000, 3),
+        out = {
+            "basis": "single-GPU roofline (simulate_serving, Poisson arrivals)",
+            "served_rate_rps": round(s.served_rate, 3),
+            "output_throughput_tps": round(s.served_rate * output_len, 3),
+            "total_throughput_tps": round(s.served_rate * (input_len + output_len), 3),
+            "ttft_ms": round(s.ttft_ms.mean, 3),
+            "tpot_ms": round(s.tpot_ms.mean, 3),
+            "mean_in_flight": round(s.mean_in_flight, 2),
         }
+        if s.saturated:
+            out["saturated"] = True
+            out["saturation_reason"] = s.saturation_reason
+        return out
     except Exception as e:  # never let theory break the record
         return {"note": f"not computed: {type(e).__name__}: {e}"}
 
@@ -142,11 +161,15 @@ def _theory_str(r: dict) -> str:
     seg = []
     if t.get("output_throughput_tps"):
         seg.append(f"out={t['output_throughput_tps']:g} tok/s")
+    if t.get("served_rate_rps"):
+        seg.append(f"rate={t['served_rate_rps']:g} req/s")
     if t.get("ttft_ms"):
         seg.append(f"TTFT={t['ttft_ms']:g}ms")
     if t.get("tpot_ms"):
         seg.append(f"TPOT={t['tpot_ms']:g}ms")
     line = f"\n      theory ({t.get('basis', 'roofline')}): " + ", ".join(seg)
+    if t.get("saturated"):
+        line += "  [SATURATED in theory]"
     eff = r.get("efficiency", {})
     effseg = []
     if "output_throughput" in eff:
@@ -169,9 +192,12 @@ def _fmt(r: dict) -> str:
     if r.get("tpot_ms"):
         metrics.append(f"TPOT={r['tpot_ms']:g}ms")
     metric_str = ", ".join(metrics) or "(no metrics)"
+    rate = r.get("request_rate")
+    rate_str = f"rate={rate} req/s, " if rate else ""
     head = (f"{r.get('model','?')} on {r.get('gpu','?')}"
-            f" | c={r.get('concurrency','?')} in={r.get('input_len','?')} "
-            f"out={r.get('output_len','?')} {_parallelism_str(r)}")
+            f" | {rate_str}c={r.get('concurrency','?')} (peak in-flight) "
+            f"in={r.get('input_len','?')} out={r.get('output_len','?')} "
+            f"{_parallelism_str(r)}")
     tail = f" | source={r.get('source','?')}"
     notes = f" — {r['notes']}" if r.get("notes") else ""
     ts = r.get("ts", "")
@@ -196,6 +222,9 @@ def _fmt(r: dict) -> str:
     total_throughput_tps="Measured total-token throughput (tokens/s); 0 if unknown.",
     ttft_ms="Measured time-to-first-token in ms; 0 if unknown.",
     tpot_ms="Measured time-per-output-token in ms; 0 if unknown.",
+    request_rate="Requested arrival rate in req/s (or 'inf' for closed-loop "
+                 "runs). Theory is only computed for finite positive rates "
+                 "since the simulator is Poisson-arrival-driven.",
     tensor_parallel="Tensor-parallel size (TP) of the deployment (default 1).",
     pipeline_parallel="Pipeline-parallel size (PP) of the deployment (default 1).",
     data_parallel="Data-parallel size (DP) of the deployment, e.g. replicas "
@@ -216,6 +245,7 @@ def record_measurement(
     total_throughput_tps: float = 0.0,
     ttft_ms: float = 0.0,
     tpot_ms: float = 0.0,
+    request_rate: str = "",
     tensor_parallel: int = 1,
     pipeline_parallel: int = 1,
     data_parallel: int = 1,
@@ -228,7 +258,8 @@ def record_measurement(
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": model,
         "gpu": gpu,
-        "concurrency": concurrency,
+        "request_rate": request_rate,
+        "concurrency": concurrency,   # observed peak in-flight at this rate
         "input_len": input_len,
         "output_len": output_len,
         "tensor_parallel": tensor_parallel,
@@ -245,7 +276,7 @@ def record_measurement(
     # Document the corresponding theoretical (roofline) numbers so each record
     # carries both measured and modeled, plus the efficiency factor between
     # them. Computed from the same PRESET model+GPU at this operating point.
-    theo = _theoretical(model, gpu, concurrency, input_len, output_len,
+    theo = _theoretical(model, gpu, request_rate, input_len, output_len,
                         tensor_parallel * pipeline_parallel * data_parallel)
     rec["theoretical"] = theo
     eff = _efficiency(rec, theo)
@@ -254,8 +285,9 @@ def record_measurement(
 
     with STORE_FILE.open("a") as f:
         f.write(json.dumps(rec) + "\n")
+    rate_bit = f"rate={request_rate} req/s, " if request_rate else ""
     status = (f"recorded measurement: {model} on {gpu} "
-              f"(c={concurrency}, in={input_len}, out={output_len}, "
+              f"({rate_bit}c={concurrency}, in={input_len}, out={output_len}, "
               f"{_parallelism_str(rec)})")
     if eff:
         bits = []

@@ -100,17 +100,17 @@ class OpBreakdown:
 
 
 @dataclass
-class Latency:
-    """Per-request latency, split by phase."""
-
-    waiting: OperationLatency = field(default_factory=OperationLatency)
-    prefill: OpBreakdown = field(default_factory=OpBreakdown)
-    decode: OpBreakdown = field(default_factory=OpBreakdown)
-
-
-@dataclass
 class Request:
-    """One in-flight request tracked by the serving simulator."""
+    """One in-flight request tracked by the serving simulator.
+
+    The four timestamps below are set by the scheduler and define every
+    derived per-request latency:
+
+    * ``ttft  = first_token_s - arrival_s``
+    * ``tpot  = (finish_s - first_token_s) / max(gen_tokens - 1, 1)``
+    * ``e2e   = finish_s - arrival_s``
+    * ``wait  = start_s - arrival_s``
+    """
 
     id: Any
     arrival_s: float
@@ -118,8 +118,9 @@ class Request:
     gen_tokens: int
     kv_tokens: int = 0           # KV cached before the current step
     tokens_this_step: int = 0    # how many tokens this request runs THIS step
-    finish_s: float = 0.0
-    latency: Latency = field(default_factory=Latency)
+    start_s: float = 0.0         # first scheduled into running queue
+    first_token_s: float = 0.0   # end of step where prefill completed
+    finish_s: float = 0.0        # end of step where last decode ran
 
 
 def total_tokens_in_batch(requests: list[Request]) -> int:
