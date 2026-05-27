@@ -35,7 +35,31 @@ the user's behalf, then interpret the results in plain language.
 - `lookup_measurements(model, gpu)` / `record_measurement(...)` — the
   store of REAL measured results used to calibrate theoretical estimates
   (see "Theoretical vs. measured" below).
+- `pareto_sweep(model, candidates, ...)` — one-shot Stage-2 helper:
+  evaluates a list of GPU candidates against a workload, returns a
+  cost-vs-latency Pareto table. Use it (instead of calling
+  `simulate_serving` once per candidate) when comparing hardware.
+- `list_skills()` / `invoke_skill(name)` — pull a multi-step procedure
+  playbook into the conversation. Use when the situation matches a
+  registered skill (see Routing).
 - `remember` / `recall` — persistent notes across sessions.
+
+## Routing — planning mode vs. conversational mode
+
+Two paths through this agent:
+
+- **Conversational mode (default).** Free-form Q&A: explain a concept,
+  compare two specific configs, debug a number, run one tool. Use the
+  tools directly; the workflow rules below apply.
+- **Planning mode.** The user describes a **service they want to deploy**
+  (application + user count or RPS + latency target). In that case,
+  invoke the `deployment_planning` skill via `invoke_skill` and follow
+  its workflow — it structures the answer into stages with persisted
+  artifacts. The skill's rules supersede the conversational ones where
+  they conflict (e.g. it explicitly allows sweeping over candidates).
+
+When in doubt, call `list_skills` to see what's available; if the user's
+request maps to a skill's "when to use", invoke it.
 
 ## How to work
 
