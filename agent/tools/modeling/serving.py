@@ -278,7 +278,8 @@ def _bottleneck_label(op: OperationLatency) -> str:
     return "BALANCED"
 
 
-def render_report(summary: RunSummary | None) -> str:
+def render_report(summary: RunSummary | None,
+                  cost_per_hour: float = 0.0) -> str:
     rb = ReportBuilder(width=76)
     rb.line().banner("SERVING SIMULATION REPORT").line()
 
@@ -295,6 +296,17 @@ def render_report(summary: RunSummary | None) -> str:
     rb.line(f"Average TPOT:             {summary.avg_decode_per_token_s * 1000:.3f} ms")
     rb.line(f"Output Token Throughput:  {summary.output_throughput_tps:.3f} token/s")
     rb.line(f"Total Token Throughput:   {summary.total_throughput_tps:.3f} token/s")
+
+    # Cost / 1M tokens — only when the GPU has a non-zero price.
+    if cost_per_hour > 0.0 and summary.output_throughput_tps > 0:
+        cost_per_s = cost_per_hour / 3600.0
+        cost_per_mtok_out = cost_per_s * 1e6 / summary.output_throughput_tps
+        cost_per_mtok_total = (cost_per_s * 1e6 / summary.total_throughput_tps
+                               if summary.total_throughput_tps > 0 else None)
+        rb.line(f"Cost / 1M output tokens:  ${cost_per_mtok_out:.3f}  "
+                f"(at ${cost_per_hour:.2f}/GPU-hour)")
+        if cost_per_mtok_total is not None:
+            rb.line(f"Cost / 1M total tokens:   ${cost_per_mtok_total:.3f}")
 
     pct = lambda v, t: (v / t * 100) if t > 0 else 0.0  # noqa: E731
 
@@ -331,6 +343,17 @@ def render_report(summary: RunSummary | None) -> str:
         rows=step_rows,
         col_widths=[14, 12, 8, 11, 10, 10],
     )
+
+    # Top bottleneck: the op consuming the largest share of step latency.
+    # Continuous batching mixes prefill+decode tokens within each forward
+    # pass, so the bottleneck is named per-OP, not per-phase.
+    top_name, top_op = max(summary.avg_op_per_step.iter_ops(),
+                           key=lambda no: no[1].roofline_s)
+    rb.line()
+    rb.line(f"Bottleneck: {top_name} — "
+            f"{pct(top_op.roofline_s, step_total.roofline_s):.1f}% of step "
+            f"({_bottleneck_label(top_op)}-bound, "
+            f"avg {summary.avg_batch_tokens:.1f} tokens/batch)")
 
     rb.rule("=")
     return rb.build()
@@ -376,7 +399,8 @@ def simulate_serving(
         n_requests=num_requests,
         max_batched_tokens=max_num_batched_tokens,
     )
-    return render_report(summarize_run(result))
+    return render_report(summarize_run(result),
+                         cost_per_hour=PRESET_GPUS[gpu].cost_per_hour)
 
 
 # ---------------------------------------------------------------------------
@@ -419,4 +443,5 @@ if __name__ == "__main__":
         jitter=args.random_range_ratio,
         microbench=microbench,
     )
-    print(render_report(summarize_run(result)))
+    print(render_report(summarize_run(result),
+                        cost_per_hour=PRESET_GPUS[args.gpu].cost_per_hour))

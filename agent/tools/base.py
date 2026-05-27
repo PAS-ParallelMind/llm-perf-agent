@@ -94,7 +94,10 @@ def _coerce_args(fn: Callable, args: dict) -> dict:
 
 def dispatch(name: str, arguments: str | dict) -> str:
     if name not in TOOLS:
-        return f"ERROR: unknown tool {name!r}"
+        # Surface the valid names so the model can self-correct without
+        # waiting for the user to remind it which tools actually exist.
+        return (f"ERROR: unknown tool {name!r}. "
+                f"Available tools: {', '.join(sorted(TOOLS))}")
     if isinstance(arguments, str):
         try:
             args = json.loads(arguments)
