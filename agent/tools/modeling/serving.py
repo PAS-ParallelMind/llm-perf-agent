@@ -40,8 +40,9 @@ from .report import ReportBuilder
 
 
 # Fraction of GPU memory reserved for activations / CUDA graphs / framework
-# overhead. Matches what vLLM's ``--gpu-memory-utilization 0.85`` defaults to.
-GPU_MEMORY_OVERHEAD = 0.15
+# overhead. Matches vLLM's default ``--gpu-memory-utilization 0.92``, i.e.
+# 8% of total HBM is held back from the KV cache budget.
+GPU_MEMORY_OVERHEAD = 0.08
 
 # Discard the first WARMUP_FRACTION of completed requests when computing
 # tail-latency percentiles — they finish before the system reaches steady
@@ -381,6 +382,7 @@ class RunSummary:
     # Workload
     requested_rate: float
     served_rate: float
+    output_token_throughput: float   # generated tokens per second (aggregate)
     n_finished: int
 
     # Latency percentiles (ms / s)
@@ -454,6 +456,10 @@ def summarize_run(result: SimulationResult) -> RunSummary | None:
     ]
 
     served_rate = (n / result.wall_time_s) if result.wall_time_s > 0 else 0.0
+    total_gen_tokens = sum(r.gen_tokens for r in result.finished)
+    output_token_throughput = (
+        total_gen_tokens / result.wall_time_s if result.wall_time_s > 0 else 0.0
+    )
     saturated, reason = _saturation_reason(result, served_rate)
 
     n_steps = max(result.n_forward_passes, 1)
@@ -461,6 +467,7 @@ def summarize_run(result: SimulationResult) -> RunSummary | None:
     return RunSummary(
         requested_rate=result.requested_rate,
         served_rate=served_rate,
+        output_token_throughput=output_token_throughput,
         n_finished=n,
         ttft_ms=Percentiles.of(ttfts_ms),
         tpot_ms=Percentiles.of(tpots_ms),
@@ -507,37 +514,40 @@ def render_report(summary: RunSummary | None) -> str:
         rb.line(f"⚠  SATURATED — {summary.saturation_reason}")
         rb.line()
 
+    KEY_WIDTH = 32
+
     rb.heading("Workload & Throughput")
-    rb.kv("Requested rate", f"{summary.requested_rate:.2f} req/s")
-    rb.kv("Served rate", f"{summary.served_rate:.2f} req/s")
-    rb.kv("Requests completed", f"{summary.n_finished:,}")
-    rb.kv("Wall clock", f"{summary.wall_time_s:.2f} s")
+    rb.kv("Incoming request rate",   f"{summary.requested_rate:.2f} req/s", KEY_WIDTH)
+    rb.kv("Completed request rate",  f"{summary.served_rate:.2f} req/s", KEY_WIDTH)
+    rb.kv("Output token throughput", f"{summary.output_token_throughput:.1f} tok/s", KEY_WIDTH)
+    rb.kv("Requests completed",      f"{summary.n_finished:,}", KEY_WIDTH)
+    rb.kv("Simulated duration",      f"{summary.wall_time_s:.2f} s", KEY_WIDTH)
     rb.line()
 
-    rb.heading("Latency (warmup excluded)")
-    rb.kv("TTFT", _fmt_pct(summary.ttft_ms))
-    rb.kv("  wait", _fmt_pct(summary.wait_ms))
-    rb.kv("TPOT", _fmt_pct(summary.tpot_ms))
-    rb.kv("E2E", _fmt_pct(summary.e2e_s, suffix="s "))
+    rb.heading("Per-Request Latency (warmup excluded)")
+    rb.kv("Time to First Token (TTFT)",   _fmt_pct(summary.ttft_ms), KEY_WIDTH)
+    rb.kv("  Queue wait time",            _fmt_pct(summary.wait_ms), KEY_WIDTH)
+    rb.kv("Time Per Output Token (TPOT)", _fmt_pct(summary.tpot_ms), KEY_WIDTH)
+    rb.kv("End-to-end latency (E2E)",     _fmt_pct(summary.e2e_s, suffix="s "), KEY_WIDTH)
     rb.line()
 
     rb.heading("System State")
-    rb.kv("Mean in-flight", f"{summary.mean_in_flight:.1f} requests")
-    rb.kv("Peak in-flight", f"{summary.peak_in_flight} requests")
-    rb.kv("KV cache budget", f"{summary.kv_budget_gib:.2f} GiB")
+    rb.kv("Avg concurrent requests",  f"{summary.mean_in_flight:.1f} requests", KEY_WIDTH)
+    rb.kv("Peak concurrent requests", f"{summary.peak_in_flight} requests", KEY_WIDTH)
+    rb.kv("KV cache budget",          f"{summary.kv_budget_gib:.2f} GiB", KEY_WIDTH)
     kv_pressure = (
         summary.peak_kv_use_gib / summary.kv_budget_gib * 100
         if summary.kv_budget_gib > 0 else 0.0
     )
-    rb.kv("KV cache peak use", f"{summary.peak_kv_use_gib:.2f} GiB ({kv_pressure:.1f}%)")
+    rb.kv("KV cache peak use",        f"{summary.peak_kv_use_gib:.2f} GiB ({kv_pressure:.1f}%)", KEY_WIDTH)
     if summary.admitted_kv_blocked > 0:
-        rb.kv("KV-blocked admits", f"{summary.admitted_kv_blocked} scheduler steps")
+        rb.kv("Admission stalls (KV full)", f"{summary.admitted_kv_blocked} scheduler steps", KEY_WIDTH)
 
     rb.section("PER-FORWARD-PASS BREAKDOWN")
     step_total = summary.avg_op_per_step.total()
-    rb.line(f"Forward passes simulated   : {summary.n_forward_passes:,} steps")
-    rb.line(f"Avg tokens / batch         : {summary.avg_batch_tokens:.1f} tokens")
-    rb.line(f"Avg latency / forward pass : {step_total.roofline_s * 1000:.3f} ms")
+    rb.line(f"Forward passes simulated     : {summary.n_forward_passes:,} steps")
+    rb.line(f"Avg batch size (tokens/pass) : {summary.avg_batch_tokens:.1f} tokens")
+    rb.line(f"Avg latency per forward pass : {step_total.roofline_s * 1000:.3f} ms")
     rb.line()
 
     pct = lambda v, t: (v / t * 100) if t > 0 else 0.0  # noqa: E731

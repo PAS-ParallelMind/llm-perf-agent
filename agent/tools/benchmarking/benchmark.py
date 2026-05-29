@@ -227,11 +227,9 @@ def _render_report(
 def _record_to_store(
     data: dict,
     *,
+    workload_file: str,
     model: str,
     gpu: str,
-    request_rate: str,
-    input_len: int,
-    output_len: int,
     tensor_parallel: int,
     pipeline_parallel: int,
     data_parallel: int,
@@ -247,14 +245,9 @@ def _record_to_store(
     # it's the cap itself.
     observed_peak = int(data.get("max_concurrent_requests") or 0)
     record_measurement(
-        model=model,
+        workload_file=workload_file,
         gpu=gpu or "unknown",
-        request_rate=str(request_rate),
         concurrency=observed_peak,
-        input_len=input_len,
-        output_len=output_len,
-        output_throughput_tps=data.get("output_throughput", 0.0),
-        total_throughput_tps=data.get("total_token_throughput", 0.0),
         ttft_ms=data.get("mean_ttft_ms", 0.0),
         tpot_ms=data.get("mean_tpot_ms", 0.0),
         tensor_parallel=tensor_parallel,
@@ -274,6 +267,7 @@ def _record_to_store(
 def run_benchmark(
     *,
     base_url: str,
+    workload_file: str,
     model: str,
     request_rate: str,
     input_len: int,
@@ -379,11 +373,9 @@ def run_benchmark(
     )
     recorded = _record_to_store(
         data,
+        workload_file=workload_file,
         model=model,
         gpu=gpu,
-        request_rate=request_rate,
-        input_len=input_len,
-        output_len=output_len,
         tensor_parallel=tensor_parallel,
         pipeline_parallel=pipeline_parallel,
         data_parallel=data_parallel,
@@ -459,6 +451,7 @@ def benchmark_serving(
 
     return run_benchmark(
         base_url=base_url,
+        workload_file=workload_file,
         model=model,
         request_rate=request_rate,
         input_len=input_len,
@@ -510,6 +503,7 @@ if __name__ == "__main__":
 
     print(run_benchmark(
         base_url=args.base_url,
+        workload_file=args.workload_file,
         model=wf["model"],
         request_rate=str(rr),
         input_len=wf["input_len"],

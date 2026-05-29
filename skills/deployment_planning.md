@@ -24,13 +24,13 @@ does NOT apply here.
 - **Stage 2** runs the workload through each hardware candidate. The
   simulator yields a **theoretical upper bound** per candidate. The
   workflow then forks into two paths:
-  - **Path A — fix the software** (vLLM, SGLang, etc. as-is). The agent
+  - **Baseline performance** (vLLM, SGLang, etc. as-is). The agent
     applies a historical efficiency factor to the theoretical numbers to
     project the **actual** performance of the baseline stack on each
     candidate, and the user picks hardware on those projected numbers.
     Stage 3 then reports the real measurement against the projection and
     the workflow ends.
-  - **Path B — optimize the software**. The user picks hardware on the
+  - **Potential performance (after optimization)**. The user picks hardware on the
     theoretical numbers, accepting the implementation gap as something
     they'll close. Stage 3 measures the baseline against theory and
     diagnoses *where* the gap is. Stage 4 (parked) would close it.
@@ -56,16 +56,18 @@ closing "let me know" line are required:
 >    concrete numbers (request rate, input/output length, latency target).
 > 2. **Hardware sweep** — simulate each candidate to get the theoretical
 >    upper bound, and also project the actual performance of a baseline
->    software stack (vLLM/SGLang) using historical measurements. Two
->    paths to pick from: **(A) fix the software** — pick hardware on the
->    projected-actual numbers; **(B) optimize the software** — pick
->    hardware on the theoretical numbers and treat the gap as something
->    to close. You decide.
-> 3. **Measure baseline performance** — Path A reports the real numbers
->    against the projection; Path B measures the baseline + diagnoses
->    where the implementation gap is.
-> 4. *(future work)* Optimisation suggestions for the bottleneck (Path B
->    only).
+>    implementation (vLLM/SGLang) using historical measurements. Two
+>    paths to pick from: **baseline performance** — pick hardware on the
+>    projected-actual numbers (what the baseline implementation will
+>    deliver today); **potential performance (after optimization)** —
+>    pick hardware on the theoretical numbers (what you could reach if
+>    you close the implementation gap). You decide.
+> 3. **Measure performance** — the baseline-performance path reports
+>    the real numbers against the projection; the potential-performance
+>    path measures the running implementation and diagnoses where the
+>    gap is.
+> 4. *(future work)* Optimisation suggestions for the bottleneck
+>    (potential-performance path only).
 >
 > Let me know if you'd rather just chat about specific numbers instead.
 
@@ -150,44 +152,57 @@ assumptions you made, and a one-line invitation to override.
 3. **Projected-actual sweep — Table B** (agent-driven):
    - For each candidate that fits and isn't saturated, call
      `lookup_measurements(model=<workload model>, gpu=<candidate>)`. Each
-     returned record carries an `efficiency` dict with keys
-     `output_throughput`, `total_throughput`, `tpot`, `ttft` — defined
-     as `measured / theory` for throughput and `theory / measured` for
-     latency, so values <1.0 always mean "measured is worse than
-     theory".
-   - **Pick a projection factor** by judgement: prefer the most recent
-     record at a similar operating point (close `request_rate`,
+     returned record carries an `efficiency` dict with keys `ttft` and
+     `tpot` — defined as `theory / measured`, so values <1.0 mean
+     "measured is worse than theory". (Throughput isn't recorded — at
+     sub-saturation it just mirrors offered load and isn't a capability
+     signal.)
+   - **Pick the projection factors** by judgement: prefer the most
+     recent record at a similar operating point (close `request_rate`,
      `input_len`, `output_len`). If multiple records exist, you can
      average, take the most recent, or weight by operating-point
      proximity — your call. State which record(s) you used.
-   - Apply to that candidate's Table-A row:
-     - `projected_output_throughput = theoretical × efficiency.output_throughput`
-     - For projected **request latency**: the store keeps per-token
-       efficiency, not end-to-end. Approximate with `efficiency.tpot`
-       for output-heavy workloads (large `output_len`), or
-       `efficiency.ttft` for prefill-heavy ones. Or rebuild from raw
-       fields: `measured_e2e ≈ ttft_ms/1000 + tpot_ms × output_len /
-       1000` and the same for theory, then use the ratio.
-     - Recompute `projected_$/Mtok` from projected throughput.
+   - Apply to that candidate's Table-A row to project request latency:
+     - `projected_ttft_ms = theoretical_ttft_ms / efficiency.ttft`
+     - `projected_tpot_ms = theoretical_tpot_ms / efficiency.tpot`
+     - `projected_request_latency_s = projected_ttft_ms/1000 +
+       projected_tpot_ms/1000 × output_len`
+     - For the `$/1M tok` column, use the theoretical output throughput
+       from Table A (at sub-saturation it equals offered load — there's
+       no separate throughput projection to compute).
    - If **no record exists** for (model, gpu), flag the candidate in
-     Table B with "—" and a note — do NOT fabricate an efficiency
-     factor or copy theoretical numbers across.
+     Table B with "—" and a note — do NOT fabricate efficiency factors
+     or copy theoretical numbers across.
    - Build Table B with the same columns as Table A and mark its own
      Pareto frontier on projected numbers.
 
 4. **Present both tables side by side** and name two recommendations:
-   - **Path A — fix the software**: cheapest candidate that meets
+   - **Baseline performance**: cheapest candidate that meets
      `target_request_latency_s` on **projected actual** numbers.
-   - **Path B — optimize the software**: cheapest candidate that meets
+   - **Potential performance (after optimization)**: cheapest candidate that meets
      the target on **theoretical** numbers.
    - If a candidate appears in only one table (no historical data for
      Table B), say so plainly. If neither table has a candidate meeting
      the target, recommend the closest miss in each.
 
 5. **Ask the user which path** they want to take. Do NOT pre-decide —
-   the choice depends on whether they want to ship on a known stack
-   (A) or invest in software optimisation (B). Once they pick, restate
-   the chosen plan.
+   the choice depends on whether they want to size against
+   **baseline-performance** numbers (what the baseline implementation
+   will deliver today) or against **potential-performance** numbers
+   (what they could reach by optimising the implementation). Once they
+   pick, restate the chosen plan.
+
+   **If the user picks the baseline-performance path on a candidate
+   with no historical record**: you cannot compute a real projection —
+   there's no efficiency factor to apply. Do NOT copy the theoretical
+   numbers into the projection block and pretend it's a projection (the
+   resulting "delta" in Stage 3 will be meaningless). Instead, tell the
+   user plainly: *"I don't have a historical measurement for this
+   (model, gpu) pair, so I can't project the baseline implementation's
+   actual performance. Two options: (a) switch to the
+   potential-performance path and we measure + diagnose against theory;
+   (b) proceed to Stage 3 to capture the first measurement for this
+   pair — future runs will use it for projections."* Let the user pick.
 
 6. **Single-GPU only** for now — the modeling tools don't model TP/PP/DP
    scaling. Output `n_gpus: 1` and a parallelism stub.
@@ -197,27 +212,28 @@ assumptions you made, and a one-line invitation to override.
 
 ```yaml
 candidate_set: [<gpu keys>]
-chosen_path: A | B                   # A = fix software / project & verify
-                                     # B = optimize software / diagnose gap
+chosen_path: baseline | optimized    # baseline = size on projected-actual / measure & compare
+                                     # optimized = size on theoretical / diagnose gap
 recommended:
   gpu: <key>
   n_gpus: 1
   parallelism: {tp: 1, pp: 1, dp: 1}
   rationale: "<why this point under the chosen path>"
 meets_target: <true|false>
-projection:                          # Path A only — null for Path B
-  factor_throughput: <float>         # what you applied to project actual
-  factor_latency: <float>
+projection:                          # baseline only — null for optimized
+  factor_ttft: <float>               # efficiency.ttft from source record (<1 = slower than theory)
+  factor_tpot: <float>               # efficiency.tpot from source record
   source_record: "<measurement id / timestamp>"
-  projected_throughput_tps: <float>
-  projected_latency_s: <float>
+  projected_ttft_ms: <float>
+  projected_tpot_ms: <float>
+  projected_request_latency_s: <float>
 ```
 
 **Reply to the user**: the two tables (or compact summaries), the two
 recommendations, the path question. After they answer, confirm the
 chosen plan and tell them "next: Stage 3 measures the baseline."
 
-## Stage 3 — Measure baseline performance
+## Stage 3 — Measure performance
 
 **Input**: WorkloadProfile + DeploymentPlan (with `chosen_path`).
 
@@ -225,7 +241,7 @@ The goal: measure the **actual** performance of the deployed system.
 What we do with that measurement depends on the path the user picked in
 Stage 2. Branch accordingly.
 
-### Path A — fix the software
+### Baseline performance
 
 **Goal**: report the real performance against the Stage-2 projection.
 No verdict — present numbers and the delta; the user decides whether
@@ -239,44 +255,55 @@ the delta is acceptable.
    measure it."*
    - **If no** → tell them they need a deployed server to compare
      against the projection, and to come back when one exists. Don't
-     fall back to anything — Path A's whole point is the projection vs.
-     measurement comparison.
+     fall back to anything — the baseline-performance path's whole
+     point is the projection vs. measurement comparison.
 
 2. **Measure**: call `benchmark_serving(base_url=...,
    workload_file="stages/01_workload.yaml", gpu=<recommended preset>,
    tensor_parallel=1)`. Override `model` if the server serves under a
    different id than the workload's `model`.
 
-3. **Compare**: present measured throughput / latency next to the
-   `projection` block from `stages/02_plan.yaml`. Show the delta as
-   percentages. Report numbers; do **not** say "pass" / "fail" — the
-   user decides what's acceptable.
+3. **Compare**: present measured request latency (with its TTFT /
+   TPOT breakdown) next to the `projection` block from
+   `stages/02_plan.yaml`. Show the delta as percentages. Report
+   numbers; do **not** say "pass" / "fail" — the user decides what's
+   acceptable.
+
+   Throughput isn't compared here — at sub-saturation it just mirrors
+   `request_rate × output_len` on both sides, so the delta is
+   uninformative. Latency (and its TTFT / TPOT decomposition) is the
+   meaningful signal.
 
 **Output artifact** → write to `stages/03_report.yaml`:
 
 ```yaml
-path: A
+path: baseline
 projected:
-  output_throughput_tps: <float>
   request_latency_s: <float>
+  ttft_ms: <float>
+  tpot_ms: <float>
 measured:
-  output_throughput_tps: <float>
   request_latency_s: <float>
+  ttft_ms: <float>
+  tpot_ms: <float>
 delta:                               # measured / projected
-  throughput: <float>
-  latency: <float>
+  request_latency: <float>
+  ttft: <float>
+  tpot: <float>
 source_record: "<measurement id used for projection>"
 ```
 
-**Reply to the user**: measured vs projected (numbers + delta %), the
-source record used for the projection, and one line on whether the
-delta is large enough that they may want to revisit Stage 2 with a
-different candidate. End the workflow here.
+**Reply to the user**: measured vs projected (latency numbers + delta
+%, with TTFT / TPOT breakdown), the source record used for the
+projection, and one line on whether the delta is large enough that
+they may want to revisit Stage 2 with a different candidate. End the
+workflow here.
 
-### Path B — optimize the software
+### Potential performance (after optimization)
 
-**Goal**: measure baseline performance, compare to theoretical, and
-identify the per-op bottleneck — sets up Stage 4 (parked).
+**Goal**: measure the running implementation's actual performance,
+compare to the theoretical upper bound, and identify the per-op
+bottleneck — sets up Stage 4 (parked).
 
 The measured numbers come from `benchmark_serving` against the running
 server. The theoretical numbers come from `simulate_serving` and serve
@@ -287,7 +314,7 @@ per-op detail).
 
 **Process**:
 
-1. **Ask about a running server.** Same as Path A.
+1. **Ask about a running server.** Same as the baseline-performance path.
    - **If yes** → run the measurement path (steps 2–5).
    - **If no** → theoretical-only fallback at the end. Tell the user
      that's a roofline reference, not actual performance, and that they
@@ -332,7 +359,7 @@ per-op detail).
 **Output artifact** → write to `stages/03_report.yaml`:
 
 ```yaml
-path: B
+path: optimized
 theoretical:
   output_throughput_tps: <float>
   request_latency_s: <float>
@@ -362,7 +389,8 @@ happen.
 
 ## Stage 4 — Performance optimization (FUTURE WORK)
 
-This stage is **parked** and only relevant on **Path B**. The intended
+This stage is **parked** and only relevant on the
+**potential-performance** path. The intended
 scope: given the Stage 3 bottleneck and gap, suggest software-level
 optimisations (kernel selection / fused kernels, scheduler tweaks,
 prefix caching, speculative decoding, MoE expert-parallel layout,

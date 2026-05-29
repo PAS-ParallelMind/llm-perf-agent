@@ -54,27 +54,36 @@ def _load_all() -> list[dict]:
     return out
 
 
-def _theoretical(
-    model: str,
-    gpu: str,
-    request_rate: str,
-    input_len: int,
-    output_len: int,
-    n_gpus: int,
-) -> dict:
-    """Theoretical (roofline) numbers at this operating point, via the serving
-    simulator. Returns metric fields on success, or ``{"note": why}`` when it
-    can't / shouldn't be computed. Never raises — recording must not depend on
-    the model being computable.
+def _load_workload(workload_file: str) -> dict | None:
+    """Parse a WorkloadProfile YAML inside the workspace. Returns the dict
+    or None on failure (so callers can error gracefully without raising)."""
+    try:
+        from ...workspace import resolve
+        import yaml
+        return yaml.safe_load(resolve(workload_file).read_text()) or {}
+    except Exception:
+        return None
 
-    ``model`` / ``gpu`` must be exact PRESET keys (the modeling tools key on
-    those); pass the same preset names you give the modeling tools. The
-    simulator is request-rate-driven (Poisson arrivals); ``request_rate`` must
-    parse to a finite positive float."""
+
+def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
+    """Theoretical (roofline) numbers via the serving simulator, run at the
+    *same* workload the benchmark consumed (the parsed WorkloadProfile dict).
+    Returns metric fields on success or ``{"note": why}`` when it can't /
+    shouldn't be computed. Never raises — recording must not depend on the
+    model being computable.
+
+    Because the simulator and the benchmark share the same workload knobs
+    (model/rate/in/out/num_requests/range_ratio), theory and measurement are
+    apples-to-apples by construction. Under saturation this matters: mean
+    TTFT/TPOT grow with run length until the queue reaches steady state, so a
+    short theoretical run would understate the roofline."""
     # Lazy imports: keep the modeling stack (numpy) off the import path until a
     # record actually needs it.
     from ..modeling.configs.model_specs import PRESET_MODELS
     from ..modeling.configs.hw_specs import PRESET_GPUS
+
+    model = wf.get("model", "")
+    request_rate_raw = wf.get("request_rate", 0)
 
     if model not in PRESET_MODELS or gpu not in PRESET_GPUS:
         missing = "model" if model not in PRESET_MODELS else "gpu"
@@ -86,23 +95,26 @@ def _theoretical(
                         "TP/PP/DP scaling, so a single-GPU roofline wouldn't "
                         "correspond"}
     try:
-        rate_f = float(request_rate)
+        rate_f = float(request_rate_raw)
     except (TypeError, ValueError):
         rate_f = 0.0
     if not (rate_f > 0 and rate_f != float("inf")):
-        return {"note": f"not computed: request_rate={request_rate!r} is not "
-                        "a finite positive number (the simulator is Poisson-"
-                        "arrival-driven; closed-loop runs aren't directly "
-                        "comparable to its open-loop baseline)"}
+        return {"note": f"not computed: request_rate={request_rate_raw!r} is "
+                        "not a finite positive number (the simulator is "
+                        "Poisson-arrival-driven; closed-loop runs aren't "
+                        "directly comparable to its open-loop baseline)"}
     try:
         from ..modeling.serving import run_simulation, summarize_run
-        # ~10 s of simulated traffic — enough for stable percentiles at any
-        # rate, bounded so cheap rates don't blow up the run.
-        n_req = max(int(rate_f * 10), 32)
+        # Use the workload's own num_requests; floor at 200 for stable
+        # saturated-regime percentiles when the workload didn't set one.
+        n_req = int(wf.get("num_requests", 0)) or max(int(rate_f * 10), 200)
         result = run_simulation(
             model_name=model, gpu_name=gpu, request_rate=rate_f,
-            input_len=input_len, output_len=output_len,
-            n_requests=n_req, max_batched_tokens=8192, jitter=0.0,
+            input_len=int(wf.get("input_len", 0)),
+            output_len=int(wf.get("output_len", 0)),
+            n_requests=n_req,
+            max_batched_tokens=int(wf.get("max_num_batched_tokens", 0)) or 8192,
+            jitter=float(wf.get("range_ratio", 0.0)),
         )
         s = summarize_run(result)
         if s is None:
@@ -110,8 +122,6 @@ def _theoretical(
         out = {
             "basis": "single-GPU roofline (simulate_serving, Poisson arrivals)",
             "served_rate_rps": round(s.served_rate, 3),
-            "output_throughput_tps": round(s.served_rate * output_len, 3),
-            "total_throughput_tps": round(s.served_rate * (input_len + output_len), 3),
             "ttft_ms": round(s.ttft_ms.mean, 3),
             "tpot_ms": round(s.tpot_ms.mean, 3),
             "mean_in_flight": round(s.mean_in_flight, 2),
@@ -126,12 +136,10 @@ def _theoretical(
 
 def _efficiency(rec: dict, theo: dict) -> dict:
     """Fraction of theoretical ideal achieved (1.0 = matches theory, <1 = worse).
-    Throughput: measured/theory. Latency: theory/measured (theory is the floor)."""
+    Stored for TTFT and TPOT only (theory/measured — theory is the floor).
+    Throughput isn't stored: at sub-saturation it just mirrors the offered
+    load, so the ratio isn't a capability signal."""
     eff: dict = {}
-    for key in ("output_throughput_tps", "total_throughput_tps"):
-        m, t = rec.get(key), theo.get(key)
-        if m and t:
-            eff[key.replace("_tps", "")] = round(m / t, 3)
     for key in ("ttft_ms", "tpot_ms"):
         m, t = rec.get(key), theo.get(key)
         if m and t:
@@ -156,11 +164,9 @@ def _theory_str(r: dict) -> str:
     t = r.get("theoretical")
     if not t:
         return ""
-    if "output_throughput_tps" not in t:  # only a 'note' (not computed)
+    if "ttft_ms" not in t and "tpot_ms" not in t:  # only a 'note' (not computed)
         return f"\n      theory: {t.get('note', 'n/a')}"
     seg = []
-    if t.get("output_throughput_tps"):
-        seg.append(f"out={t['output_throughput_tps']:g} tok/s")
     if t.get("served_rate_rps"):
         seg.append(f"rate={t['served_rate_rps']:g} req/s")
     if t.get("ttft_ms"):
@@ -172,8 +178,8 @@ def _theory_str(r: dict) -> str:
         line += "  [SATURATED in theory]"
     eff = r.get("efficiency", {})
     effseg = []
-    if "output_throughput" in eff:
-        effseg.append(f"output tput {eff['output_throughput']:.0%}")
+    if "ttft" in eff:
+        effseg.append(f"TTFT {eff['ttft']:.0%}")
     if "tpot" in eff:
         effseg.append(f"TPOT {eff['tpot']:.0%}")
     if effseg:
@@ -183,10 +189,6 @@ def _theory_str(r: dict) -> str:
 
 def _fmt(r: dict) -> str:
     metrics = []
-    if r.get("output_throughput_tps"):
-        metrics.append(f"out={r['output_throughput_tps']:g} tok/s")
-    if r.get("total_throughput_tps"):
-        metrics.append(f"total={r['total_throughput_tps']:g} tok/s")
     if r.get("ttft_ms"):
         metrics.append(f"TTFT={r['ttft_ms']:g}ms")
     if r.get("tpot_ms"):
@@ -205,26 +207,24 @@ def _fmt(r: dict) -> str:
 
 
 @tool(
-    "Record a REAL, measured benchmark result for a model+GPU+workload so "
-    "future estimates can be calibrated against it. Theoretical models are "
-    "first-order and can be off due to kernel/framework maturity — call "
-    "this whenever you learn real measured numbers (`benchmark_serving` calls "
-    "it automatically; otherwise user-reported). It also stores the "
-    "corresponding theoretical roofline + efficiency factor automatically, so "
-    "USE EXACT PRESET_MODELS / PRESET_GPUS names — that's what lets it compute "
-    "the matching theory (and what lets later lookups match).",
-    model="Model name (prefer a PRESET_MODELS key).",
+    "Record a REAL, measured benchmark result for a workload+GPU so future "
+    "estimates can be calibrated against it. Theoretical models are "
+    "first-order and can be off due to kernel/framework maturity — call this "
+    "whenever you learn real measured numbers (`benchmark_serving` calls it "
+    "automatically; otherwise user-reported). Pass the SAME `workload_file` "
+    "the benchmark consumed — the workload context (model, request_rate, "
+    "input_len, output_len, num_requests, range_ratio, …) is read from there "
+    "and the matching theoretical roofline is computed via the simulator on "
+    "the same workload, so theory and measurement are by-construction "
+    "apples-to-apples. Stored metrics are TTFT and TPOT — the primitive "
+    "serving-performance numbers; throughput isn't stored because at "
+    "sub-saturation it just mirrors `request_rate × output_len`.",
+    workload_file="Workspace-relative path to the WorkloadProfile YAML the "
+                  "benchmark ran (e.g. 'stages/01_workload.yaml').",
     gpu="GPU name (prefer a PRESET_GPUS key).",
-    concurrency="In-flight request concurrency during the measurement.",
-    input_len="Input tokens per request.",
-    output_len="Output tokens per request (incl. reasoning tokens, if any).",
-    output_throughput_tps="Measured output-token throughput (tokens/s); 0 if unknown.",
-    total_throughput_tps="Measured total-token throughput (tokens/s); 0 if unknown.",
+    concurrency="Observed peak in-flight requests during the measurement.",
     ttft_ms="Measured time-to-first-token in ms; 0 if unknown.",
     tpot_ms="Measured time-per-output-token in ms; 0 if unknown.",
-    request_rate="Requested arrival rate in req/s (or 'inf' for closed-loop "
-                 "runs). Theory is only computed for finite positive rates "
-                 "since the simulator is Poisson-arrival-driven.",
     tensor_parallel="Tensor-parallel size (TP) of the deployment (default 1).",
     pipeline_parallel="Pipeline-parallel size (PP) of the deployment (default 1).",
     data_parallel="Data-parallel size (DP) of the deployment, e.g. replicas "
@@ -236,16 +236,11 @@ def _fmt(r: dict) -> str:
           "from theory (e.g. 'immature B200 kernels, ~0.7x of H100').",
 )
 def record_measurement(
-    model: str,
+    workload_file: str,
     gpu: str,
     concurrency: int,
-    input_len: int,
-    output_len: int,
-    output_throughput_tps: float = 0.0,
-    total_throughput_tps: float = 0.0,
     ttft_ms: float = 0.0,
     tpot_ms: float = 0.0,
-    request_rate: str = "",
     tensor_parallel: int = 1,
     pipeline_parallel: int = 1,
     data_parallel: int = 1,
@@ -253,31 +248,36 @@ def record_measurement(
     source: str = "user-reported",
     notes: str = "",
 ) -> str:
+    wf = _load_workload(workload_file)
+    if wf is None:
+        return (f"ERROR: could not load workload_file {workload_file!r} "
+                f"(must be a workspace-relative path to a WorkloadProfile YAML)")
+
     _ensure()
+    n_gpus = tensor_parallel * pipeline_parallel * data_parallel
+    request_rate = str(wf.get("request_rate", ""))
     rec = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "model": model,
+        "workload_file": workload_file,
+        "model": wf.get("model", ""),
         "gpu": gpu,
         "request_rate": request_rate,
         "concurrency": concurrency,   # observed peak in-flight at this rate
-        "input_len": input_len,
-        "output_len": output_len,
+        "input_len": wf.get("input_len"),
+        "output_len": wf.get("output_len"),
+        "num_requests": wf.get("num_requests"),
         "tensor_parallel": tensor_parallel,
         "pipeline_parallel": pipeline_parallel,
         "data_parallel": data_parallel,
         "expert_parallel": expert_parallel,
-        "output_throughput_tps": output_throughput_tps,
-        "total_throughput_tps": total_throughput_tps,
         "ttft_ms": ttft_ms,
         "tpot_ms": tpot_ms,
         "source": source,
         "notes": notes,
     }
-    # Document the corresponding theoretical (roofline) numbers so each record
-    # carries both measured and modeled, plus the efficiency factor between
-    # them. Computed from the same PRESET model+GPU at this operating point.
-    theo = _theoretical(model, gpu, request_rate, input_len, output_len,
-                        tensor_parallel * pipeline_parallel * data_parallel)
+    # Run the simulator at the same workload as the benchmark — apples-to-apples
+    # by construction. Stores measured + theoretical + efficiency in one record.
+    theo = _theoretical(wf, gpu, n_gpus)
     rec["theoretical"] = theo
     eff = _efficiency(rec, theo)
     if eff:
@@ -286,15 +286,15 @@ def record_measurement(
     with STORE_FILE.open("a") as f:
         f.write(json.dumps(rec) + "\n")
     rate_bit = f"rate={request_rate} req/s, " if request_rate else ""
-    status = (f"recorded measurement: {model} on {gpu} "
-              f"({rate_bit}c={concurrency}, in={input_len}, out={output_len}, "
-              f"{_parallelism_str(rec)})")
+    status = (f"recorded measurement: {rec['model']} on {gpu} "
+              f"({rate_bit}c={concurrency}, in={rec['input_len']}, "
+              f"out={rec['output_len']}, {_parallelism_str(rec)})")
     if eff:
         bits = []
+        if "ttft" in eff:
+            bits.append(f"TTFT {eff['ttft']:.0%}")
         if "tpot" in eff:
             bits.append(f"TPOT {eff['tpot']:.0%} of roofline")
-        if "output_throughput" in eff:
-            bits.append(f"output tput {eff['output_throughput']:.0%}")
         if bits:
             status += " | efficiency vs theory: " + ", ".join(bits)
     elif theo.get("note"):

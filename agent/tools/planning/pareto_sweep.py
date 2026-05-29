@@ -1,13 +1,19 @@
 """Hardware Pareto sweep — Stage 2 of the deployment-planning workflow.
 
-For each candidate GPU, check single-GPU fit, run the serving simulator,
-optionally calibrate against any recorded measurement, compute
-$/Mtoken, and identify which candidates sit on the cost-vs-latency
-Pareto frontier (i.e. no other candidate is both cheaper AND faster).
+For each candidate GPU: check the model weights fit on a single GPU,
+run the serving simulator (which derives the KV-cache budget from the
+remaining VRAM and admits requests against it), compute $/Mtoken, and
+identify which candidates sit on the cost-vs-latency Pareto frontier
+(no other candidate is both cheaper AND faster).
+
+Concurrency is a *result* of the simulator's admission control at the
+given ``request_rate``, not an input — so we don't pre-reject candidates
+on a static worst-case KV calculation. If a candidate's KV budget is
+too small to sustain the rate, the simulator saturates KV-bound and we
+flag that in the table.
 
 Assumes **single-GPU** deployment — the modeling tools don't model
-TP/PP/DP scaling. Candidates whose memory footprint exceeds a single GPU
-are flagged "doesn't fit" and excluded from the frontier.
+TP/PP/DP scaling.
 """
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ from dataclasses import dataclass
 from ..base import tool
 from ..modeling.configs.hw_specs import PRESET_GPUS
 from ..modeling.configs.model_specs import PRESET_MODELS
-from ..modeling.memory import kv_cache_vram_gib, weights_vram_gib
+from ..modeling.memory import weights_vram_gib
 from ..modeling.report import ReportBuilder
 from ..modeling.serving import run_simulation, summarize_run
 
@@ -27,20 +33,34 @@ _VRAM_HEADROOM = 0.90   # leave 10% of HBM for activations / framework overhead
 @dataclass
 class _CandidateRow:
     gpu: str
-    fits: bool
-    vram_used_gib: float
+    fits_weights: bool             # model weights load on a single GPU
+    weights_gib: float
     vram_cap_gib: float
+    # Simulator-derived KV stats (None if the simulator never ran).
+    kv_budget_gib: float | None
+    peak_kv_use_gib: float | None
+    kv_bound: bool                 # simulator saturated for KV reasons
     request_latency_s: float | None
+    ttft_ms: float | None
+    tpot_ms: float | None
+    # output_throughput_tps is kept for the $/Mtok computation but not
+    # surfaced in the table (at sub-saturation it just mirrors offered load).
     output_throughput_tps: float | None
     cost_per_hour: float
-    cost_per_mtok: float | None   # USD per 1M output tokens
+    cost_per_mtok: float | None    # USD per 1M output tokens
     meets_target: bool | None
     saturated: bool = False        # diverging latency; excluded from frontier
     note: str = ""
 
     @property
     def is_evaluated(self) -> bool:
-        return self.fits and self.request_latency_s is not None
+        return self.fits_weights and self.request_latency_s is not None
+
+    @property
+    def kv_peak_pct(self) -> float | None:
+        if self.kv_budget_gib and self.peak_kv_use_gib is not None and self.kv_budget_gib > 0:
+            return self.peak_kv_use_gib / self.kv_budget_gib * 100
+        return None
 
 
 def _evaluate(
@@ -58,25 +78,23 @@ def _evaluate(
     gpu = PRESET_GPUS[gpu_key]
     model_spec = PRESET_MODELS[model]
 
-    # Worst-case fit check: assume all `max_concurrent_requests` requests
-    # are simultaneously holding their full KV. Actual peak in-flight may
-    # be lower (the simulator admits subject to its own KV budget), but
-    # if even the worst case doesn't fit, the deployment is too tight.
+    # Weights-only fit gate: the model has to load before anything else
+    # matters. KV admission is the simulator's job — it derives the KV
+    # budget from VRAM minus weights minus framework overhead, and admits
+    # requests subject to that budget.
     weights_g = weights_vram_gib(model_spec)
-    kv_g = kv_cache_vram_gib(model_spec, max_concurrent_requests,
-                              input_len + output_len)
-    vram_used = weights_g + kv_g
     vram_cap = gpu.mem_capacity / (1024 ** 3) * _VRAM_HEADROOM
 
-    if vram_used > vram_cap:
+    if weights_g > vram_cap:
         return _CandidateRow(
-            gpu=gpu_key, fits=False,
-            vram_used_gib=vram_used, vram_cap_gib=vram_cap,
-            request_latency_s=None, output_throughput_tps=None,
+            gpu=gpu_key, fits_weights=False,
+            weights_gib=weights_g, vram_cap_gib=vram_cap,
+            kv_budget_gib=None, peak_kv_use_gib=None, kv_bound=False,
+            request_latency_s=None, ttft_ms=None, tpot_ms=None,
+            output_throughput_tps=None,
             cost_per_hour=gpu.cost_per_hour, cost_per_mtok=None,
             meets_target=None,
-            note=f"doesn't fit (worst case @ max_concurrent={max_concurrent_requests}): "
-                 f"{vram_used:.1f} > {vram_cap:.1f} GiB usable",
+            note=f"weights don't fit: {weights_g:.1f} > {vram_cap:.1f} GiB usable",
         )
 
     result = run_simulation(
@@ -91,15 +109,20 @@ def _evaluate(
     s = summarize_run(result)
     if s is None or s.served_rate <= 0:
         return _CandidateRow(
-            gpu=gpu_key, fits=True,
-            vram_used_gib=vram_used, vram_cap_gib=vram_cap,
-            request_latency_s=None, output_throughput_tps=None,
+            gpu=gpu_key, fits_weights=True,
+            weights_gib=weights_g, vram_cap_gib=vram_cap,
+            kv_budget_gib=None, peak_kv_use_gib=None, kv_bound=False,
+            request_latency_s=None, ttft_ms=None, tpot_ms=None,
+            output_throughput_tps=None,
             cost_per_hour=gpu.cost_per_hour, cost_per_mtok=None,
             meets_target=None,
             note="simulation produced no usable result",
         )
 
-    # served_rate is requests/s; multiply by output_len for output tokens/s.
+    # KV-bound saturation = the rate exhausted the KV budget. Treat this
+    # as "doesn't fit at this rate" in the report — the candidate can't
+    # admit enough concurrent requests to sustain the offered load.
+    kv_bound = s.saturated and "KV-cache" in s.saturation_reason
     output_throughput_tps = s.served_rate * output_len
     request_latency_s = s.e2e_s.mean
     cost_per_mtok = (
@@ -109,9 +132,14 @@ def _evaluate(
     meets = (request_latency_s <= target_latency) if target_latency is not None else None
     note = f"saturated: {s.saturation_reason}" if s.saturated else ""
     return _CandidateRow(
-        gpu=gpu_key, fits=True,
-        vram_used_gib=vram_used, vram_cap_gib=vram_cap,
+        gpu=gpu_key, fits_weights=True,
+        weights_gib=weights_g, vram_cap_gib=vram_cap,
+        kv_budget_gib=s.kv_budget_gib,
+        peak_kv_use_gib=s.peak_kv_use_gib,
+        kv_bound=kv_bound,
         request_latency_s=request_latency_s,
+        ttft_ms=s.ttft_ms.mean,
+        tpot_ms=s.tpot_ms.mean,
         output_throughput_tps=output_throughput_tps,
         cost_per_hour=gpu.cost_per_hour,
         cost_per_mtok=cost_per_mtok,
@@ -154,42 +182,49 @@ def _format_table(
     on_pareto: set[str],
     target_latency: float | None,
 ) -> str:
-    rb = ReportBuilder(width=92)
+    rb = ReportBuilder(width=110)
     rb.banner("HARDWARE PARETO SWEEP")
     rb.line()
-    headers = ["gpu", "fits?", "req lat (s)", "out tok/s", "$/1M tok",
-               "meets target", "pareto"]
+    headers = ["gpu", "fits?", "KV peak", "req lat (s)", "ttft (ms)",
+               "tpot (ms)", "$/1M tok", "meets target", "pareto"]
     table_rows = []
     for r in rows:
-        if not r.fits:
-            table_rows.append([r.gpu, "no", "—", "—", "—", "—", "—"])
+        if not r.fits_weights:
+            table_rows.append([r.gpu, "no", "—", "—", "—", "—", "—", "—", "—"])
             continue
         if not r.is_evaluated:
-            table_rows.append([r.gpu, "yes", "—", "—", "—", "—", "—"])
+            table_rows.append([r.gpu, "yes", "—", "—", "—", "—", "—", "—", "—"])
             continue
+        fits_str = "KV-bound" if r.kv_bound else "yes"
+        kv_str = f"{r.kv_peak_pct:.0f}%" if r.kv_peak_pct is not None else "—"
         meets = "—" if r.meets_target is None else ("✓" if r.meets_target else "✗")
         cost_str = f"${r.cost_per_mtok:.3f}" if r.cost_per_mtok is not None else "—"
         pareto = "★" if r.gpu in on_pareto else " "
+        ttft_str = f"{r.ttft_ms:.0f}" if r.ttft_ms is not None else "—"
+        tpot_str = f"{r.tpot_ms:.2f}" if r.tpot_ms is not None else "—"
         table_rows.append([
-            r.gpu, "yes",
+            r.gpu, fits_str, kv_str,
             f"{r.request_latency_s:.3f}",
-            f"{r.output_throughput_tps:.0f}",
+            ttft_str, tpot_str,
             cost_str,
             meets,
             pareto,
         ])
     rb.table(
         headers=headers, rows=table_rows,
-        col_widths=[12, 6, 12, 11, 10, 13, 7],
+        col_widths=[12, 9, 8, 12, 10, 10, 10, 13, 7],
     )
     rb.line()
-    # surface "doesn't fit" reasons explicitly
     for r in rows:
         if r.note:
             rb.line(f"  {r.gpu}: {r.note}")
     if target_latency is not None:
         rb.line(f"target_request_latency_s = {target_latency} "
                 f"(✓ = meets, ✗ = misses)")
+    rb.line("'KV peak' = peak KV-cache used as a % of the candidate's KV "
+            "budget (VRAM after weights + framework overhead). 'KV-bound' "
+            "in `fits?` means the rate exhausted the budget — concurrency "
+            "couldn't grow enough to sustain the offered load.")
     rb.line("★ = on the cost-vs-latency Pareto frontier "
             "(no other candidate is both cheaper AND faster).")
     rb.line("Costs are owned-hardware TCO (MSRP amortised + electricity) — "
@@ -201,12 +236,13 @@ def _format_table(
 @tool(
     "Stage 2 of the deployment-planning workflow: evaluate a list of "
     "single-GPU hardware candidates against a workload and return a "
-    "cost-vs-latency Pareto table. For each candidate it checks single-"
-    "GPU memory fit (worst-case at `max_concurrent_requests`), runs the "
-    "serving simulator under Poisson arrivals, and computes $/1M output "
-    "tokens. Candidates that don't fit or that saturate at this rate are "
-    "excluded from the frontier. All workload knobs come from the YAML; "
-    "you only pass the candidate hardware list.",
+    "cost-vs-latency Pareto table. For each candidate it checks that the "
+    "model weights fit on a single GPU, runs the serving simulator (the "
+    "simulator derives the KV-cache budget from VRAM minus weights minus "
+    "framework overhead and admits requests against it), and computes $/1M "
+    "output tokens. Candidates whose KV budget is too small to sustain the "
+    "rate saturate KV-bound and are flagged accordingly. All workload knobs "
+    "come from the YAML; you only pass the candidate hardware list.",
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain `model`, "
                   "`request_rate`, `input_len`, `output_len`, `num_requests`, "

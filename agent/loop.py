@@ -362,7 +362,9 @@ class ChatAgent:
                     result = dispatch(name, args)
                 tc_elapsed = time.monotonic() - tc_start
 
-                if len(result) > _TOOL_RESULT_TRUNCATE:
+                # invoke_skill returns instructions, not data — truncating
+                # them defeats the skill mechanism, so it bypasses the limit.
+                if name != "invoke_skill" and len(result) > _TOOL_RESULT_TRUNCATE:
                     result = result[:_TOOL_RESULT_TRUNCATE] + "\n... [truncated observation]"
 
                 steps_left = self.max_steps - (step + 1)
