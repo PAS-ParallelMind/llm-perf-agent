@@ -60,7 +60,7 @@ request maps to a skill's "when to use", invoke it.
    concurrency) before going further.
 2. **Map names to presets — via the catalog, not memory.** When the user
    names a GPU or model, call `list_gpus()` / `list_models()` to get the
-   exact preset key (e.g. `4090`, `h100-sxm`,
+   exact preset key (e.g. `rtx4090`, `h100-sxm`,
    `Qwen/Qwen3-Coder-30B-A3B-Instruct`) and its specs. State which preset
    you used. If a name is ambiguous (e.g. "H100" → SXM vs. PCIe), pick
    the most common (SXM) and note the assumption. If it's absent from
@@ -186,9 +186,13 @@ so make them visible and easy to challenge.
 ### The remaining knobs
 
 - `num_requests`: enough requests to reach steady state and produce
-  stable percentiles — `max(200, ~10 × request_rate)` (i.e. at least
-  200, and at least 10 s of arrivals at the chosen rate). It affects
-  simulation fidelity, not the deployment.
+  stable percentiles — `max(200, ~100 × request_rate)` (i.e. at least
+  200, and at least ~100 s of arrivals at the chosen rate). Shorter
+  runs at high rates finish before the queue reaches steady-state
+  depth, which makes mean TTFT / TPOT / E2E look artificially low —
+  empirically by ~70%+ at rates approaching saturation. Sizing for
+  ~100 s avoids that. Affects simulation/benchmark fidelity, not the
+  deployment.
 - `max_num_batched_tokens`: default 8192 (vLLM's typical setting).
 - `max_concurrent_requests`: vLLM `--max-num-seqs` server-policy cap on
   in-flight requests; default 1024 is fine for most cases. Lower it to
@@ -210,46 +214,71 @@ GPU can even underperform an older one on the same workload when its
 kernels are immature (e.g. B200 below H100 in some early-software
 cases). Don't present theory as if it were measured truth.
 
+### Two measurement modes — calibration vs. capacity
+
+Benchmarks come in two flavours that answer different questions. Don't
+mix them up.
+
+| Mode | What it answers | Recipe | What to do with it |
+|---|---|---|---|
+| **Closed-loop CALIBRATION** | "How efficient are the kernels at a controlled batch?" | `request_rate=.inf` + a fixed `max_concurrent_requests=N` (typically 16). Same N on both simulator and benchmark → matched-concurrency, apples-to-apples per-pass cost. | Stored efficiency factor feeds `simulate_serving(..., efficiency_factor=k)` to project real performance at arbitrary deployment rates. |
+| **Open-loop CAPACITY** | "Does the system meet SLO at this user load?" | `request_rate=λ` (finite, Poisson arrivals); `num_requests ≈ 100 × λ` so the queue reaches steady-state depth. | Reports SLO compliance (TTFT/E2E percentiles vs. threshold) at a real deployment point. |
+
+**Open-loop efficiency factors are biased and must NOT drive projection**:
+they're computed at different equilibrium concurrencies in theory and
+measurement (the simulator's faster per-pass time produces shorter
+in-flight times → smaller batches → small-batch theoretical, while real
+measurement runs at large-batch reality). The biased ratio over-states
+the kernel gap. Always prefer a closed-loop calibration record for any
+"what's the efficiency?" claim.
+
 ### Comparing theory vs. measured
 
-- **After** a theoretical estimate, call `lookup_measurements(model, gpu)`
-  to check whether real measurements exist for this model + GPU.
-- If they do: each record already carries the measured numbers, the
-  corresponding theoretical roofline, AND the efficiency factor
-  (fraction of ideal achieved) — you don't need to recompute them.
-  Present **both** — clearly labelled "theoretical roofline" vs.
-  "measured / reality-adjusted" — and apply the stored efficiency factor
-  to reality-adjust the estimate at hand, explaining the gap (citing the
-  recorded `notes` when present).
+- After a theoretical estimate, call
+  `lookup_measurements(model, gpu, mode='closed')` to find a calibration
+  record. Each record carries the measured numbers, the matched-
+  concurrency theoretical baseline, and the per-pass efficiency factor
+  (TTFT, TPOT) — apples-to-apples by construction.
+- To project performance at a different operating point, call
+  `simulate_serving(workload_file=..., gpu=..., efficiency_factor=
+  <calibration.efficiency.tpot>)`. The simulator scales per-pass wall
+  time by `1/efficiency`; the equilibrium concurrency shifts up
+  naturally to reflect the slower regime. The reported TPOT/TTFT/E2E
+  are the projected actual numbers.
+- DO NOT manually scale theoretical TPOT by `1/efficiency` —
+  that ignores the equilibrium-shift effect and gives the wrong number.
+  Always go through the simulator.
 - Always still give the theoretical figure; the adjustment is an
   overlay, not a replacement.
-- If no measurement matches, say plainly that the estimate is purely
-  theoretical and may not reflect real deployment — and offer to record
-  real numbers if the user has them.
-- When several records (or old ones) match, don't treat one as ground
-  truth: note the spread and prefer higher-trust sources (a `vllm bench`
-  result over an offhand user figure).
+- If no calibration record matches, say so plainly; offer to run a
+  calibration probe (closed-loop benchmark) if a server is available.
 
 ### Running benchmark_serving
 
-The load knob is `request_rate` (req/s, Poisson arrivals — mirrors
-`simulate_serving`). Concurrency is no longer an input; it's a **result**
-(the observed peak in-flight) reported alongside the metrics. Pick
-`num_requests` so the run lasts long enough for stable percentiles —
-roughly **`num_requests ≈ 10 × request_rate`** gives ~10 s of traffic.
-Benchmark wall time scales with **total output tokens** generated
-(`num_requests × output_len`), so cap `num_requests` for long outputs.
+The load knob is `request_rate`. Two recipes by purpose:
 
-- State the chosen `request_rate` and `num_requests` and *why* before
-  kicking off the benchmark, so the user can override (higher rate
-  approaches saturation; more requests = more confidence, more wall time).
-- `max_concurrency` is an optional cap on in-flight — leave at the
-  default (no cap) unless you're modeling a specific server policy.
-- For a saturation probe (legacy "what's the max throughput?"), use
-  `request_rate="inf"` with `max_concurrency=N` — but note the recorded
-  theoretical baseline is skipped in closed-loop mode (the simulator is
-  open-loop). Prefer running at a few finite rates to see where the
-  system saturates.
+**For calibration** (closed-loop):
+- `request_rate=.inf` + `max_concurrent_requests=N` (typically 16; use
+  32 for very fast hardware where 16 underloads).
+- `num_requests=500` is typical — enough cycles through the N-slot
+  pool for stable percentiles.
+- The recorded efficiency factor is the deliverable. Stored with
+  `mode: closed` automatically.
+
+**For capacity** (open-loop):
+- `request_rate=λ` (finite). Concurrency is a *result*, not an input —
+  the observed peak in-flight is reported alongside the metrics.
+- `num_requests ≈ 100 × λ` gives ~100 s of traffic — needed for the
+  queue to reach steady-state depth at rates close to saturation.
+  Shorter runs systematically underestimate TPOT/E2E because the queue
+  hasn't filled.
+- Stored with `mode: open` automatically.
+
+State the chosen mode + `request_rate` + `num_requests` and *why*
+before kicking off the benchmark. Benchmark wall time scales with total
+output tokens (`num_requests × output_len`); for slow hardware and long
+outputs, sample sizes need to be smaller or runs need to go into the
+background.
 
 ### Recording a measurement
 

@@ -23,6 +23,7 @@ directory, like the memory store.
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,35 +99,48 @@ def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
         rate_f = float(request_rate_raw)
     except (TypeError, ValueError):
         rate_f = 0.0
-    if not (rate_f > 0 and rate_f != float("inf")):
+    if not (rate_f > 0):
         return {"note": f"not computed: request_rate={request_rate_raw!r} is "
-                        "not a finite positive number (the simulator is "
-                        "Poisson-arrival-driven; closed-loop runs aren't "
-                        "directly comparable to its open-loop baseline)"}
+                        "not a positive number (use a finite rate for open-"
+                        "loop or `.inf` for closed-loop)."}
+    closed_loop = math.isinf(rate_f)
     try:
         from ..modeling.serving import run_simulation, summarize_run
-        # Use the workload's own num_requests; floor at 200 for stable
-        # saturated-regime percentiles when the workload didn't set one.
-        n_req = int(wf.get("num_requests", 0)) or max(int(rate_f * 10), 200)
+        # Run length: prefer the workload's num_requests (apples-to-apples
+        # with the benchmark). Open-loop fallback ≈ 10s of arrivals (floor 200);
+        # closed-loop fallback = 500 (typical calibration sample size).
+        nr_wf = int(wf.get("num_requests", 0))
+        if nr_wf > 0:
+            n_req = nr_wf
+        elif closed_loop:
+            n_req = 500
+        else:
+            n_req = max(int(rate_f * 10), 200)
         result = run_simulation(
             model_name=model, gpu_name=gpu, request_rate=rate_f,
             input_len=int(wf.get("input_len", 0)),
             output_len=int(wf.get("output_len", 0)),
             n_requests=n_req,
             max_batched_tokens=int(wf.get("max_num_batched_tokens", 0)) or 8192,
+            max_concurrent_requests=int(wf.get("max_concurrent_requests", 0)) or 1024,
             jitter=float(wf.get("range_ratio", 0.0)),
         )
         s = summarize_run(result)
         if s is None:
             return {"note": "not computed: simulation produced no finished requests"}
+        basis = ("single-GPU roofline, closed-loop"
+                 if closed_loop else
+                 "single-GPU roofline, open-loop (Poisson arrivals)")
         out = {
-            "basis": "single-GPU roofline (simulate_serving, Poisson arrivals)",
+            "basis": basis,
             "served_rate_rps": round(s.served_rate, 3),
             "ttft_ms": round(s.ttft_ms.mean, 3),
             "tpot_ms": round(s.tpot_ms.mean, 3),
             "mean_in_flight": round(s.mean_in_flight, 2),
         }
-        if s.saturated:
+        if s.saturated and not closed_loop:
+            # Saturation flag only meaningful for open-loop. Closed-loop is
+            # always "saturated" in the open-loop sense (served < requested=inf).
             out["saturated"] = True
             out["saturation_reason"] = s.saturation_reason
         return out
@@ -194,10 +208,16 @@ def _fmt(r: dict) -> str:
     if r.get("tpot_ms"):
         metrics.append(f"TPOT={r['tpot_ms']:g}ms")
     metric_str = ", ".join(metrics) or "(no metrics)"
-    rate = r.get("request_rate")
-    rate_str = f"rate={rate} req/s, " if rate else ""
+    # Operating-point label depends on mode. Records without a `mode` field
+    # predate the closed/open distinction — treat as open for back-compat.
+    mode = r.get("mode", "open")
+    if mode == "closed":
+        op_str = f"closed-loop N={r.get('max_concurrency','?')}, "
+    else:
+        rate = r.get("request_rate")
+        op_str = f"open-loop rate={rate} req/s, " if rate else ""
     head = (f"{r.get('model','?')} on {r.get('gpu','?')}"
-            f" | {rate_str}c={r.get('concurrency','?')} (peak in-flight) "
+            f" | {op_str}c={r.get('concurrency','?')} (peak in-flight) "
             f"in={r.get('input_len','?')} out={r.get('output_len','?')} "
             f"{_parallelism_str(r)}")
     tail = f" | source={r.get('source','?')}"
@@ -255,14 +275,24 @@ def record_measurement(
 
     _ensure()
     n_gpus = tensor_parallel * pipeline_parallel * data_parallel
-    request_rate = str(wf.get("request_rate", ""))
+    request_rate_raw = wf.get("request_rate", 0)
+    try:
+        rate_f = float(request_rate_raw)
+    except (TypeError, ValueError):
+        rate_f = 0.0
+    mode = "closed" if math.isinf(rate_f) else "open"
+    max_concurrency = int(wf.get("max_concurrent_requests", 0)) or None
     rec = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "workload_file": workload_file,
+        "mode": mode,                 # closed = N-controlled probe (kernel calibration);
+                                      # open  = rate-driven Poisson (deployment capacity)
         "model": wf.get("model", ""),
         "gpu": gpu,
-        "request_rate": request_rate,
-        "concurrency": concurrency,   # observed peak in-flight at this rate
+        "request_rate": str(request_rate_raw),
+        "max_concurrency": max_concurrency,   # the closed-loop operating point;
+                                              # also the open-loop policy cap
+        "concurrency": concurrency,   # observed peak in-flight (steady-state N for closed)
         "input_len": wf.get("input_len"),
         "output_len": wf.get("output_len"),
         "num_requests": wf.get("num_requests"),
@@ -275,8 +305,9 @@ def record_measurement(
         "source": source,
         "notes": notes,
     }
-    # Run the simulator at the same workload as the benchmark — apples-to-apples
-    # by construction. Stores measured + theoretical + efficiency in one record.
+    # Run the simulator at the same workload+mode as the benchmark —
+    # apples-to-apples by construction. Stores measured + theoretical +
+    # efficiency in one record.
     theo = _theoretical(wf, gpu, n_gpus)
     rec["theoretical"] = theo
     eff = _efficiency(rec, theo)
@@ -285,9 +316,11 @@ def record_measurement(
 
     with STORE_FILE.open("a") as f:
         f.write(json.dumps(rec) + "\n")
-    rate_bit = f"rate={request_rate} req/s, " if request_rate else ""
-    status = (f"recorded measurement: {rec['model']} on {gpu} "
-              f"({rate_bit}c={concurrency}, in={rec['input_len']}, "
+    op_bit = (f"closed N={max_concurrency}, "
+              if mode == "closed"
+              else f"rate={rec['request_rate']} req/s, ")
+    status = (f"recorded measurement ({mode}-loop): {rec['model']} on {gpu} "
+              f"({op_bit}c={concurrency}, in={rec['input_len']}, "
               f"out={rec['output_len']}, {_parallelism_str(rec)})")
     if eff:
         bits = []
@@ -303,21 +336,32 @@ def record_measurement(
 
 
 @tool(
-    "Look up previously recorded REAL benchmark measurements to calibrate a "
-    "theoretical estimate. Filter by model and/or gpu (leave a field blank "
-    "to match any; substring match). Call this after a theoretical estimate "
-    "to check whether measured performance is known for this model+GPU, "
-    "then report the theoretical number AND a reality-adjusted estimate.",
-    model="Filter to this model (blank = any).",
-    gpu="Filter to this GPU (blank = any).",
+    "Look up previously recorded REAL benchmark measurements. Records come in "
+    "two modes: CLOSED-loop (request_rate=inf with a fixed in-flight cap N — "
+    "the right source for kernel-efficiency calibration, because theory and "
+    "measurement share the same batch by construction) and OPEN-loop (Poisson "
+    "arrivals at a fixed rate — the right source for deployment-capacity / "
+    "SLO data). When projecting actual performance, prefer a closed-loop "
+    "record's efficiency factor and feed it to `simulate_serving`'s "
+    "`efficiency_factor` knob.",
+    model="Filter to this model (blank = any; substring match).",
+    gpu="Filter to this GPU (blank = any; substring match).",
+    mode="Filter to closed-loop or open-loop records (blank = any). "
+         "Use 'closed' for kernel-efficiency calibration; 'open' for "
+         "deployment-capacity / SLO data.",
 )
-def lookup_measurements(model: str = "", gpu: str = "") -> str:
+def lookup_measurements(model: str = "", gpu: str = "", mode: str = "") -> str:
     recs = _load_all()
+    mode_norm = mode.strip().lower()
+    if mode_norm and mode_norm not in ("open", "closed"):
+        return (f"ERROR: mode={mode!r} must be 'open', 'closed', or blank.")
 
     def matches(r: dict) -> bool:
         if model and model.lower() not in str(r.get("model", "")).lower():
             return False
         if gpu and gpu.lower() not in str(r.get("gpu", "")).lower():
+            return False
+        if mode_norm and r.get("mode", "open") != mode_norm:
             return False
         return True
 

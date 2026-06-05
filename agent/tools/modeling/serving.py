@@ -180,6 +180,27 @@ def _poisson_arrivals(rng: random.Random, n: int, rate: float) -> list[float]:
     return times
 
 
+def _request_lengths(
+    rng: random.Random,
+    n_requests: int,
+    input_len: int,
+    output_len: int,
+    jitter: float,
+) -> list[tuple[int, int]]:
+    """Per-request (prompt_tokens, gen_tokens) pairs with jitter applied.
+
+    Factored out so open-loop and closed-loop modes can share the same
+    jitter semantics — open-loop pairs these with Poisson arrivals up-front,
+    closed-loop dispatches them on-demand as slots free.
+    """
+    out: list[tuple[int, int]] = []
+    for _ in range(n_requests):
+        prompt = max(1, int(rng.uniform(input_len * (1 - jitter), input_len * (1 + jitter))))
+        gen = max(1, int(rng.uniform(output_len * (1 - jitter), output_len * (1 + jitter))))
+        out.append((prompt, gen))
+    return out
+
+
 def _build_request_pool(
     rng: random.Random,
     n_requests: int,
@@ -188,16 +209,13 @@ def _build_request_pool(
     request_rate: float,
     jitter: float,
 ) -> list[Request]:
+    """Open-loop pool: Poisson arrivals + per-request lengths."""
     arrivals = _poisson_arrivals(rng, n_requests, request_rate)
-    pool: list[Request] = []
-    for i, arrival in enumerate(arrivals):
-        prompt = max(1, int(rng.uniform(input_len * (1 - jitter), input_len * (1 + jitter))))
-        gen = max(1, int(rng.uniform(output_len * (1 - jitter), output_len * (1 + jitter))))
-        pool.append(Request(
-            id=i, arrival_s=arrival,
-            prompt_tokens=prompt, gen_tokens=gen,
-        ))
-    return pool
+    lengths = _request_lengths(rng, n_requests, input_len, output_len, jitter)
+    return [
+        Request(id=i, arrival_s=a, prompt_tokens=p, gen_tokens=g)
+        for i, (a, (p, g)) in enumerate(zip(arrivals, lengths))
+    ]
 
 
 def _request_is_done(r: Request) -> bool:
@@ -223,9 +241,29 @@ def run_simulation(
     microbench: dict | None = None,
     seed: int = 0,
     progress_cb=None,
+    efficiency_factor: float = 1.0,
 ) -> SimulationResult:
-    """Run the simulation. Wall clock advances by each step's roofline time."""
+    """Run the simulation. Wall clock advances by each step's roofline time.
+
+    Two arrival modes (auto-detected from ``request_rate``):
+
+    * **Open-loop** (finite ``request_rate``): arrivals follow a Poisson
+      process pre-generated up front. Concurrency emerges from rate and
+      service time.
+    * **Closed-loop** (``request_rate=math.inf``): seeds
+      ``max_concurrent_requests`` requests at t=0, then dispatches the next
+      request *as each one finishes* — steady-state in-flight = N. Use for
+      kernel-efficiency calibration where you want a controlled batch size.
+
+    ``efficiency_factor`` scales per-forward-pass wall time by
+    ``1 / efficiency_factor`` (default 1.0 = pure roofline). Use the
+    closed-loop-derived efficiency from the measurement store to project
+    real-world performance: theory-with-implementation-cost-baked-in.
+    """
     rng = random.Random(seed)
+    # Separate RNG for MoE routing so toggling routing_skew doesn't shift
+    # arrival times / request length jitter (which would change the workload).
+    routing_rng = random.Random(seed + 1)
     model = PRESET_MODELS[model_name]
     gpu = PRESET_GPUS[gpu_name]
     kv_budget = compute_kv_budget_bytes(model, gpu, n_gpus)
@@ -236,7 +274,25 @@ def run_simulation(
         model=model,
     )
 
-    arrival_pool = _build_request_pool(rng, n_requests, input_len, output_len, request_rate, jitter)
+    closed_loop = math.isinf(request_rate)
+
+    if closed_loop:
+        # Closed-loop: pre-generate lengths only; arrivals fire on-demand as
+        # requests finish, keeping in-flight at most max_concurrent_requests.
+        lengths = _request_lengths(rng, n_requests, input_len, output_len, jitter)
+        arrival_pool: list[Request] = []
+        initial = min(max_concurrent_requests, n_requests)
+        for i in range(initial):
+            p, g = lengths[i]
+            arrival_pool.append(Request(id=i, arrival_s=0.0, prompt_tokens=p, gen_tokens=g))
+        next_dispatch_idx = initial
+    else:
+        arrival_pool = _build_request_pool(
+            rng, n_requests, input_len, output_len, request_rate, jitter,
+        )
+        lengths = None
+        next_dispatch_idx = n_requests  # all already in arrival_pool
+
     waiting_queue: list[Request] = []
     running_queue: list[Request] = []
     finished: list[Request] = []
@@ -260,14 +316,16 @@ def run_simulation(
         ))
 
     pool_idx = 0
-    while pool_idx < len(arrival_pool) or waiting_queue or running_queue:
+    while (pool_idx < len(arrival_pool) or waiting_queue or running_queue
+           or (closed_loop and next_dispatch_idx < n_requests)):
         # Pull arrivals up to t_now into the waiting queue.
         while pool_idx < len(arrival_pool) and arrival_pool[pool_idx].arrival_s <= t_now:
             waiting_queue.append(arrival_pool[pool_idx])
             pool_idx += 1
 
         # If running is empty and waiting is empty, jump the clock to the
-        # next arrival (no work to do until then).
+        # next arrival (no work to do until then). Only relevant in open-loop;
+        # closed-loop always has work pending or has finished entirely.
         if not running_queue and not waiting_queue and pool_idx < len(arrival_pool):
             t_now = arrival_pool[pool_idx].arrival_s
             continue
@@ -292,9 +350,14 @@ def run_simulation(
                 r.start_s = t_now
 
         # Forward pass.
-        step_breakdown = forward_pass_latency(running_queue, microbench, gpu, model, expert_cache)
+        step_breakdown = forward_pass_latency(
+            running_queue, microbench, gpu, model, expert_cache, rng=routing_rng,
+        )
         sim_breakdown.accumulate(step_breakdown)
         step_duration = step_breakdown.total().roofline_s
+        # Project implementation overhead: theory-times-1/efficiency = measured.
+        if 0.0 < efficiency_factor < 1.0:
+            step_duration /= efficiency_factor
         n_forward_passes += 1
         total_batch_tokens += total_tokens_in_batch(running_queue)
 
@@ -319,6 +382,16 @@ def run_simulation(
                 finished.append(r)
                 if progress_cb is not None:
                     progress_cb(1)
+                # Closed-loop: a slot just freed — dispatch the next request.
+                if closed_loop and next_dispatch_idx < n_requests:
+                    p, g = lengths[next_dispatch_idx]
+                    arrival_pool.append(Request(
+                        id=next_dispatch_idx,
+                        arrival_s=t_now,
+                        prompt_tokens=p,
+                        gen_tokens=g,
+                    ))
+                    next_dispatch_idx += 1
             else:
                 still_running.append(r)
         running_queue[:] = still_running
@@ -584,26 +657,37 @@ def render_report(summary: RunSummary | None) -> str:
 # ---------------------------------------------------------------------------
 
 @tool(
-    "Simulate a continuous-batching serving workload under a Poisson "
-    "arrival process and report TTFT/TPOT/E2E percentiles, observed "
-    "concurrency, KV-cache pressure, per-forward-pass breakdown, and a "
-    "saturation flag if the GPU(s) cannot keep up with the requested rate. "
-    "Concurrency is a RESULT, not an input — it emerges from request_rate, "
-    "request sizes, and serving capacity. The workload knobs all come from "
-    "a WorkloadProfile YAML (typically `stages/01_workload.yaml`); pass "
-    "the hardware as `gpu`.",
+    "Simulate a continuous-batching serving workload and report TTFT/TPOT/"
+    "E2E percentiles, observed concurrency, KV-cache pressure, per-forward-"
+    "pass breakdown, and a saturation flag if the GPU(s) cannot keep up. "
+    "Auto-detects two modes from the workload's `request_rate`: a finite "
+    "rate runs OPEN-loop (Poisson arrivals, concurrency is a result); "
+    "`.inf` runs CLOSED-loop (a new request is dispatched as each one "
+    "finishes, so steady-state in-flight = `max_concurrent_requests`). "
+    "Open-loop is for deployment-capacity sizing; closed-loop is for kernel-"
+    "efficiency calibration at a controlled batch. The workload knobs all "
+    "come from a WorkloadProfile YAML; pass the hardware as `gpu`. The "
+    "optional `efficiency_factor` scales per-forward-pass wall time by "
+    "`1 / efficiency_factor` — feed in the closed-loop-derived efficiency "
+    "from `lookup_measurements` to project realistic performance.",
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain at "
-                  "least `model`, `request_rate`, `input_len`, "
-                  "`output_len`, `num_requests`, `max_num_batched_tokens`. "
-                  "`max_concurrent_requests` is optional (defaults to 1024).",
+                  "least `model`, `request_rate` (finite or `.inf`), "
+                  "`input_len`, `output_len`, `num_requests`, "
+                  "`max_num_batched_tokens`. `max_concurrent_requests` is "
+                  "optional in open-loop (defaults to 1024) and REQUIRED "
+                  "in closed-loop (it sets the steady-state in-flight N).",
     gpu="Preset GPU name (must exist in PRESET_GPUS).",
     n_gpus="Number of GPUs sharing the model (for KV-cache budget, default 1).",
+    efficiency_factor="Per-pass kernel efficiency (theory/measured, in (0, 1]; "
+                      "default 1.0 = pure roofline). Set to a measured "
+                      "efficiency to project actual performance.",
 )
 def simulate_serving(
     workload_file: str,
     gpu: str,
     n_gpus: int = 1,
+    efficiency_factor: float = 1.0,
 ) -> str:
     try:
         from ...workspace import resolve
@@ -625,13 +709,19 @@ def simulate_serving(
         return f"ERROR: unknown model {model!r}. Available: {', '.join(sorted(PRESET_MODELS))}"
     if gpu not in PRESET_GPUS:
         return f"ERROR: unknown gpu {gpu!r}. Available: {', '.join(sorted(PRESET_GPUS))}"
-    if request_rate <= 0:
-        return "ERROR: request_rate must be > 0."
+    try:
+        rate_f = float(request_rate)
+    except (TypeError, ValueError):
+        return f"ERROR: request_rate={request_rate!r} is not numeric (use a positive float, or `.inf` for closed-loop)."
+    if not (rate_f > 0):
+        return "ERROR: request_rate must be > 0 (or `.inf` for closed-loop)."
+    if not (0.0 < efficiency_factor <= 1.0):
+        return f"ERROR: efficiency_factor={efficiency_factor!r} must be in (0, 1]."
 
     result = run_simulation(
         model_name=model,
         gpu_name=gpu,
-        request_rate=request_rate,
+        request_rate=rate_f,
         input_len=input_len,
         output_len=output_len,
         n_requests=num_requests,
@@ -639,6 +729,7 @@ def simulate_serving(
         max_concurrent_requests=max_concurrent_requests,
         n_gpus=n_gpus,
         jitter=range_ratio,
+        efficiency_factor=efficiency_factor,
     )
     return render_report(summarize_run(result))
 
@@ -666,6 +757,11 @@ def _parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bench-file", type=str, default=None,
                         help="Microbenchmark results JSON (optional).")
+    parser.add_argument("--efficiency-factor", type=float, default=1.0,
+                        help="Per-pass kernel efficiency (theory/measured, "
+                             "in (0, 1]; default 1.0 = pure roofline). Use "
+                             "with the closed-loop-derived efficiency to "
+                             "project actual performance.")
     return parser.parse_args()
 
 
@@ -683,7 +779,7 @@ if __name__ == "__main__":
     result = run_simulation(
         model_name=wf["model"],
         gpu_name=args.gpu,
-        request_rate=wf["request_rate"],
+        request_rate=float(wf["request_rate"]),
         input_len=wf["input_len"],
         output_len=wf["output_len"],
         n_requests=wf["num_requests"],
@@ -693,5 +789,6 @@ if __name__ == "__main__":
         jitter=float(wf.get("range_ratio", 0.0)),
         microbench=microbench,
         seed=args.seed,
+        efficiency_factor=args.efficiency_factor,
     )
     print(render_report(summarize_run(result)))

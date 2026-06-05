@@ -269,6 +269,20 @@ def attention_core_latency(
 # Layer / full-forward composition
 # ---------------------------------------------------------------------------
 
+def zipfian_routing_probs(n_experts: int, skew: float) -> list[float] | None:
+    """Per-expert probability vector for Zipfian top-k routing.
+
+    Expert at rank i (0-indexed) gets weight ``1 / (i+1)**skew``, normalised.
+    Returns ``None`` for ``skew <= 0`` (uniform routing — callers use the
+    faster top-k-without-replacement path).
+    """
+    if skew <= 0.0:
+        return None
+    weights = [1.0 / (i + 1) ** skew for i in range(n_experts)]
+    total = sum(weights)
+    return [w / total for w in weights]
+
+
 def transformer_layer_latency(
     requests: list[Request],
     layer_idx: int,
@@ -276,6 +290,8 @@ def transformer_layer_latency(
     gpu: HardwareConfig,
     model: ModelConfig,
     expert_cache: dict | None = None,
+    rng: random.Random | None = None,
+    routing_probs: list[float] | None = None,
 ) -> OpBreakdown:
     """Roofline for one transformer layer applied to ``requests``."""
     breakdown = OpBreakdown()
@@ -327,9 +343,16 @@ def transformer_layer_latency(
         breakdown.up_gate_proj = cached["up_gate"]
         breakdown.down_proj = cached["down"]
     else:
-        # MoE: simulate uniform-random expert selection to estimate
-        # per-expert token loads, then grouped GEMM.
-        token_counts = _sample_expert_loads(n_tokens, model.n_experts, model.top_k)
+        # MoE: sample per-expert token loads, then grouped GEMM. Uniform
+        # (routing_probs=None) uses true top-k-without-replacement;
+        # Zipfian uses a weighted multinomial approximation.
+        token_counts = _sample_expert_loads(
+            rng or random,
+            n_tokens,
+            model.n_experts,
+            model.top_k,
+            routing_probs,
+        )
 
         up_gate_shapes = [
             (token_counts[e], model.hidden_size, model.moe_intermediate_size * 2)
@@ -356,12 +379,30 @@ def transformer_layer_latency(
     return breakdown
 
 
-def _sample_expert_loads(n_tokens: int, n_experts: int, top_k: int) -> list[int]:
-    """How many tokens each expert receives under uniform-random top-k routing."""
+def _sample_expert_loads(
+    rng,
+    n_tokens: int,
+    n_experts: int,
+    top_k: int,
+    probs: list[float] | None,
+) -> list[int]:
+    """How many tokens each expert receives.
+
+    * ``probs=None``: uniform top-k routing without replacement (each token
+      picks ``top_k`` distinct experts uniformly at random).
+    * ``probs`` provided: weighted multinomial approximation — ``n_tokens *
+      top_k`` independent draws weighted by ``probs``. Statistically very
+      close to weighted-without-replacement when ``top_k << n_experts`` and
+      considerably faster.
+    """
     counts = [0] * n_experts
-    expert_ids = list(range(n_experts))
-    for _ in range(n_tokens):
-        for e in random.sample(expert_ids, top_k):
+    if probs is None:
+        expert_ids = list(range(n_experts))
+        for _ in range(n_tokens):
+            for e in rng.sample(expert_ids, top_k):
+                counts[e] += 1
+    else:
+        for e in rng.choices(range(n_experts), weights=probs, k=n_tokens * top_k):
             counts[e] += 1
     return counts
 
@@ -372,12 +413,21 @@ def forward_pass_latency(
     gpu: HardwareConfig,
     model: ModelConfig,
     expert_cache: dict | None = None,
+    rng: random.Random | None = None,
 ) -> OpBreakdown:
     """Roofline for a full forward pass (all transformer layers + lm_head)."""
     total = OpBreakdown()
+    # Routing probs are shape-only (same shape across layers under Zipfian),
+    # so compute once per forward pass and thread through.
+    routing_probs = zipfian_routing_probs(model.n_experts, model.routing_skew)
     for layer_idx in range(model.n_layers):
         total.accumulate(
-            transformer_layer_latency(requests, layer_idx, microbench, gpu, model, expert_cache)
+            transformer_layer_latency(
+                requests, layer_idx, microbench, gpu, model,
+                expert_cache=expert_cache,
+                rng=rng,
+                routing_probs=routing_probs,
+            )
         )
 
     # lm_head runs on one token per request (the new query position).

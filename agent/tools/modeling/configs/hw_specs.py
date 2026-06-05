@@ -83,14 +83,24 @@ class HardwareConfig:
 # from the official datasheets.
 
 PRESET_GPUS: dict[str, HardwareConfig] = {
-    "4090": HardwareConfig(
-        name="4090",
+    "rtx4090": HardwareConfig(
+        name="rtx4090",
         bf16_flops=165.2e12,
         mem_bandwidth=1008e9,
         mem_capacity=24e9,
         fp8_flops=330.3e12,
         msrp_usd=1_600,
         tdp_watts=450,
+    ),
+    "rtx5090": HardwareConfig(
+        name="rtx5090",
+        bf16_flops=209e12,       # NVIDIA published spec, dense
+        mem_bandwidth=1792e9,    # 1.79 TB/s GDDR7
+        mem_capacity=32e9,       # 32 GB
+        fp8_flops=419e12,        # ~2x BF16 (Blackwell ratio)
+        fp4_flops=838e12,        # NVIDIA's "838 AI TOPS" headline, dense
+        msrp_usd=1_999,          # Founders Edition launch MSRP
+        tdp_watts=575,
     ),
     "h100-sxm": HardwareConfig(
         name="h100-sxm",
@@ -146,5 +156,25 @@ PRESET_GPUS: dict[str, HardwareConfig] = {
         fp4_flops=9e15,
         msrp_usd=45_000,
         tdp_watts=1_000,
+    ),
+    # DGX Spark (GB10) — NVIDIA's compact "personal AI" workstation.
+    # Two structural differences from the discrete-card presets above:
+    #   * Memory is a unified LPDDR5x pool shared with the Grace CPU,
+    #     NOT dedicated HBM — bandwidth is ~13x lower than H200 and any
+    #     memory-bound LLM decode is dominated by it.
+    #   * msrp_usd is the whole workstation (CPU + GPU + 128 GB RAM +
+    #     chassis), not a card price — cost basis differs from above.
+    # bf16/fp8 FLOPs are derived from Blackwell's standard 4:2:1 ratio
+    # against NVIDIA's headline "1 PFLOPS sparse FP4" (≈ 500 TF dense).
+    # TDP is the GPU portion only (full system draws ~240W at wall).
+    "dgx-spark": HardwareConfig(
+        name="dgx-spark",
+        bf16_flops=125e12,       # estimated: FP4_dense / 4
+        mem_bandwidth=273e9,     # LPDDR5x-8533, unified CPU+GPU pool
+        mem_capacity=128e9,      # unified; CPU shares this pool
+        fp8_flops=250e12,        # estimated: FP4_dense / 2
+        fp4_flops=500e12,        # NVIDIA's "1 PFLOPS sparse" / 2
+        msrp_usd=3_000,          # whole workstation
+        tdp_watts=140,           # estimated GPU portion only
     ),
 }

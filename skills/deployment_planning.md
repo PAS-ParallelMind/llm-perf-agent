@@ -25,11 +25,16 @@ does NOT apply here.
   simulator yields a **theoretical upper bound** per candidate. The
   workflow then forks into two paths:
   - **Baseline performance** (vLLM, SGLang, etc. as-is). The agent
-    applies a historical efficiency factor to the theoretical numbers to
-    project the **actual** performance of the baseline stack on each
-    candidate, and the user picks hardware on those projected numbers.
-    Stage 3 then reports the real measurement against the projection and
-    the workflow ends.
+    pulls a **closed-loop calibration** record (per-pass kernel
+    efficiency at a fixed in-flight N) from the measurement store and
+    feeds it to `simulate_serving(..., efficiency_factor=k)`. The
+    simulator runs at the deployment's open-loop rate but scales each
+    forward pass by `1/k`, so the equilibrium concurrency shifts up
+    naturally and the projected TPOT / TTFT / E2E reflect the kernel
+    cost. The user picks hardware on those projected numbers. Stage 3
+    captures (or refreshes) the closed-loop calibration on the real
+    server, then runs an open-loop capacity probe and reports
+    measured-vs-projected.
   - **Potential performance (after optimization)**. The user picks hardware on the
     theoretical numbers, accepting the implementation gap as something
     they'll close. Stage 3 measures the baseline against theory and
@@ -99,7 +104,7 @@ model: <PRESET_MODELS key>
 request_rate: <float>              # req/s, Poisson arrivals (NOT concurrency)
 input_len: <int>
 output_len: <int>                  # incl. reasoning budget if model reasons
-num_requests: <int>                # max(200, ~10 × request_rate) for stable percentiles
+num_requests: <int>                # max(200, ~100 × request_rate) — ~100s of arrivals so the queue reaches steady state
 max_num_batched_tokens: <int>      # vLLM --max-num-batched-tokens (e.g. 8192)
 max_concurrent_requests: <int>     # vLLM --max-num-seqs server cap (e.g. 1024)
 range_ratio: <float>               # 0.0 = fixed lengths (clean modeled-vs-measured
@@ -149,30 +154,42 @@ assumptions you made, and a one-line invitation to override.
    do NOT extend it with measurement lookups; the projection happens
    in step 3 below.
 
-3. **Projected-actual sweep — Table B** (agent-driven):
+3. **Projected-actual sweep — Table B** (agent-driven, simulator-applied):
    - For each candidate that fits and isn't saturated, call
-     `lookup_measurements(model=<workload model>, gpu=<candidate>)`. Each
-     returned record carries an `efficiency` dict with keys `ttft` and
-     `tpot` — defined as `theory / measured`, so values <1.0 mean
-     "measured is worse than theory". (Throughput isn't recorded — at
-     sub-saturation it just mirrors offered load and isn't a capability
-     signal.)
-   - **Pick the projection factors** by judgement: prefer the most
-     recent record at a similar operating point (close `request_rate`,
-     `input_len`, `output_len`). If multiple records exist, you can
-     average, take the most recent, or weight by operating-point
-     proximity — your call. State which record(s) you used.
-   - Apply to that candidate's Table-A row to project request latency:
-     - `projected_ttft_ms = theoretical_ttft_ms / efficiency.ttft`
-     - `projected_tpot_ms = theoretical_tpot_ms / efficiency.tpot`
-     - `projected_request_latency_s = projected_ttft_ms/1000 +
-       projected_tpot_ms/1000 × output_len`
-     - For the `$/1M tok` column, use the theoretical output throughput
-       from Table A (at sub-saturation it equals offered load — there's
-       no separate throughput projection to compute).
-   - If **no record exists** for (model, gpu), flag the candidate in
-     Table B with "—" and a note — do NOT fabricate efficiency factors
-     or copy theoretical numbers across.
+     `lookup_measurements(model=<workload model>, gpu=<candidate>,
+     mode='closed')`. **The `mode='closed'` filter is critical**:
+     only closed-loop calibration records give apples-to-apples per-
+     forward-pass kernel efficiency. Open-loop records' efficiency
+     factors are *biased* by the equilibrium-shift effect (slow
+     measured → more concurrency → bigger batches → not the same
+     operating point theory was computed at) and must not drive
+     projection.
+   - **Pick the calibration record** by judgement: prefer the most
+     recent at a similar `max_concurrency` and similar lengths.
+     State which record you used and its `efficiency.tpot`.
+   - **Project actual performance via the simulator** — DO NOT scale
+     theoretical numbers manually. Call:
+     ```
+     simulate_serving(
+         workload_file="stages/01_workload.yaml",
+         gpu=<candidate>,
+         efficiency_factor=<calibration.efficiency.tpot>,
+     )
+     ```
+     The simulator applies the efficiency to per-forward-pass wall
+     time; the equilibrium concurrency naturally shifts up (slower
+     per-pass → longer in-flight → larger batches) and the reported
+     TPOT / TTFT / E2E latency are the projected actual numbers at the
+     deployment open-loop rate. Read those into Table B's row for this
+     candidate.
+   - For the `$/1M tok` column, use the projected output throughput
+     (`request_rate × output_len` at sub-saturation, or the simulator's
+     served-rate × output_len when saturated).
+   - If **no closed-loop record exists** for (model, gpu), flag the
+     candidate in Table B with "—" and a note that *calibration is
+     missing*. Do NOT fall back to open-loop efficiency or to copying
+     theoretical numbers — both are biased. Surface this to the user
+     so Stage 3 can capture the calibration first.
    - Build Table B with the same columns as Table A and mark its own
      Pareto frontier on projected numbers.
 
@@ -221,10 +238,11 @@ recommended:
   rationale: "<why this point under the chosen path>"
 meets_target: <true|false>
 projection:                          # baseline only — null for optimized
-  factor_ttft: <float>               # efficiency.ttft from source record (<1 = slower than theory)
-  factor_tpot: <float>               # efficiency.tpot from source record
-  source_record: "<measurement id / timestamp>"
-  projected_ttft_ms: <float>
+  source_record: "<closed-loop measurement id / timestamp>"
+  source_max_concurrency: <int>      # the N the calibration was probed at
+  efficiency_tpot: <float>           # closed-loop per-pass efficiency applied
+  efficiency_ttft: <float>           # informational; mostly mirrors tpot at saturation
+  projected_ttft_ms: <float>         # from simulate_serving(..., efficiency_factor=tpot)
   projected_tpot_ms: <float>
   projected_request_latency_s: <float>
 ```
@@ -243,28 +261,54 @@ Stage 2. Branch accordingly.
 
 ### Baseline performance
 
-**Goal**: report the real performance against the Stage-2 projection.
-No verdict — present numbers and the delta; the user decides whether
-the delta is acceptable.
+**Goal**: capture (or refresh) the **closed-loop calibration** that
+drives Stage 2's projection, then run an **open-loop capacity** probe
+at the deployment rate and report measured-vs-projected.
+
+Two distinct measurements happen here:
+- **Calibration probe** (closed-loop, `request_rate=.inf`, fixed N).
+  Produces the per-pass kernel efficiency factor that
+  `simulate_serving(..., efficiency_factor=...)` consumes for
+  projection. Apples-to-apples kernel comparison by construction.
+- **Capacity probe** (open-loop, the deployment `request_rate`).
+  Reports the real SLO compliance and request latency at the
+  expected user load.
 
 **Process**:
 
-1. **Ask about a running server.** Tell the user the recommended config
-   and ask: *"Do you have an OpenAI-compatible server running this
-   config? Give me the `base_url` and the served `model` name and I'll
-   measure it."*
-   - **If no** → tell them they need a deployed server to compare
-     against the projection, and to come back when one exists. Don't
-     fall back to anything — the baseline-performance path's whole
-     point is the projection vs. measurement comparison.
+1. **Ask about a running server.** Tell the user the recommended
+   config and ask: *"Do you have an OpenAI-compatible server running
+   this config? Give me the `base_url` and the served `model` name and
+   I'll measure it."*
+   - **If no** → tell them they need a deployed server, and to come
+     back when one exists. Don't fall back to anything.
 
-2. **Measure**: call `benchmark_serving(base_url=...,
-   workload_file="stages/01_workload.yaml", gpu=<recommended preset>,
+2. **Calibrate** (closed-loop probe). Skip this step *only* if Stage
+   2 already used a recent closed-loop record at a similar
+   `max_concurrency` and similar lengths; otherwise run it now.
+   - Write a calibration yaml (e.g. `stages/01_workload_cal.yaml`)
+     with the same `model` / `input_len` / `output_len` as the
+     deployment, plus `request_rate: .inf`,
+     `max_concurrent_requests: 16` (or 32 for very fast hardware),
+     `num_requests: 500`.
+   - Call `benchmark_serving(base_url=..., workload_file=<cal yaml>,
+     gpu=<recommended>, tensor_parallel=1)`. The record auto-tags as
+     `mode: closed` and stores the kernel efficiency.
+   - If Stage 2's projection used a *different* efficiency (proxy
+     hardware, stale record, no record), **re-run Stage 2's
+     projection** with the fresh efficiency before continuing — the
+     projection number you compare against should reflect this
+     hardware's actual kernels.
+
+3. **Measure capacity** (open-loop, at the deployment rate). Call
+   `benchmark_serving(base_url=..., workload_file=
+   "stages/01_workload.yaml", gpu=<recommended preset>,
    tensor_parallel=1)`. Override `model` if the server serves under a
-   different id than the workload's `model`.
+   different id than the workload's `model`. Record auto-tags as
+   `mode: open`.
 
-3. **Compare**: present measured request latency (with its TTFT /
-   TPOT breakdown) next to the `projection` block from
+4. **Compare**: present measured request latency (with TTFT / TPOT
+   breakdown) next to the `projection` block from
    `stages/02_plan.yaml`. Show the delta as percentages. Report
    numbers; do **not** say "pass" / "fail" — the user decides what's
    acceptable.
@@ -274,15 +318,26 @@ the delta is acceptable.
    uninformative. Latency (and its TTFT / TPOT decomposition) is the
    meaningful signal.
 
+   If the projection misses by a lot, the most likely causes are
+   (a) the calibration record came from a different operating point
+   or older framework version, or (b) the deployment rate pushes the
+   system into a regime the calibration didn't cover. Surface the
+   suspected cause; don't just report the delta.
+
 **Output artifact** → write to `stages/03_report.yaml`:
 
 ```yaml
 path: baseline
-projected:
+calibration:                         # the closed-loop probe used / refreshed
+  record_ts: "<measurement timestamp>"
+  max_concurrency: <int>
+  efficiency_tpot: <float>
+  efficiency_ttft: <float>
+projected:                           # from simulate_serving + efficiency_factor
   request_latency_s: <float>
   ttft_ms: <float>
   tpot_ms: <float>
-measured:
+measured:                            # from open-loop benchmark_serving
   request_latency_s: <float>
   ttft_ms: <float>
   tpot_ms: <float>
@@ -290,14 +345,12 @@ delta:                               # measured / projected
   request_latency: <float>
   ttft: <float>
   tpot: <float>
-source_record: "<measurement id used for projection>"
 ```
 
 **Reply to the user**: measured vs projected (latency numbers + delta
-%, with TTFT / TPOT breakdown), the source record used for the
-projection, and one line on whether the delta is large enough that
-they may want to revisit Stage 2 with a different candidate. End the
-workflow here.
+%, with TTFT / TPOT breakdown), the calibration record used, and one
+line on whether the delta is large enough that they may want to
+revisit Stage 2 with a different candidate. End the workflow here.
 
 ### Potential performance (after optimization)
 
