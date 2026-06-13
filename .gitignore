@@ -16,6 +16,13 @@ memory/
 # Measured-performance store (per-instance calibration data)
 measurements/
 
+# Per-instance hardware profiles (microbench JSONs) — generated per machine
+agent/tools/modeling/configs/hw_profiles/
+
+# Ad-hoc experiment scripts and standalone sims (leading underscore convention)
+agent/tools/modeling/_*.py
+!agent/tools/modeling/__init__.py
+
 # Python
 __pycache__/
 *.pyc

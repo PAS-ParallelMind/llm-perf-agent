@@ -1,103 +1,53 @@
-"""Analytical forward-pass latency model.
+"""Per-forward-pass latency model — two modes (roofline / predictor).
 
-Computes per-operation compute / memory / roofline latencies for a single
-transformer forward pass. Used standalone via the ``estimate_latency``
-tool, and as the inner loop of the serving simulator.
+The previous version of this module computed per-op latencies analytically
+from FLOPs/bytes and the GPU's theoretical peaks, scaled by an optional
+``efficiency_factor`` scalar. That approach over-predicted throughput by
+5-13x on B200 mxfp4 (validated empirically — see ``workspace/case1_v2``).
+This module replaces it with a microbench-driven predictor whose
+per-shape efficiency is read from ``measurements/microbenchmarks/<gpu>/``.
 
-Conventions:
-* ``compute_s`` / ``memory_s`` / ``roofline_s`` are all in seconds.
-* "Roofline" time defaults to ``max(compute, memory)`` (perfect overlap
-  of one resource bound). A soft-roofline p-norm may be supplied via
-  microbenchmark data to model partial overlap.
+Two modes:
+
+* ``"roofline"`` — analytic FLOPs/bytes against the GPU's theoretical
+  peaks (efficiency = 1.0 for every op). Useful as a baseline /
+  ablation; for B200 this over-predicts throughput by ~7x.
+* ``"predictor"`` (default) — same roofline math, but each op's wall
+  time is divided by a per-shape efficiency factor interpolated from
+  the llm-gpu-bench microbench grid. On B200 this tracks measured TPOT
+  within ~15% across N=1..256 at in=6144/out=1024.
+
+Continuous batching: a step's running queue is split into decoders
+(``tokens_this_step==1`` and prefill complete) and prefill chunks
+(everyone else). The vLLM FlashInfer backend launches BatchDecode +
+BatchPrefill kernels back-to-back on one stream, so per-step time is
+the sum of the two — validated to ~1.8% mean in llm-gpu-bench.
+
+SWA prefill (``Sq > sliding_window``) is a documented coverage gap in
+the prefill grid: the sweep enforces ``Sk >= Sq``, so SWA prefill cells
+fall back to the analytic roofline. Affects TTFT on SWA models like
+gpt-oss-20b; TPOT (decode) is unaffected.
 """
 from __future__ import annotations
 
-import random
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator
 
-import numpy as np
+from .predict import Predictor
+from .configs.model_specs import ModelConfig
 
-from ..base import tool
-from .configs.hw_specs import PRESET_GPUS, HardwareConfig
-from .configs.model_specs import PRESET_MODELS, ModelConfig, get_quantization_bytes
-from .report import ReportBuilder
+
+MODES = ("roofline", "predictor")
+# Hardware profile JSONs ship in-tree alongside hw_specs.py / model_specs.py
+# — they characterize the GPU's per-kernel throughput, same flavor of static
+# config as the rest of configs/.
+HW_PROFILES_ROOT = Path(__file__).parent / "configs" / "hw_profiles"
 
 
 # ---------------------------------------------------------------------------
-# Per-operation latency primitives
+# Per-request scheduler state (consumed by serving.run_simulation)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class OperationLatency:
-    """Compute / memory / roofline time for one operation, in seconds."""
-
-    compute_s: float = 0.0
-    memory_s: float = 0.0
-    roofline_s: float = 0.0
-
-    def apply_roofline(self, p_norm: float | None = None) -> None:
-        """Set ``roofline_s`` from the current compute/memory components.
-
-        ``p_norm=None`` → pure max (perfect overlap of the slower resource).
-        ``p_norm=p``    → soft roofline: ``(c^p + m^p) ** (1/p)``.
-        """
-        if p_norm:
-            self.roofline_s = (
-                self.compute_s ** p_norm + self.memory_s ** p_norm
-            ) ** (1.0 / p_norm)
-        else:
-            self.roofline_s = max(self.compute_s, self.memory_s)
-
-    def __add__(self, other: "OperationLatency") -> "OperationLatency":
-        if not isinstance(other, OperationLatency):
-            return NotImplemented
-        return OperationLatency(
-            compute_s=self.compute_s + other.compute_s,
-            memory_s=self.memory_s + other.memory_s,
-            roofline_s=self.roofline_s + other.roofline_s,
-        )
-
-    def __iadd__(self, other: "OperationLatency") -> "OperationLatency":
-        if not isinstance(other, OperationLatency):
-            return NotImplemented
-        self.compute_s += other.compute_s
-        self.memory_s += other.memory_s
-        self.roofline_s += other.roofline_s
-        return self
-
-
-@dataclass
-class OpBreakdown:
-    """Per-op latency breakdown of a single forward pass."""
-
-    qkv_proj: OperationLatency = field(default_factory=OperationLatency)
-    attn_core: OperationLatency = field(default_factory=OperationLatency)
-    o_proj: OperationLatency = field(default_factory=OperationLatency)
-    up_gate_proj: OperationLatency = field(default_factory=OperationLatency)
-    down_proj: OperationLatency = field(default_factory=OperationLatency)
-    lm_head: OperationLatency = field(default_factory=OperationLatency)
-
-    def iter_ops(self) -> Iterator[tuple[str, OperationLatency]]:
-        for f in fields(self):
-            yield f.name, getattr(self, f.name)
-
-    def total(self) -> OperationLatency:
-        agg = OperationLatency()
-        for _, op in self.iter_ops():
-            agg += op
-        return agg
-
-    def accumulate(self, other: "OpBreakdown") -> None:
-        for f in fields(self):
-            setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
-
-    def attention_total(self) -> OperationLatency:
-        return self.qkv_proj + self.attn_core + self.o_proj
-
-    def ffn_total(self) -> OperationLatency:
-        return self.up_gate_proj + self.down_proj
-
 
 @dataclass
 class Request:
@@ -128,424 +78,291 @@ def total_tokens_in_batch(requests: list[Request]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Roofline lookup helpers
+# Per-GPU predictor bundle
 # ---------------------------------------------------------------------------
 
-def achievable_bandwidth(data_size_bytes: float, mem_bw_curve: dict) -> float:
-    """Interpolate the achievable HBM bandwidth (bytes/s) for a given working set.
-
-    ``mem_bw_curve`` maps ``{size_in_MiB (str|int): bandwidth_in_GBs (float)}``;
-    the curve is sampled in log2 space because microbenchmarks grow
-    exponentially and bandwidth scales logarithmically with cache boundaries.
+@dataclass
+class PredictorBundle:
+    """Per-GPU predictor set covering the kernel surface we model.
+    Any field may be ``None`` if its JSON is absent — callers should
+    check before using a specific op. GEMM is bf16/fp16 only.
     """
-    curve = {int(k): v for k, v in mem_bw_curve.items()}
-    data_size_mib = data_size_bytes / (1024 ** 2)
-    points = sorted(curve.items())
-    x_mib = np.array([p[0] for p in points])
-    y_gbs = np.array([p[1] for p in points])
-    estimated_gbs = np.interp(np.log2(data_size_mib), np.log2(x_mib), y_gbs)
-    return estimated_gbs * 1e9
+    gpu_name: str
+    gemm_bf16: Predictor | None
+    attn_bf16: Predictor | None
+    moe_bf16: Predictor | None
+    moe_mxfp4: Predictor | None
+
+    @classmethod
+    def from_gpu(cls, gpu_name: str, root: Path | None = None) -> "PredictorBundle":
+        base = (root or HW_PROFILES_ROOT) / gpu_name
+
+        def _load(stem: str) -> Predictor | None:
+            p = base / f"{stem}.json"
+            return Predictor.from_json(p) if p.exists() else None
+
+        return cls(
+            gpu_name=gpu_name,
+            gemm_bf16=_load("gemm_bf16"),
+            attn_bf16=_load("attn_bf16"),
+            moe_bf16=_load("moe_bf16"),
+            moe_mxfp4=_load("moe_mxfp4"),
+        )
+
+    def gemm(self) -> Predictor:
+        if self.gemm_bf16 is None:
+            raise RuntimeError(f"no gemm_bf16 predictor for {self.gpu_name}")
+        return self.gemm_bf16
+
+    def moe(self, weight_dtype: str) -> Predictor:
+        p = self.moe_mxfp4 if weight_dtype == "mxfp4" else self.moe_bf16
+        if p is None:
+            raise RuntimeError(
+                f"no moe_{weight_dtype} predictor for {self.gpu_name}")
+        return p
 
 
-def op_latency_from_roofline(
-    total_flops: float,
-    compute_dtype: str,
-    total_bytes: float,
-    microbench: dict | None,
-    gpu: HardwareConfig,
-) -> OperationLatency:
-    """Compute the roofline latency for one op given its FLOP and byte counts."""
-    # Today we only model bf16 compute throughput. FP8/FP4 paths exist on
-    # the GPU spec but are gated until benchmark calibration lands.
-    compute_flops = gpu.bf16_flops
-    mem_bandwidth = gpu.mem_bandwidth
-    p_norm = None
-    if microbench:
-        compute_flops = microbench["compute"][compute_dtype] * 1e12
-        mem_bandwidth = achievable_bandwidth(total_bytes, microbench["memory"])
-        p_norm = microbench["p"]
-
-    op = OperationLatency(
-        compute_s=total_flops / compute_flops,
-        memory_s=total_bytes / mem_bandwidth,
-    )
-    op.apply_roofline(p_norm)
-    return op
+_BUNDLES: dict[str, PredictorBundle] = {}
 
 
-# ---------------------------------------------------------------------------
-# Matmul / attention primitives
-# ---------------------------------------------------------------------------
-
-def matmul_latency(
-    n_tokens: int,
-    in_dim: int,
-    out_dim: int,
-    microbench: dict | None,
-    gpu: HardwareConfig,
-    weight_dtype: str,
-    act_dtype: str,
-) -> OperationLatency:
-    """Roofline for a single GEMM of shape (n_tokens, in_dim) @ (in_dim, out_dim)."""
-    weight_byte = get_quantization_bytes(weight_dtype)
-    act_byte = get_quantization_bytes(act_dtype)
-
-    total_flops = 2 * n_tokens * in_dim * out_dim
-    total_bytes = act_byte * (n_tokens * in_dim + n_tokens * out_dim) + weight_byte * in_dim * out_dim
-    return op_latency_from_roofline(total_flops, act_dtype, total_bytes, microbench, gpu)
-
-
-def grouped_matmul_latency(
-    shapes: list[tuple[int, int, int]],
-    microbench: dict | None,
-    gpu: HardwareConfig,
-    weight_dtype: str,
-    act_dtype: str,
-) -> OperationLatency:
-    """Roofline for grouped GEMM (MoE) — sum FLOPs / bytes across non-empty groups."""
-    weight_byte = get_quantization_bytes(weight_dtype)
-    act_byte = get_quantization_bytes(act_dtype)
-
-    total_flops = 0
-    total_bytes = 0
-    for n_tokens, in_dim, out_dim in shapes:
-        if n_tokens == 0:
-            continue
-        total_flops += 2 * n_tokens * in_dim * out_dim
-        total_bytes += act_byte * (n_tokens * in_dim + n_tokens * out_dim) + weight_byte * in_dim * out_dim
-
-    return op_latency_from_roofline(total_flops, act_dtype, total_bytes, microbench, gpu)
-
-
-def attention_core_latency(
-    requests: list[Request],
-    q_proj_dim: int,        # head_dim * n_attention_heads
-    gqa_group: int,         # n_attention_heads / n_kv_heads
-    window: int,            # effective attention window (sliding cap or max_seq_len)
-    microbench: dict | None,
-    gpu: HardwareConfig,
-    act_dtype: str,
-) -> OperationLatency:
-    """Roofline for Q@K^T followed by Score@V, under causal + sliding-window masking."""
-    act_byte = get_quantization_bytes(act_dtype)
-
-    total_flops = 0
-    total_bytes = 0
-
-    for r in requests:
-        n_tokens = r.tokens_this_step
-        kv_prior = r.kv_tokens
-
-        # Causal+SWA dot-product count. Each query at chunk-position i in
-        # [0, n_tokens) attends to min(window, kv_prior + i + 1) keys.
-        # Closed-form so we stay O(1) for very long prefills.
-        if window >= kv_prior + n_tokens:
-            # No sliding cap kicks in: causal triangle over the prior KV.
-            causal_pairs = n_tokens * kv_prior + n_tokens * (n_tokens + 1) // 2
-        elif window <= kv_prior:
-            # Every query is already past the window; each sees exactly W keys.
-            causal_pairs = n_tokens * window
-        else:
-            # Mixed: queries 0..i_star are uncapped (causal), the rest clipped.
-            i_star = window - kv_prior - 1
-            uncapped = (i_star + 1) * kv_prior + (i_star + 1) * (i_star + 2) // 2
-            capped = (n_tokens - i_star - 1) * window
-            causal_pairs = uncapped + capped
-
-        # Q@K^T and Score@V each contribute 2 * causal_pairs * q_proj_dim FLOPs.
-        total_flops += 4 * causal_pairs * q_proj_dim
-
-        # Bytes: union of unique keys/values read across this chunk.
-        kv_unique = n_tokens + window if kv_prior + n_tokens > window else kv_prior + n_tokens
-        bytes_q = n_tokens * q_proj_dim
-        bytes_kv = 2 * kv_unique * q_proj_dim // gqa_group
-        bytes_o = n_tokens * q_proj_dim
-        total_bytes += act_byte * (bytes_q + bytes_kv + bytes_o)
-
-    return op_latency_from_roofline(total_flops, act_dtype, total_bytes, microbench, gpu)
+def get_bundle(gpu_name: str) -> PredictorBundle:
+    """Cached lookup of the per-GPU predictor set."""
+    if gpu_name not in _BUNDLES:
+        _BUNDLES[gpu_name] = PredictorBundle.from_gpu(gpu_name)
+    return _BUNDLES[gpu_name]
 
 
 # ---------------------------------------------------------------------------
-# Layer / full-forward composition
+# Per-step latency breakdown (consumed by serving.summarize_run)
 # ---------------------------------------------------------------------------
 
-def zipfian_routing_probs(n_experts: int, skew: float) -> list[float] | None:
-    """Per-expert probability vector for Zipfian top-k routing.
+@dataclass
+class StepBreakdown:
+    """Per-step latency components in seconds. Replaces the old
+    ``OpBreakdown``: no compute/memory split (the predictor returns a
+    single number per op), so the per-op report becomes just
+    ``Op | Time(ms) | %Step``."""
+    qkv_s: float = 0.0
+    attn_decode_s: float = 0.0
+    attn_prefill_s: float = 0.0
+    o_proj_s: float = 0.0
+    ffn_or_moe_s: float = 0.0
 
-    Expert at rank i (0-indexed) gets weight ``1 / (i+1)**skew``, normalised.
-    Returns ``None`` for ``skew <= 0`` (uniform routing — callers use the
-    faster top-k-without-replacement path).
-    """
-    if skew <= 0.0:
-        return None
-    weights = [1.0 / (i + 1) ** skew for i in range(n_experts)]
-    total = sum(weights)
-    return [w / total for w in weights]
+    @property
+    def total_s(self) -> float:
+        return (self.qkv_s + self.attn_decode_s + self.attn_prefill_s
+                + self.o_proj_s + self.ffn_or_moe_s)
+
+    def iter_ops(self) -> Iterator[tuple[str, float]]:
+        for name in ("qkv", "attn_decode", "attn_prefill", "o_proj", "ffn_or_moe"):
+            yield name, getattr(self, f"{name}_s")
+
+    def accumulate(self, other: "StepBreakdown") -> None:
+        self.qkv_s += other.qkv_s
+        self.attn_decode_s += other.attn_decode_s
+        self.attn_prefill_s += other.attn_prefill_s
+        self.o_proj_s += other.o_proj_s
+        self.ffn_or_moe_s += other.ffn_or_moe_s
 
 
-def transformer_layer_latency(
-    requests: list[Request],
-    layer_idx: int,
-    microbench: dict | None,
-    gpu: HardwareConfig,
+# ---------------------------------------------------------------------------
+# Per-op latencies — mode='roofline' returns the analytic floor,
+# mode='predictor' divides it by the grid's per-shape efficiency.
+# ---------------------------------------------------------------------------
+
+def _gemm_ms(bundle: PredictorBundle, M: int, K: int, N: int,
+             weight_dtype: str, *, roofline_only: bool) -> float:
+    """Dense GEMM latency. Only bf16/fp16 weights are supported."""
+    if weight_dtype not in ("bf16", "fp16"):
+        raise NotImplementedError(f"gemm only supports bf16/fp16; got {weight_dtype}")
+    pred = bundle.gemm()
+    return pred.roofline_ms(M, K, N, "bf16") if roofline_only else pred.latency_ms(M, K, N, "bf16")
+
+
+def _attn_decode_ms(bundle: PredictorBundle, R: int, kv_tokens_total: int,
+                    n_qo: int, n_kv: int, head_dim: int,
+                    *, roofline_only: bool) -> float:
+    if bundle.attn_bf16 is None:
+        raise RuntimeError(f"no attn_bf16 predictor for {bundle.gpu_name}")
+    Sk = kv_tokens_total // max(R, 1)
+    if roofline_only:
+        return bundle.attn_bf16.attn_roofline_ms(R=R, Sq=1, Sk=Sk,
+                                                  H=n_qo, H_kv=n_kv, D=head_dim)
+    return bundle.attn_bf16.attn_latency_ms(R=R, Sq=1, Sk=Sk,
+                                             H=n_qo, H_kv=n_kv, D=head_dim)
+
+
+def _attn_prefill_ms(bundle: PredictorBundle, R: int, Sq: int, Sk: int,
+                     n_qo: int, n_kv: int, head_dim: int,
+                     sliding_window: int | None = None,
+                     *, roofline_only: bool) -> float:
+    if bundle.attn_bf16 is None:
+        raise RuntimeError(f"no attn_bf16 predictor for {bundle.gpu_name}")
+    pred = bundle.attn_bf16
+    # SWA prefill (Sq > window) is a grid coverage gap: always falls back
+    # to the roofline regardless of mode.
+    if sliding_window is not None and Sq > sliding_window:
+        return pred.attn_roofline_ms(R=R, Sq=Sq, Sk=sliding_window,
+                                      H=n_qo, H_kv=n_kv, D=head_dim)
+    if roofline_only:
+        return pred.attn_roofline_ms(R=R, Sq=Sq, Sk=Sk,
+                                      H=n_qo, H_kv=n_kv, D=head_dim)
+    return pred.attn_latency_ms(R=R, Sq=Sq, Sk=Sk,
+                                 H=n_qo, H_kv=n_kv, D=head_dim)
+
+
+def _moe_ms(bundle: PredictorBundle, M: int, n_experts: int, top_k: int,
+            hidden: int, intermediate: int, weight_dtype: str,
+            *, roofline_only: bool) -> float:
+    pred = bundle.moe(weight_dtype)
+    if roofline_only:
+        return pred.moe_roofline_ms(M, n_experts, top_k, hidden, intermediate)
+    return pred.moe_latency_ms(M, n_experts, top_k, hidden, intermediate)
+
+
+# ---------------------------------------------------------------------------
+# Layer + forward-pass composition
+# ---------------------------------------------------------------------------
+
+def _transformer_layer_s(
+    bundle: PredictorBundle,
     model: ModelConfig,
-    expert_cache: dict | None = None,
-    rng: random.Random | None = None,
-    routing_probs: list[float] | None = None,
-) -> OpBreakdown:
-    """Roofline for one transformer layer applied to ``requests``."""
-    breakdown = OpBreakdown()
-    n_tokens = total_tokens_in_batch(requests)
+    layer_idx: int,
+    *,
+    decode_tokens: list[int],
+    prefill_chunks: list[tuple[int, int]],
+    roofline_only: bool,
+) -> StepBreakdown:
+    """One transformer layer's latency for one forward pass. Splits the
+    batch into decode (Sq=1) and prefill (Sq>1) buckets per FlashInfer's
+    additive composition."""
+    hidden = model.hidden_size
+    n_qo = model.n_attention_heads
+    n_kv = model.n_kv_heads
+    head_dim = model.head_dim
+    q_proj_dim = head_dim * n_qo
+    qkv_out = head_dim * (n_qo + 2 * n_kv)
+    swa = model.sliding_window if model.layer_uses_sliding_window(layer_idx) else None
 
-    # ----- GQA attention -----
-    gqa_group = model.n_attention_heads // model.n_kv_heads
+    n_decode = len(decode_tokens)
+    n_prefill = sum(sq for sq, _ in prefill_chunks)
+    M = n_decode + n_prefill
+    if M == 0:
+        return StepBreakdown()
 
-    breakdown.qkv_proj = matmul_latency(
-        n_tokens,
-        model.hidden_size,
-        model.head_dim * (model.n_attention_heads + 2 * model.n_kv_heads),
-        microbench, gpu,
-        model.attn_weight_dtype, model.activation_dtype,
-    )
+    t_qkv_ms = _gemm_ms(bundle, M, hidden, qkv_out, model.attn_weight_dtype,
+                        roofline_only=roofline_only)
+    t_o_ms = _gemm_ms(bundle, M, q_proj_dim, hidden, model.attn_weight_dtype,
+                      roofline_only=roofline_only)
 
-    window = model.sliding_window if model.layer_uses_sliding_window(layer_idx) else model.max_seq_len
-    breakdown.attn_core = attention_core_latency(
-        requests,
-        q_proj_dim=model.head_dim * model.n_attention_heads,
-        gqa_group=gqa_group,
-        window=window,
-        microbench=microbench,
-        gpu=gpu,
-        act_dtype=model.activation_dtype,
-    )
+    t_dec_ms = 0.0
+    if n_decode > 0:
+        kv_capped = [min(k, swa) if swa is not None else k for k in decode_tokens]
+        kv_total = sum(kv_capped)
+        t_dec_ms = _attn_decode_ms(bundle, n_decode, kv_total, n_qo, n_kv, head_dim,
+                                    roofline_only=roofline_only)
 
-    breakdown.o_proj = matmul_latency(
-        n_tokens,
-        model.head_dim * model.n_attention_heads,
-        model.hidden_size,
-        microbench, gpu,
-        model.attn_weight_dtype, model.activation_dtype,
-    )
+    t_pre_ms = 0.0
+    for sq, sk in prefill_chunks:
+        sk_capped = min(sk, swa) if swa is not None else sk
+        t_pre_ms += _attn_prefill_ms(bundle, 1, sq, sk_capped, n_qo, n_kv, head_dim,
+                                      sliding_window=swa,
+                                      roofline_only=roofline_only)
 
-    # ----- FFN: dense or MoE -----
-    if model.n_experts <= 1:
-        # Dense SwiGLU: gate+up are typically fused into a 2*intermediate-wide GEMM.
-        breakdown.up_gate_proj = matmul_latency(
-            n_tokens, model.hidden_size, model.intermediate_size * 2,
-            microbench, gpu, model.ffn_weight_dtype, model.activation_dtype,
-        )
-        breakdown.down_proj = matmul_latency(
-            n_tokens, model.intermediate_size, model.hidden_size,
-            microbench, gpu, model.ffn_weight_dtype, model.activation_dtype,
-        )
-    elif expert_cache is not None and n_tokens in expert_cache:
-        cached = expert_cache[n_tokens]
-        breakdown.up_gate_proj = cached["up_gate"]
-        breakdown.down_proj = cached["down"]
+    if model.n_experts > 1:
+        t_ffn_ms = _moe_ms(bundle, M, model.n_experts, model.top_k,
+                            hidden, model.moe_intermediate_size,
+                            weight_dtype=model.ffn_weight_dtype,
+                            roofline_only=roofline_only)
     else:
-        # MoE: sample per-expert token loads, then grouped GEMM. Uniform
-        # (routing_probs=None) uses true top-k-without-replacement;
-        # Zipfian uses a weighted multinomial approximation.
-        token_counts = _sample_expert_loads(
-            rng or random,
-            n_tokens,
-            model.n_experts,
-            model.top_k,
-            routing_probs,
-        )
+        t_up = _gemm_ms(bundle, M, hidden, 2 * model.intermediate_size,
+                        model.ffn_weight_dtype, roofline_only=roofline_only)
+        t_down = _gemm_ms(bundle, M, model.intermediate_size, hidden,
+                          model.ffn_weight_dtype, roofline_only=roofline_only)
+        t_ffn_ms = t_up + t_down
 
-        up_gate_shapes = [
-            (token_counts[e], model.hidden_size, model.moe_intermediate_size * 2)
-            for e in range(model.n_experts)
-        ]
-        breakdown.up_gate_proj = grouped_matmul_latency(
-            up_gate_shapes, microbench, gpu,
-            model.ffn_weight_dtype, model.activation_dtype,
-        )
-        down_shapes = [
-            (token_counts[e], model.moe_intermediate_size, model.hidden_size)
-            for e in range(model.n_experts)
-        ]
-        breakdown.down_proj = grouped_matmul_latency(
-            down_shapes, microbench, gpu,
-            model.ffn_weight_dtype, model.activation_dtype,
-        )
-        if expert_cache is not None:
-            expert_cache[n_tokens] = {
-                "up_gate": breakdown.up_gate_proj,
-                "down": breakdown.down_proj,
-            }
-
-    return breakdown
-
-
-def _sample_expert_loads(
-    rng,
-    n_tokens: int,
-    n_experts: int,
-    top_k: int,
-    probs: list[float] | None,
-) -> list[int]:
-    """How many tokens each expert receives.
-
-    * ``probs=None``: uniform top-k routing without replacement (each token
-      picks ``top_k`` distinct experts uniformly at random).
-    * ``probs`` provided: weighted multinomial approximation — ``n_tokens *
-      top_k`` independent draws weighted by ``probs``. Statistically very
-      close to weighted-without-replacement when ``top_k << n_experts`` and
-      considerably faster.
-    """
-    counts = [0] * n_experts
-    if probs is None:
-        expert_ids = list(range(n_experts))
-        for _ in range(n_tokens):
-            for e in rng.sample(expert_ids, top_k):
-                counts[e] += 1
-    else:
-        for e in rng.choices(range(n_experts), weights=probs, k=n_tokens * top_k):
-            counts[e] += 1
-    return counts
+    return StepBreakdown(
+        qkv_s=t_qkv_ms / 1000.0,
+        attn_decode_s=t_dec_ms / 1000.0,
+        attn_prefill_s=t_pre_ms / 1000.0,
+        o_proj_s=t_o_ms / 1000.0,
+        ffn_or_moe_s=t_ffn_ms / 1000.0,
+    )
 
 
 def forward_pass_latency(
-    requests: list[Request],
-    microbench: dict | None,
-    gpu: HardwareConfig,
+    running_queue: list[Request],
+    gpu_name: str,
     model: ModelConfig,
-    expert_cache: dict | None = None,
-    rng: random.Random | None = None,
-) -> OpBreakdown:
-    """Roofline for a full forward pass (all transformer layers + lm_head)."""
-    total = OpBreakdown()
-    # Routing probs are shape-only (same shape across layers under Zipfian),
-    # so compute once per forward pass and thread through.
-    routing_probs = zipfian_routing_probs(model.n_experts, model.routing_skew)
-    for layer_idx in range(model.n_layers):
-        total.accumulate(
-            transformer_layer_latency(
-                requests, layer_idx, microbench, gpu, model,
-                expert_cache=expert_cache,
-                rng=rng,
-                routing_probs=routing_probs,
-            )
-        )
+    *,
+    mode: str = "predictor",
+) -> StepBreakdown:
+    """Compute one forward pass's per-op latency.
 
-    # lm_head runs on one token per request (the new query position).
-    total.lm_head = matmul_latency(
-        len(requests),
-        model.hidden_size,
-        model.vocab_size,
-        microbench, gpu,
-        model.model_orig_dtype, model.activation_dtype,
-    )
+    Extracts the decode / prefill split from the running queue's
+    ``tokens_this_step`` and ``kv_tokens`` fields (set by the scheduler),
+    then sums per-layer contributions. ``mode`` controls whether
+    efficiency factors come from the microbench grid (``"predictor"``)
+    or are forced to 1.0 (``"roofline"``).
+    """
+    if mode not in MODES:
+        raise ValueError(f"mode={mode!r} must be one of {MODES}")
+    bundle = get_bundle(gpu_name)
+    roofline_only = (mode == "roofline")
+
+    decode_kvs: list[int] = []
+    prefill_chunks: list[tuple[int, int]] = []
+    for r in running_queue:
+        if r.tokens_this_step == 0:
+            continue
+        if r.tokens_this_step == 1 and r.kv_tokens >= r.prompt_tokens:
+            decode_kvs.append(r.kv_tokens)
+        else:
+            sq = r.tokens_this_step
+            sk = r.kv_tokens + sq
+            prefill_chunks.append((sq, sk))
+
+    total = StepBreakdown()
+    for layer_idx in range(model.n_layers):
+        layer = _transformer_layer_s(
+            bundle, model, layer_idx,
+            decode_tokens=decode_kvs, prefill_chunks=prefill_chunks,
+            roofline_only=roofline_only,
+        )
+        total.accumulate(layer)
     return total
 
 
 # ---------------------------------------------------------------------------
-# Report rendering
+# Lower-level entry points (kept for tests / _sim_v2_* shims)
 # ---------------------------------------------------------------------------
 
-def _bottleneck_label(op: OperationLatency) -> str:
-    if op.compute_s > op.memory_s * 1.05:
-        return "COMPUTE"
-    if op.memory_s > op.compute_s * 1.05:
-        return "MEMORY"
-    return "BALANCED"
+def forward_pass_ms(
+    bundle: PredictorBundle,
+    model: ModelConfig,
+    *,
+    decode_tokens: list[int],
+    prefill_chunks: list[tuple[int, int]] = (),
+    roofline_only: bool = False,
+) -> tuple[float, dict[str, float]]:
+    """Direct entry: pass decode/prefill batch composition explicitly.
 
-
-def _render_forward_report(
-    model_name: str,
-    gpu_name: str,
-    batch_size: int,
-    input_tokens: int,
-    kv_cache_len: int,
-    breakdown: OpBreakdown,
-) -> str:
-    rb = ReportBuilder(width=76)
-    rb.banner("FORWARD-PASS LATENCY BREAKDOWN").line()
-    rb.heading("Configuration")
-    rb.kv("Model", model_name)
-    rb.kv("GPU", gpu_name)
-    rb.kv("Batch size", f"{batch_size} request(s)")
-    rb.kv("Tokens / request", f"{input_tokens} (this forward pass)")
-    rb.kv("KV cache / request", f"{kv_cache_len} tokens")
-    rb.line()
-    rb.heading("Per-Operation Latency")
-
-    rows = []
-    for name, op in breakdown.iter_ops():
-        rows.append([
-            name,
-            f"{op.roofline_s * 1000:.3f}",
-            f"{op.compute_s * 1000:.3f}",
-            f"{op.memory_s * 1000:.3f}",
-            _bottleneck_label(op),
-        ])
-    total = breakdown.total()
-    rows.append([
-        "TOTAL",
-        f"{total.roofline_s * 1000:.3f}",
-        f"{total.compute_s * 1000:.3f}",
-        f"{total.memory_s * 1000:.3f}",
-        _bottleneck_label(total),
-    ])
-    rb.table(
-        headers=["Op", "Roofline(ms)", "Compute(ms)", "Memory(ms)", "Bottleneck"],
-        rows=rows,
-        col_widths=[14, 12, 11, 10, 10],
-    )
-    rb.rule("=")
-    return rb.build()
-
-
-# ---------------------------------------------------------------------------
-# Tool: estimate_latency
-# ---------------------------------------------------------------------------
-
-@tool(
-    "Estimate latency of a single transformer forward pass for a "
-    "homogeneous batch. Returns a per-operation breakdown (compute vs. "
-    "memory bound). For decode, set input_tokens=1 and kv_cache_len to "
-    "the current context length; for prefill, set input_tokens to the "
-    "prompt length and kv_cache_len=0.",
-    model="Preset model name (must exist in PRESET_MODELS).",
-    gpu="Preset GPU name (must exist in PRESET_GPUS).",
-    batch_size="Number of requests in the batch.",
-    input_tokens="Tokens per request being processed this forward pass "
-                 "(1 = decode step, N = prefill chunk of N).",
-    kv_cache_len="Existing KV cache length per request before this pass.",
-)
-def estimate_latency(
-    model: str,
-    gpu: str,
-    batch_size: int,
-    input_tokens: int,
-    kv_cache_len: int,
-) -> str:
-    if model not in PRESET_MODELS:
-        return f"ERROR: unknown model {model!r}. Available: {', '.join(sorted(PRESET_MODELS))}"
-    if gpu not in PRESET_GPUS:
-        return f"ERROR: unknown gpu {gpu!r}. Available: {', '.join(sorted(PRESET_GPUS))}"
-
-    model_spec = PRESET_MODELS[model]
-    gpu_spec = PRESET_GPUS[gpu]
-    requests = [
-        Request(
-            id=i,
-            arrival_s=0.0,
-            prompt_tokens=input_tokens + kv_cache_len,
-            gen_tokens=1,
-            kv_tokens=kv_cache_len,
-            tokens_this_step=input_tokens,
+    Returns (total_ms, breakdown_dict_in_ms_per_op). Used by the standalone
+    sims in ``_sim_v2_*``. Production callers (serving.py) go through
+    ``forward_pass_latency`` instead.
+    """
+    total = StepBreakdown()
+    for layer_idx in range(model.n_layers):
+        layer = _transformer_layer_s(
+            bundle, model, layer_idx,
+            decode_tokens=list(decode_tokens), prefill_chunks=list(prefill_chunks),
+            roofline_only=roofline_only,
         )
-        for i in range(batch_size)
-    ]
-    breakdown = forward_pass_latency(requests, None, gpu_spec, model_spec)
-    return _render_forward_report(
-        model_name=model,
-        gpu_name=gpu,
-        batch_size=batch_size,
-        input_tokens=input_tokens,
-        kv_cache_len=kv_cache_len,
-        breakdown=breakdown,
-    )
+        total.accumulate(layer)
+    return total.total_s * 1000.0, {
+        "qkv": total.qkv_s * 1000.0,
+        "attn_decode": total.attn_decode_s * 1000.0,
+        "attn_prefill": total.attn_prefill_s * 1000.0,
+        "o_proj": total.o_proj_s * 1000.0,
+        "ffn_or_moe": total.ffn_or_moe_s * 1000.0,
+    }

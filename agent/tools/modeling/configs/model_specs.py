@@ -81,14 +81,6 @@ class ModelConfig:
     #   "always" — always reasons (e.g. DeepSeek-R1 style)
     reasoning_mode: str = "none"
 
-    # MoE routing skew (Zipfian exponent). 0 = uniform routing (every expert
-    # equally likely — the current default). Larger values concentrate tokens
-    # on a small set of "hot" experts: expert at rank i gets probability
-    # ∝ 1/(i+1)^skew. Typical realistic values:
-    #   0.3-0.5 → mild skew, post-balancing-loss behaviour
-    #   1.0     → classic Zipf, strongly skewed
-    routing_skew: float = 0.5
-
     def layer_uses_sliding_window(self, layer_idx: int) -> bool:
         """True if the given layer applies sliding-window attention.
 

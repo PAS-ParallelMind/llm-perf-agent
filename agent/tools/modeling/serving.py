@@ -19,7 +19,6 @@ deeper exploration (microbenchmark file support, custom seed, etc.).
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import random
 import statistics
@@ -29,9 +28,9 @@ from ..base import tool
 from .configs.hw_specs import PRESET_GPUS
 from .configs.model_specs import PRESET_MODELS, ModelConfig, get_quantization_bytes
 from .latency import (
-    OperationLatency,
-    OpBreakdown,
+    MODES,
     Request,
+    StepBreakdown,
     forward_pass_latency,
     total_tokens_in_batch,
 )
@@ -155,7 +154,7 @@ class ContinuousBatchingScheduler:
 class SimulationResult:
     """Everything the report needs from one simulation run."""
     finished: list[Request]
-    sim_breakdown: OpBreakdown
+    sim_breakdown: StepBreakdown
     n_forward_passes: int
     total_batch_tokens: int
     wall_time_s: float
@@ -238,12 +237,11 @@ def run_simulation(
     max_concurrent_requests: int = 1024,
     n_gpus: int = 1,
     jitter: float = 0.1,
-    microbench: dict | None = None,
     seed: int = 0,
     progress_cb=None,
-    efficiency_factor: float = 1.0,
+    latency_source: str = "predictor",
 ) -> SimulationResult:
-    """Run the simulation. Wall clock advances by each step's roofline time.
+    """Run the simulation. Wall clock advances by each step's modeled time.
 
     Two arrival modes (auto-detected from ``request_rate``):
 
@@ -255,15 +253,19 @@ def run_simulation(
       request *as each one finishes* — steady-state in-flight = N. Use for
       kernel-efficiency calibration where you want a controlled batch size.
 
-    ``efficiency_factor`` scales per-forward-pass wall time by
-    ``1 / efficiency_factor`` (default 1.0 = pure roofline). Use the
-    closed-loop-derived efficiency from the measurement store to project
-    real-world performance: theory-with-implementation-cost-baked-in.
+    Two latency sources are supported via ``latency_source``:
+
+    * ``"predictor"`` (default) — per-shape latency from the llm-gpu-bench
+      microbench grid (under ``measurements/microbenchmarks/<gpu>/``).
+      Reproduces measured TPOT within ~15% on B200 (vs ~7× error for
+      pure roofline).
+    * ``"roofline"`` — analytic FLOPs/bytes against the GPU's theoretical
+      peaks (efficiency = 1.0 for every op). Baseline / ablation.
     """
+    if latency_source not in MODES:
+        raise ValueError(
+            f"latency_source={latency_source!r} must be one of {MODES}")
     rng = random.Random(seed)
-    # Separate RNG for MoE routing so toggling routing_skew doesn't shift
-    # arrival times / request length jitter (which would change the workload).
-    routing_rng = random.Random(seed + 1)
     model = PRESET_MODELS[model_name]
     gpu = PRESET_GPUS[gpu_name]
     kv_budget = compute_kv_budget_bytes(model, gpu, n_gpus)
@@ -297,8 +299,7 @@ def run_simulation(
     running_queue: list[Request] = []
     finished: list[Request] = []
 
-    sim_breakdown = OpBreakdown()
-    expert_cache: dict = {}     # scoped to this simulation
+    sim_breakdown = StepBreakdown()
     t_now = 0.0
     n_forward_passes = 0
     total_batch_tokens = 0
@@ -349,15 +350,12 @@ def run_simulation(
             if r.start_s == 0.0 and r.kv_tokens == 0:
                 r.start_s = t_now
 
-        # Forward pass.
+        # Forward pass — single path, latency_source picks the mode.
         step_breakdown = forward_pass_latency(
-            running_queue, microbench, gpu, model, expert_cache, rng=routing_rng,
+            running_queue, gpu_name, model, mode=latency_source,
         )
         sim_breakdown.accumulate(step_breakdown)
-        step_duration = step_breakdown.total().roofline_s
-        # Project implementation overhead: theory-times-1/efficiency = measured.
-        if 0.0 < efficiency_factor < 1.0:
-            step_duration /= efficiency_factor
+        step_duration = step_breakdown.total_s
         n_forward_passes += 1
         total_batch_tokens += total_tokens_in_batch(running_queue)
 
@@ -479,18 +477,17 @@ class RunSummary:
     # Per-forward-pass averages
     n_forward_passes: int
     avg_batch_tokens: float
-    avg_op_per_step: OpBreakdown
+    avg_op_per_step: StepBreakdown
 
 
-def _avg_op(op: OperationLatency, n: int) -> OperationLatency:
-    return OperationLatency(op.compute_s / n, op.memory_s / n, op.roofline_s / n)
-
-
-def _avg_breakdown(breakdown: OpBreakdown, n: int) -> OpBreakdown:
-    avg = OpBreakdown()
-    for name, op in breakdown.iter_ops():
-        setattr(avg, name, _avg_op(op, n))
-    return avg
+def _avg_breakdown(breakdown: StepBreakdown, n: int) -> StepBreakdown:
+    return StepBreakdown(
+        qkv_s=breakdown.qkv_s / n,
+        attn_decode_s=breakdown.attn_decode_s / n,
+        attn_prefill_s=breakdown.attn_prefill_s / n,
+        o_proj_s=breakdown.o_proj_s / n,
+        ffn_or_moe_s=breakdown.ffn_or_moe_s / n,
+    )
 
 
 def _saturation_reason(result: SimulationResult, served_rate: float) -> tuple[bool, str]:
@@ -560,14 +557,6 @@ def summarize_run(result: SimulationResult) -> RunSummary | None:
     )
 
 
-def _bottleneck_label(op: OperationLatency) -> str:
-    if op.compute_s > op.memory_s:
-        return "COMPUTE"
-    if op.memory_s > op.compute_s:
-        return "MEMORY"
-    return "BALANCED"
-
-
 def _fmt_pct(p: Percentiles, suffix: str = "ms") -> str:
     return (
         f"mean {p.mean:.2f} {suffix}  "
@@ -617,35 +606,29 @@ def render_report(summary: RunSummary | None) -> str:
         rb.kv("Admission stalls (KV full)", f"{summary.admitted_kv_blocked} scheduler steps", KEY_WIDTH)
 
     rb.section("PER-FORWARD-PASS BREAKDOWN")
-    step_total = summary.avg_op_per_step.total()
+    step_total_s = summary.avg_op_per_step.total_s
     rb.line(f"Forward passes simulated     : {summary.n_forward_passes:,} steps")
     rb.line(f"Avg batch size (tokens/pass) : {summary.avg_batch_tokens:.1f} tokens")
-    rb.line(f"Avg latency per forward pass : {step_total.roofline_s * 1000:.3f} ms")
+    rb.line(f"Avg latency per forward pass : {step_total_s * 1000:.3f} ms")
     rb.line()
 
     pct = lambda v, t: (v / t * 100) if t > 0 else 0.0  # noqa: E731
     rows: list[list[str]] = []
-    for name, op in summary.avg_op_per_step.iter_ops():
+    for name, op_s in summary.avg_op_per_step.iter_ops():
         rows.append([
             name,
-            f"{op.roofline_s * 1000:.3f}",
-            f"{pct(op.roofline_s, step_total.roofline_s):.2f}%",
-            f"{op.compute_s * 1000:.3f}",
-            f"{op.memory_s * 1000:.3f}",
-            _bottleneck_label(op),
+            f"{op_s * 1000:.3f}",
+            f"{pct(op_s, step_total_s):.2f}%",
         ])
     rows.append([
         "TOTAL",
-        f"{step_total.roofline_s * 1000:.3f}",
+        f"{step_total_s * 1000:.3f}",
         "100.00%",
-        f"{step_total.compute_s * 1000:.3f}",
-        f"{step_total.memory_s * 1000:.3f}",
-        _bottleneck_label(step_total),
     ])
     rb.table(
-        headers=["Op", "Roofline(ms)", "% Step", "Compute(ms)", "Memory(ms)", "Bottleneck"],
+        headers=["Op", "Time(ms)", "% Step"],
         rows=rows,
-        col_widths=[14, 12, 8, 11, 10, 10],
+        col_widths=[14, 12, 10],
     )
 
     rb.rule("=")
@@ -666,10 +649,7 @@ def render_report(summary: RunSummary | None) -> str:
     "finishes, so steady-state in-flight = `max_concurrent_requests`). "
     "Open-loop is for deployment-capacity sizing; closed-loop is for kernel-"
     "efficiency calibration at a controlled batch. The workload knobs all "
-    "come from a WorkloadProfile YAML; pass the hardware as `gpu`. The "
-    "optional `efficiency_factor` scales per-forward-pass wall time by "
-    "`1 / efficiency_factor` — feed in the closed-loop-derived efficiency "
-    "from `lookup_measurements` to project realistic performance.",
+    "come from a WorkloadProfile YAML; pass the hardware as `gpu`.",
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain at "
                   "least `model`, `request_rate` (finite or `.inf`), "
@@ -679,15 +659,18 @@ def render_report(summary: RunSummary | None) -> str:
                   "in closed-loop (it sets the steady-state in-flight N).",
     gpu="Preset GPU name (must exist in PRESET_GPUS).",
     n_gpus="Number of GPUs sharing the model (for KV-cache budget, default 1).",
-    efficiency_factor="Per-pass kernel efficiency (theory/measured, in (0, 1]; "
-                      "default 1.0 = pure roofline). Set to a measured "
-                      "efficiency to project actual performance.",
+    latency_source="How to model per-forward-pass time. 'predictor' (default) "
+                   "uses the llm-gpu-bench microbench grid "
+                   "(needs measurements/microbenchmarks/<gpu>/*.json). "
+                   "'roofline' uses analytic FLOPs/bytes × the GPU's "
+                   "theoretical peaks (efficiency=1.0 for every op) — "
+                   "baseline / ablation.",
 )
 def simulate_serving(
     workload_file: str,
     gpu: str,
     n_gpus: int = 1,
-    efficiency_factor: float = 1.0,
+    latency_source: str = "predictor",
 ) -> str:
     try:
         from ...workspace import resolve
@@ -715,8 +698,8 @@ def simulate_serving(
         return f"ERROR: request_rate={request_rate!r} is not numeric (use a positive float, or `.inf` for closed-loop)."
     if not (rate_f > 0):
         return "ERROR: request_rate must be > 0 (or `.inf` for closed-loop)."
-    if not (0.0 < efficiency_factor <= 1.0):
-        return f"ERROR: efficiency_factor={efficiency_factor!r} must be in (0, 1]."
+    if latency_source not in MODES:
+        return f"ERROR: latency_source={latency_source!r} must be one of {MODES}."
 
     result = run_simulation(
         model_name=model,
@@ -729,7 +712,7 @@ def simulate_serving(
         max_concurrent_requests=max_concurrent_requests,
         n_gpus=n_gpus,
         jitter=range_ratio,
-        efficiency_factor=efficiency_factor,
+        latency_source=latency_source,
     )
     return render_report(summarize_run(result))
 
@@ -755,13 +738,12 @@ def _parse_args():
                         help="Preset GPU name (PRESET_GPUS key).")
     parser.add_argument("--n-gpus", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--bench-file", type=str, default=None,
-                        help="Microbenchmark results JSON (optional).")
-    parser.add_argument("--efficiency-factor", type=float, default=1.0,
-                        help="Per-pass kernel efficiency (theory/measured, "
-                             "in (0, 1]; default 1.0 = pure roofline). Use "
-                             "with the closed-loop-derived efficiency to "
-                             "project actual performance.")
+    parser.add_argument("--latency-source", type=str, default="predictor",
+                        choices=list(MODES),
+                        help="Per-pass latency source. 'predictor' (default) "
+                             "uses the llm-gpu-bench microbench grid. "
+                             "'roofline' uses analytic peaks with all "
+                             "efficiency factors = 1 (baseline / ablation).")
     return parser.parse_args()
 
 
@@ -769,10 +751,6 @@ if __name__ == "__main__":
     import yaml as _yaml
     from pathlib import Path as _Path
     args = _parse_args()
-    microbench = None
-    if args.bench_file:
-        with open(args.bench_file) as f:
-            microbench = json.load(f)
 
     wf = _yaml.safe_load(_Path(args.workload_file).read_text()) or {}
     print(f"running workload simulation from {args.workload_file}...")
@@ -787,8 +765,7 @@ if __name__ == "__main__":
         max_concurrent_requests=wf.get("max_concurrent_requests", 1024),
         n_gpus=args.n_gpus,
         jitter=float(wf.get("range_ratio", 0.0)),
-        microbench=microbench,
         seed=args.seed,
-        efficiency_factor=args.efficiency_factor,
+        latency_source=args.latency_source,
     )
     print(render_report(summarize_run(result)))
