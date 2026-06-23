@@ -21,6 +21,8 @@ tables.
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from ..base import tool
@@ -34,6 +36,10 @@ from ..modeling.serving import run_simulation, summarize_run
 
 _VRAM_HEADROOM = 0.90   # leave 10% of HBM for activations / framework overhead
 
+# Worker pool for the per-candidate simulations. Leave one core free for
+# the parent / interactive use.
+_N_WORKERS = max(1, (os.cpu_count() or 4) - 1)
+
 
 @dataclass
 class _CandidateRow:
@@ -43,20 +49,17 @@ class _CandidateRow:
     fits_weights: bool             # weights fit on a replica (tp * per-gpu VRAM)
     weights_gib: float
     vram_cap_gib: float            # per-replica usable VRAM (tp * mem * headroom)
-    # Simulator-derived KV stats (None if the simulator never ran).
+    # Simulator-derived stats (None if the simulator never ran).
     kv_budget_gib: float | None
     peak_kv_use_gib: float | None
-    kv_bound: bool                 # simulator saturated for KV reasons
+    served_rate: float | None      # req/s actually completed
     request_latency_s: float | None
     ttft_ms: float | None
     tpot_ms: float | None
-    # output_throughput_tps is kept for the $/Mtok computation but not
-    # surfaced in the table (at sub-saturation it just mirrors offered load).
-    output_throughput_tps: float | None
+    output_throughput_tps: float | None    # served_rate * output_len
     cost_per_hour: float
     cost_per_mtok: float | None    # USD per 1M output tokens
     meets_target: bool | None
-    saturated: bool = False        # diverging latency; excluded from frontier
     note: str = ""
 
     @property
@@ -113,7 +116,8 @@ def _evaluate(
         return _CandidateRow(
             gpu=gpu_key, tp=parallel.tp, dp=parallel.dp, fits_weights=False,
             weights_gib=weights_g, vram_cap_gib=vram_cap,
-            kv_budget_gib=None, peak_kv_use_gib=None, kv_bound=False,
+            kv_budget_gib=None, peak_kv_use_gib=None,
+            served_rate=None,
             request_latency_s=None, ttft_ms=None, tpot_ms=None,
             output_throughput_tps=None,
             cost_per_hour=deployment_cost_per_hour, cost_per_mtok=None,
@@ -137,7 +141,8 @@ def _evaluate(
         return _CandidateRow(
             gpu=gpu_key, tp=parallel.tp, dp=parallel.dp, fits_weights=True,
             weights_gib=weights_g, vram_cap_gib=vram_cap,
-            kv_budget_gib=None, peak_kv_use_gib=None, kv_bound=False,
+            kv_budget_gib=None, peak_kv_use_gib=None,
+            served_rate=None,
             request_latency_s=None, ttft_ms=None, tpot_ms=None,
             output_throughput_tps=None,
             cost_per_hour=deployment_cost_per_hour, cost_per_mtok=None,
@@ -145,10 +150,6 @@ def _evaluate(
             note="simulation produced no usable result",
         )
 
-    # KV-bound saturation = the rate exhausted the KV budget. Treat this
-    # as "doesn't fit at this rate" in the report — the candidate can't
-    # admit enough concurrent requests to sustain the offered load.
-    kv_bound = s.saturated and "KV-cache" in s.saturation_reason
     output_throughput_tps = s.served_rate * output_len
     request_latency_s = s.e2e_s.mean
     cost_per_mtok = (
@@ -156,13 +157,12 @@ def _evaluate(
         if deployment_cost_per_hour > 0 and output_throughput_tps > 0 else None
     )
     meets = (request_latency_s <= target_latency) if target_latency is not None else None
-    note = f"saturated: {s.saturation_reason}" if s.saturated else ""
     return _CandidateRow(
         gpu=gpu_key, tp=parallel.tp, dp=parallel.dp, fits_weights=True,
         weights_gib=weights_g, vram_cap_gib=vram_cap,
         kv_budget_gib=s.kv_budget_gib,
         peak_kv_use_gib=s.peak_kv_use_gib,
-        kv_bound=kv_bound,
+        served_rate=s.served_rate,
         request_latency_s=request_latency_s,
         ttft_ms=s.ttft_ms.mean,
         tpot_ms=s.tpot_ms.mean,
@@ -170,8 +170,7 @@ def _evaluate(
         cost_per_hour=deployment_cost_per_hour,
         cost_per_mtok=cost_per_mtok,
         meets_target=meets,
-        saturated=s.saturated,
-        note=note,
+        note="",
     )
 
 
@@ -187,8 +186,7 @@ def _pareto_mark(rows: list[_CandidateRow]) -> set[tuple[str, int, int]]:
     no worse on both axes AND strictly better on at least one.
     """
     eligible = [r for r in rows
-                if r.is_evaluated and r.cost_per_mtok is not None
-                and not r.saturated]
+                if r.is_evaluated and r.cost_per_mtok is not None]
     on_pareto: set[tuple[str, int, int]] = set()
     for r in eligible:
         dominated = False
@@ -217,21 +215,22 @@ def _format_table(
     rb = ReportBuilder(width=118)
     rb.banner(f"HARDWARE PARETO SWEEP — {latency_source.upper()} MODE")
     rb.line()
-    headers = ["gpu", "tp", "dp", "n_gpu", "fits?", "KV peak", "req lat (s)",
-               "ttft (ms)", "tpot (ms)", "$/1M tok", "meets target", "pareto"]
+    headers = ["gpu", "tp", "dp", "n_gpu", "fits?", "KV peak", "served (r/s)",
+               "req lat (s)", "ttft (ms)", "tpot (ms)", "$/1M tok",
+               "meets target", "pareto"]
     table_rows = []
     for r in rows:
         n_gpu = r.tp * r.dp
         if not r.fits_weights:
             table_rows.append([r.gpu, str(r.tp), str(r.dp), str(n_gpu),
-                               "no", "—", "—", "—", "—", "—", "—", "—"])
+                               "no", "—", "—", "—", "—", "—", "—", "—", "—"])
             continue
         if not r.is_evaluated:
             table_rows.append([r.gpu, str(r.tp), str(r.dp), str(n_gpu),
-                               "yes", "—", "—", "—", "—", "—", "—", "—"])
+                               "yes", "—", "—", "—", "—", "—", "—", "—", "—"])
             continue
-        fits_str = "KV-bound" if r.kv_bound else "yes"
         kv_str = f"{r.kv_peak_pct:.0f}%" if r.kv_peak_pct is not None else "—"
+        served_str = f"{r.served_rate:.2f}" if r.served_rate is not None else "—"
         meets = "—" if r.meets_target is None else ("✓" if r.meets_target else "✗")
         cost_str = f"${r.cost_per_mtok:.3f}" if r.cost_per_mtok is not None else "—"
         pareto = "★" if _row_key(r) in on_pareto else " "
@@ -239,7 +238,7 @@ def _format_table(
         tpot_str = f"{r.tpot_ms:.2f}" if r.tpot_ms is not None else "—"
         table_rows.append([
             r.gpu, str(r.tp), str(r.dp), str(n_gpu),
-            fits_str, kv_str,
+            "yes", kv_str, served_str,
             f"{r.request_latency_s:.3f}",
             ttft_str, tpot_str,
             cost_str,
@@ -248,7 +247,7 @@ def _format_table(
         ])
     rb.table(
         headers=headers, rows=table_rows,
-        col_widths=[12, 4, 4, 6, 9, 8, 12, 10, 10, 10, 13, 7],
+        col_widths=[12, 4, 4, 6, 6, 8, 13, 12, 10, 10, 10, 13, 7],
     )
     rb.line()
     for r in rows:
@@ -257,10 +256,10 @@ def _format_table(
     if target_latency is not None:
         rb.line(f"target_request_latency_s = {target_latency} "
                 f"(✓ = meets, ✗ = misses)")
-    rb.line("'KV peak' = peak KV-cache used as a % of the candidate's KV "
-            "budget (VRAM after weights + framework overhead). 'KV-bound' "
-            "in `fits?` means the rate exhausted the budget — concurrency "
-            "couldn't grow enough to sustain the offered load.")
+    rb.line("'served (r/s)' is the rate the simulator actually completed — "
+            "compare to the workload's request_rate to spot saturation. "
+            "'KV peak' is peak KV-cache usage as a % of the candidate's KV "
+            "budget (VRAM after weights + framework overhead).")
     rb.line("★ = on the cost-vs-latency Pareto frontier "
             "(no other candidate is both cheaper AND faster).")
     rb.line("Costs are owned-hardware TCO (MSRP amortised + electricity) — "
@@ -346,13 +345,30 @@ def pareto_sweep(
 
     model_spec = PRESET_MODELS[model]
     target = target_request_latency_s if target_request_latency_s > 0 else None
-    rows: list[_CandidateRow] = []
+
+    # Enumerate every (gpu, tp, dp) cell, then run them in parallel.
+    cells: list[tuple] = []
     for gpu_key, count in parsed:
         for parallel in _enumerate_parallelism(model_spec, count):
-            rows.append(_evaluate(
+            cells.append((
                 model, gpu_key, parallel, request_rate, input_len, output_len,
                 num_requests, max_num_batched_tokens, max_concurrent_requests,
                 range_ratio, target, latency_source,
             ))
-    on_pareto = _pareto_mark(rows)
-    return _format_table(rows, on_pareto, target, latency_source)
+
+    rows: list[_CandidateRow | None] = [None] * len(cells)
+    # 1-worker special-case avoids pickling/forking overhead when there's a
+    # single candidate or the host machine reports cpu_count() == 1.
+    if _N_WORKERS == 1 or len(cells) == 1:
+        for i, cell in enumerate(cells):
+            rows[i] = _evaluate(*cell)
+    else:
+        with ProcessPoolExecutor(max_workers=min(_N_WORKERS, len(cells))) as ex:
+            future_to_idx = {ex.submit(_evaluate, *cell): i
+                             for i, cell in enumerate(cells)}
+            for fut in as_completed(future_to_idx):
+                rows[future_to_idx[fut]] = fut.result()
+
+    rows_final: list[_CandidateRow] = [r for r in rows if r is not None]
+    on_pareto = _pareto_mark(rows_final)
+    return _format_table(rows_final, on_pareto, target, latency_source)

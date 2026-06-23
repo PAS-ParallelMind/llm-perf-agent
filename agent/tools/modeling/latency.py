@@ -487,7 +487,7 @@ def forward_pass_latency(
 
 
 # ---------------------------------------------------------------------------
-# Lower-level entry points (kept for tests / _sim_v2_* shims)
+# Lower-level entry point — pass batch composition explicitly.
 # ---------------------------------------------------------------------------
 
 def forward_pass_ms(
@@ -501,9 +501,8 @@ def forward_pass_ms(
 ) -> tuple[float, dict[str, float]]:
     """Direct entry: pass decode/prefill batch composition explicitly.
 
-    Returns (total_ms, breakdown_dict_in_ms_per_op). Used by the standalone
-    sims in ``_sim_v2_*``. Production callers (serving.py) go through
-    ``forward_pass_latency`` instead.
+    Returns (total_ms, breakdown_dict_in_ms_per_op). Production callers
+    (serving.py) go through ``forward_pass_latency`` instead.
     """
     parallel.validate(model)
     total = StepBreakdown()

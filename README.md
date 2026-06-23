@@ -40,8 +40,14 @@ agent/
       serving.py     simulate_serving   — continuous-batching workload sim
       report.py      ReportBuilder      — shared text-report helpers
       configs/
-        hw_specs.py    PRESET_GPUS      — 4090, A100, H100, H200, B200
+        hw_specs.py    PRESET_GPUS      — RTX 4090 / 5090, A100, H100, H200,
+                                          B200, DGX Spark (GB10)
+        hw_profiles/   per-GPU microbench grids (gitignored — measured)
         model_specs.py PRESET_MODELS    — gpt-oss-20b, Qwen3-Coder-30B (BF16 + AWQ-4bit)
+    planning/
+      pareto_sweep.py  pareto_sweep     — multi-candidate (gpu, tp, dp) sweep
+                                          for the deployment-planning skill
+    skills.py          list_skills / invoke_skill — pull a multi-step playbook
 runs/                per-session dirs (run.yaml + batch/session/...)
 webui/               legacy web UI from the previous incarnation; useful
                      for inspecting session traces. Some pages depend on
@@ -74,15 +80,37 @@ estimate_memory(model, concurrency, context_length) -> report
 
 ### `simulate_serving`
 
-Runs a fixed request pool through a vLLM-style continuous-batching
-scheduler with a `max_num_batched_tokens` budget, accumulates per-phase
-latencies, and reports TTFT / TPOT / throughput plus a per-op step
-breakdown with bottleneck analysis.
+Runs a Poisson-arrival workload (or `request_rate=.inf` for closed-loop)
+through a vLLM-style continuous-batching scheduler with a
+`max_num_batched_tokens` budget, accumulates per-phase latencies, and
+reports TTFT / TPOT / E2E percentiles, observed concurrency, KV-cache
+pressure, per-op step breakdown, and a saturation flag if the
+deployment can't sustain the offered load.
 
 ```
-simulate_serving(model, gpu, concurrency, input_len, output_len,
-                 num_requests, max_num_batched_tokens) -> report
+simulate_serving(workload_file, gpu, tp=1, dp=1,
+                 latency_source="baseline") -> report
 ```
+
+- `workload_file` is a YAML carrying every workload knob (model,
+  request_rate, input/output_len, num_requests, max_num_batched_tokens,
+  optional max_concurrent_requests / range_ratio /
+  target_request_latency_s). Keeps simulator and benchmark
+  apples-to-apples by reading the same file.
+- `tp` / `dp` set the parallelism (tensor-parallel + data-parallel
+  replicas). Total GPUs = tp × dp. TP shards heads + intermediate per
+  layer and adds two ring all-reduces using the GPU's NVLink
+  bandwidth; DP scales served rate and KV budget per replica.
+- `latency_source` picks the per-op model:
+  - `"baseline"` (default) — interpolates each op's wall time from
+    the GPU's microbench grid (under
+    [agent/tools/modeling/configs/hw_profiles/&lt;gpu&gt;/](agent/tools/modeling/configs/hw_profiles/)).
+    The realistic projection; tracks measured TPOT within ~15% on
+    B200 and ~13% on H200 across N = 1..256.
+  - `"theoretical"` — analytic FLOPs/bytes vs theoretical peak
+    (efficiency = 1.0 every op). The optimistic ceiling — over-
+    predicts throughput by ~5–10× on real hardware. Use to scope
+    optimisation headroom, not for projection.
 
 Each modeling module is also runnable as a standalone CLI for ad-hoc
 checks, e.g.:
@@ -92,8 +120,25 @@ uv run python -m agent.tools.modeling.memory \
     --model openai/gpt-oss-20b --concurrency 32 --context-length 4096
 
 uv run python -m agent.tools.modeling.serving \
-    --model openai/gpt-oss-20b --gpu h100-sxm \
-    --num-concurrency 16 --input-len 128 --output-len 64 --num-requests 64
+    --workload-file stages/01_workload.yaml --gpu h200-nvl \
+    --tp 1 --dp 1 --latency-source baseline
+```
+
+### `pareto_sweep`
+
+For each GPU type the user has available, enumerates every valid
+`(tp, dp)` split (with `tp*dp <= count` and `tp` dividing the model's
+KV-head count), runs `simulate_serving` per cell, and returns a
+cost-vs-latency Pareto table. The deployment-planning skill calls this
+twice — once with `latency_source="baseline"`, once with
+`"theoretical"` — to produce the realistic-projection and
+analytic-ceiling tables side by side. Cost in `$/1M tok` is the
+deployment cost (`tp × dp × per-GPU $/h`), so heavier configurations
+are correctly penalised.
+
+```
+pareto_sweep(workload_file, candidates, latency_source="baseline") -> report
+# candidates: [{"gpu": "<PRESET_GPUS key>", "count": <int>}, ...]
 ```
 
 ## Measured benchmarking tool
@@ -107,8 +152,8 @@ vLLM) with `vllm bench serve` and reports real TTFT / TPOT / ITL / E2EL
 mirror `simulate_serving` so a modeled estimate and a real measurement
 sit side by side. On success it records the result to the measurement
 store (see below) — which **also stores the corresponding theoretical
-roofline and the efficiency factor**, so each record documents reality
-and theory together.
+roofline at matching TP/DP** alongside, so each record documents
+reality and the analytic ceiling together.
 
 ```
 benchmark_serving(base_url, model, request_rate, input_len, output_len,
@@ -143,9 +188,10 @@ benchmark_serving(base_url, model, request_rate, input_len, output_len,
   / DP / EP). `vllm bench serve` is a *client* — it can't change how the
   server is sharded — so these are descriptive metadata: they're echoed
   in the report (total GPUs = TP×PP×DP) and stored on the measurement so
-  results from different layouts aren't conflated on lookup. (The roofline
-  baseline is only computed for single-GPU deployments; the modeling tools
-  don't yet model TP/PP/DP scaling.)
+  results from different layouts aren't conflated on lookup. The stored
+  theoretical baseline now respects TP and DP (it runs the simulator with
+  the same parallelism the benchmark reports); PP is still unmodelled and
+  any `pipeline_parallel != 1` falls back to "not computed".
 
 Requires `vllm` installed and a reachable, already-running server. Also
 runnable as a CLI:

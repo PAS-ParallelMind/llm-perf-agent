@@ -20,8 +20,7 @@ Method (per op):
   efficiency interpolated over (log T, log E, log H, log I) with
   T=M·top_k routed tokens, E_act=min(E,T) active experts.
 
-When updating the vendored copy, sync against llm-gpu-bench/predict.py
-and re-run the smoke tests in this repo's _sim_v2_validate.
+When updating the vendored copy, sync against llm-gpu-bench/predict.py.
 """
 from __future__ import annotations
 
