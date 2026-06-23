@@ -65,6 +65,9 @@ class Predictor:
     moe_eff: dict = field(default_factory=dict)                  # {(T,E,H,I): eff}  T=M*top_k
     moe_axes: tuple = field(default_factory=tuple)               # (Ts, Es, Hs, Is)
     moe_bytes_model: dict[str, float] = field(default_factory=lambda: {"w": 2.0, "a": 2.0})
+    ar_lat_ms: dict = field(default_factory=dict)                # {(world_size, bytes): latency_ms}
+    ar_world_sizes: list = field(default_factory=list)           # sorted unique world_size axis
+    ar_bytes: list = field(default_factory=list)                 # sorted unique payload-bytes axis
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Predictor":
@@ -74,12 +77,21 @@ class Predictor:
         if "hardware" not in d:
             return cls._from_legacy(d)
         hw, opn = d["hardware"], d["operation"]
-        b_peak, c_peak = float(hw["b_peak_gbps"]), float(hw["c_peak_tflops"])
-        op, _, dtype = opn["bench"].partition("_")          # gemm/attn/moe ; bf16/fp16/mxfp4
+        # allreduce JSONs don't carry b_peak/c_peak; default to 0.0 in that case.
+        b_peak = float(hw.get("b_peak_gbps", 0.0))
+        c_peak = float(hw.get("c_peak_tflops", 0.0))
+        op, _, dtype = opn["bench"].partition("_")          # gemm/attn/moe/allreduce ; bf16/fp16/mxfp4
         results = d["results"]
 
         def sh(r):
             return r["shape"]
+
+        if op == "allreduce":
+            ar_lat = {(sh(r)["world_size"], sh(r)["bytes"]): r["latency_ms"] for r in results}
+            ar_ws = sorted({k[0] for k in ar_lat})
+            ar_bs = sorted({k[1] for k in ar_lat})
+            return cls(b_peak=b_peak, op="allreduce",
+                       ar_lat_ms=ar_lat, ar_world_sizes=ar_ws, ar_bytes=ar_bs)
 
         if op == "attn":
             dec = [r for r in results if sh(r).get("kind") == "decode"]
@@ -239,3 +251,26 @@ class Predictor:
 
     def moe_latency_ms(self, M, E, top_k, H, I):
         return self.moe_roofline_ms(M, E, top_k, H, I) / self.moe_efficiency(M, E, top_k, H, I)
+
+    # --- All-reduce: bilinear (log world_size, log bytes) interpolation of measured latency ---
+    def allreduce_latency_ms(self, world_size: int, payload_bytes: int) -> float:
+        """Interpolated all-reduce latency from the measured grid (ms).
+
+        Grid axes are world_size (typically {2, 4, 8}) and payload bytes
+        (log-spaced). Interpolation is linear in (log world_size, log bytes);
+        endpoints clamp. Returns NaN if no grid points are loaded.
+        """
+        if not self.ar_lat_ms:
+            return float("nan")
+        # payload_bytes can be 0 in degenerate calls — clamp to grid floor.
+        b = max(1, payload_bytes)
+        tot = wsum = 0.0
+        for wi, ww in self._bracket(self.ar_world_sizes, world_size):
+            for bi, wb in self._bracket(self.ar_bytes, b):
+                lat = self.ar_lat_ms.get((self.ar_world_sizes[wi], self.ar_bytes[bi]))
+                if lat is None or lat != lat:
+                    continue
+                w = ww * wb
+                tot += w * lat
+                wsum += w
+        return tot / wsum if wsum > 0 else float("nan")

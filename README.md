@@ -36,7 +36,7 @@ agent/
       measurements.py  record_measurement / lookup_measurements store
     modeling/
       memory.py      estimate_memory    — weights + KV cache VRAM breakdown
-      latency.py     estimate_latency   — single forward-pass roofline
+      latency.py     (plumbing)          — per-forward-pass latency model used by serving.py
       serving.py     simulate_serving   — continuous-batching workload sim
       report.py      ReportBuilder      — shared text-report helpers
       configs/
@@ -48,15 +48,17 @@ webui/               legacy web UI from the previous incarnation; useful
                      artifacts that no longer exist and will be blank.
 ```
 
-The three modeling tools under `modeling/` are analytical (roofline).
-The `benchmarking/benchmark_serving` tool is the **measured** counterpart:
+The modeling tools under `modeling/` produce simulated numbers — either
+microbench-calibrated (`baseline` mode, the realistic projection) or
+roofline (`theoretical` mode, the optimistic ceiling). The
+`benchmarking/benchmark_serving` tool is the **measured** counterpart:
 it drives a synthetic workload through a *running* OpenAI-compatible
 server with `vllm bench serve` and reports real TTFT / TPOT / throughput,
 then records the result so estimates can be calibrated against it.
 
 ## Performance modeling tools
 
-All three modeling tools take preset model and GPU names (see
+Both modeling tools take preset model and GPU names (see
 `PRESET_MODELS` / `PRESET_GPUS`) and return a formatted text report.
 
 ### `estimate_memory`
@@ -69,20 +71,6 @@ window attention layers are capped at the window size.
 ```
 estimate_memory(model, concurrency, context_length) -> report
 ```
-
-### `estimate_latency`
-
-Roofline latency of a single transformer forward pass for a homogeneous
-batch, broken down per operation (qkv_proj, attn_core, o_proj,
-up_gate_proj, down_proj, lm_head) with a compute-vs-memory bottleneck
-label per op.
-
-```
-estimate_latency(model, gpu, batch_size, input_tokens, kv_cache_len) -> report
-```
-
-For decode: `input_tokens=1`, `kv_cache_len = current context length`.
-For prefill: `input_tokens = prompt length`, `kv_cache_len=0`.
 
 ### `simulate_serving`
 

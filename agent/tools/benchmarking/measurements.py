@@ -66,7 +66,10 @@ def _load_workload(workload_file: str) -> dict | None:
         return None
 
 
-def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
+def _theoretical(wf: dict, gpu: str, *,
+                  tensor_parallel: int = 1,
+                  pipeline_parallel: int = 1,
+                  data_parallel: int = 1) -> dict:
     """Theoretical (roofline) numbers via the serving simulator, run at the
     *same* workload the benchmark consumed (the parsed WorkloadProfile dict).
     Returns metric fields on success or ``{"note": why}`` when it can't /
@@ -77,11 +80,15 @@ def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
     (model/rate/in/out/num_requests/range_ratio), theory and measurement are
     apples-to-apples by construction. Under saturation this matters: mean
     TTFT/TPOT grow with run length until the queue reaches steady state, so a
-    short theoretical run would understate the roofline."""
+    short theoretical run would understate the roofline.
+
+    TP and DP are passed through to the simulator. PP isn't modeled, so any
+    ``pipeline_parallel > 1`` falls back to "not computed"."""
     # Lazy imports: keep the modeling stack (numpy) off the import path until a
     # record actually needs it.
     from ..modeling.configs.model_specs import PRESET_MODELS
     from ..modeling.configs.hw_specs import PRESET_GPUS
+    from ..modeling.latency import ParallelConfig
 
     model = wf.get("model", "")
     request_rate_raw = wf.get("request_rate", 0)
@@ -90,11 +97,9 @@ def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
         missing = "model" if model not in PRESET_MODELS else "gpu"
         return {"note": f"not computed: {missing} is not a PRESET name "
                         "(use a PRESET_MODELS/PRESET_GPUS key to get a baseline)"}
-    if n_gpus != 1:
-        return {"note": f"not computed: deployment spans {n_gpus} GPUs — the "
-                        "modeling tools assume a single GPU and don't model "
-                        "TP/PP/DP scaling, so a single-GPU roofline wouldn't "
-                        "correspond"}
+    if pipeline_parallel != 1:
+        return {"note": f"not computed: pp={pipeline_parallel} — pipeline "
+                        "parallelism isn't modeled yet (only TP and DP are)"}
     try:
         rate_f = float(request_rate_raw)
     except (TypeError, ValueError):
@@ -106,6 +111,8 @@ def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
     closed_loop = math.isinf(rate_f)
     try:
         from ..modeling.serving import run_simulation, summarize_run
+        parallel = ParallelConfig(tp=tensor_parallel, dp=data_parallel)
+        parallel.validate(PRESET_MODELS[model])
         # Run length: prefer the workload's num_requests (apples-to-apples
         # with the benchmark). Open-loop fallback ≈ 10s of arrivals (floor 200);
         # closed-loop fallback = 500 (typical calibration sample size).
@@ -123,14 +130,15 @@ def _theoretical(wf: dict, gpu: str, n_gpus: int) -> dict:
             n_requests=n_req,
             max_batched_tokens=int(wf.get("max_num_batched_tokens", 0)) or 8192,
             max_concurrent_requests=int(wf.get("max_concurrent_requests", 0)) or 1024,
+            parallel=parallel,
             jitter=float(wf.get("range_ratio", 0.0)),
+            latency_source="theoretical",
         )
         s = summarize_run(result)
         if s is None:
             return {"note": "not computed: simulation produced no finished requests"}
-        basis = ("single-GPU roofline, closed-loop"
-                 if closed_loop else
-                 "single-GPU roofline, open-loop (Poisson arrivals)")
+        kind = "closed-loop" if closed_loop else "open-loop (Poisson arrivals)"
+        basis = f"theoretical tp={parallel.tp} dp={parallel.dp}, {kind}"
         out = {
             "basis": basis,
             "served_rate_rps": round(s.served_rate, 3),
@@ -274,7 +282,6 @@ def record_measurement(
                 f"(must be a workspace-relative path to a WorkloadProfile YAML)")
 
     _ensure()
-    n_gpus = tensor_parallel * pipeline_parallel * data_parallel
     request_rate_raw = wf.get("request_rate", 0)
     try:
         rate_f = float(request_rate_raw)
@@ -308,7 +315,12 @@ def record_measurement(
     # Run the simulator at the same workload+mode as the benchmark —
     # apples-to-apples by construction. Stores measured + theoretical +
     # efficiency in one record.
-    theo = _theoretical(wf, gpu, n_gpus)
+    theo = _theoretical(
+        wf, gpu,
+        tensor_parallel=tensor_parallel,
+        pipeline_parallel=pipeline_parallel,
+        data_parallel=data_parallel,
+    )
     rec["theoretical"] = theo
     eff = _efficiency(rec, theo)
     if eff:

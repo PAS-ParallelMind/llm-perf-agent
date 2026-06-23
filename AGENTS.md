@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Python chat agent for LLM inference deployment guidance and performance analysis. Core source lives in `agent/`: `main.py` is the interactive REPL entry point, `loop.py` owns the multi-turn tool-calling loop (`ChatAgent`), `engine.py` wraps OpenAI-compatible model clients, and `config.py` defines `ChatConfig`. Tool implementations are under `agent/tools/`: `fs.py` / `bash.py` for general I/O, `benchmarking/benchmark.py` (still a stub — endpoint probe), and `modeling/{memory,latency,serving}.py` (real analytical tools: `estimate_memory`, `estimate_latency`, `simulate_serving`) sharing `modeling/report.py` and `modeling/configs/` for GPU/model presets. Static README assets live in `assets/`. `SPEC.md` documents contracts and invariants; keep behavior-changing edits consistent with it.
+This is a Python chat agent for LLM inference deployment guidance and performance analysis. Core source lives in `agent/`: `main.py` is the interactive REPL entry point, `loop.py` owns the multi-turn tool-calling loop (`ChatAgent`), `engine.py` wraps OpenAI-compatible model clients, and `config.py` defines `ChatConfig`. Tool implementations are under `agent/tools/`: `fs.py` / `bash.py` for general I/O, `benchmarking/benchmark.py` (still a stub — endpoint probe), and `modeling/{memory,latency,serving}.py` (real analytical tools: `estimate_memory`, `simulate_serving`; `latency.py` is plumbing used by serving) sharing `modeling/report.py` and `modeling/configs/` for GPU/model presets. Static README assets live in `assets/`. `SPEC.md` documents contracts and invariants; keep behavior-changing edits consistent with it.
 
 ## Build, Test, and Development Commands
 

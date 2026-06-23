@@ -69,6 +69,11 @@ class HardwareConfig:
     mxfp4_flops: float = 0.0
     msrp_usd: float = 0.0
     tdp_watts: float = 0.0
+    # Per-GPU NVLink bandwidth (bidirectional, GB/s). Drives the TP all-
+    # reduce roofline in latency.py. 0.0 means "no fast interconnect" —
+    # any TP > 1 simulation on such a part will see PCIe-bound comms,
+    # which the roofline doesn't model, so callers should keep TP=1.
+    nvlink_bw_gbps: float = 0.0
 
     @property
     def cost_per_hour(self) -> float:
@@ -110,6 +115,7 @@ PRESET_GPUS: dict[str, HardwareConfig] = {
         fp8_flops=3958e12,
         msrp_usd=30_000,
         tdp_watts=700,
+        nvlink_bw_gbps=450,      # NVLink 4: 18 links × 25 GB/s per direction
     ),
     "h100-pcie": HardwareConfig(
         name="h100-pcie",
@@ -119,6 +125,8 @@ PRESET_GPUS: dict[str, HardwareConfig] = {
         fp8_flops=1513e12,
         msrp_usd=25_000,
         tdp_watts=350,
+        # NVL bridge is an optional accessory; default to "no fast link"
+        # so a TP > 1 sim flags the missing comms model.
     ),
     "h200-nvl": HardwareConfig(
         name="h200-nvl",
@@ -128,6 +136,7 @@ PRESET_GPUS: dict[str, HardwareConfig] = {
         fp8_flops=1671e12,
         msrp_usd=32_000,
         tdp_watts=700,
+        nvlink_bw_gbps=450,      # "NVL" = NVLink-enabled PCIe, NVLink 4 spec
     ),
     "a100-sxm": HardwareConfig(
         name="a100-sxm",
@@ -137,6 +146,7 @@ PRESET_GPUS: dict[str, HardwareConfig] = {
         fp8_flops=624e12,   # no native FP8; emulated at BF16 rate
         msrp_usd=10_000,    # well below 2020 launch MSRP — current street
         tdp_watts=400,
+        nvlink_bw_gbps=300,      # NVLink 3: 12 links × 25 GB/s per direction
     ),
     "a100-pcie": HardwareConfig(
         name="a100-pcie",
@@ -156,6 +166,7 @@ PRESET_GPUS: dict[str, HardwareConfig] = {
         fp4_flops=9e15,
         msrp_usd=45_000,
         tdp_watts=1_000,
+        nvlink_bw_gbps=900,      # NVLink 5: 18 links × 50 GB/s per direction
     ),
     # DGX Spark (GB10) — NVIDIA's compact "personal AI" workstation.
     # Two structural differences from the discrete-card presets above:

@@ -108,12 +108,11 @@ and `tools.base.dispatch(name, args)` to execute each call.
 | `record_measurement`| tools/benchmarking/measurements.py  | Persist a measured result to the cross-session store    |
 | `lookup_measurements`| tools/benchmarking/measurements.py | Read back measured results to calibrate estimates       |
 | `estimate_memory`   | tools/modeling/memory.py            | VRAM breakdown: weights + KV cache (per model/concurrency/context) |
-| `estimate_latency`  | tools/modeling/latency.py           | Single-pass roofline: per-op compute vs. memory bound  |
-| `simulate_serving`  | tools/modeling/serving.py           | Continuous-batching workload sim: TTFT / TPOT / throughput |
+| `simulate_serving`  | tools/modeling/serving.py           | Continuous-batching workload sim: TTFT / TPOT / throughput. `latency_source`: `baseline` (microbench-calibrated, default) or `theoretical` (analytic roofline) |
 | `remember`          | memory.py                           | Save a memory file + index entry                       |
 | `recall`            | memory.py                           | Read a memory file by name                             |
 
-The three modeling tools take structured kwargs (model + GPU preset
+The modeling tools take structured kwargs (model + GPU preset
 names from `tools/modeling/configs/`, plus workload-shape ints) and
 return a formatted text report rendered via `tools/modeling/report.py`.
 `benchmark_serving` is the measured counterpart to `simulate_serving`:

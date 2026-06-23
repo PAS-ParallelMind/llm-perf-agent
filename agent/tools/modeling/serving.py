@@ -9,10 +9,6 @@ emerges from the arrival rate, request size, and serving capacity:
   only if its worst-case future KV (prompt+gen tokens, summed across
   layers with SWA caps) fits alongside currently-running requests.
 
-When the input rate exceeds steady-state capacity the report flags the
-run as **saturated** — TTFT diverges in that regime so the averages
-become meaningless; we surface that explicitly rather than hiding it.
-
 Exposed as the ``simulate_serving`` tool; also runnable as a CLI for
 deeper exploration (microbenchmark file support, custom seed, etc.).
 """
@@ -29,6 +25,7 @@ from .configs.hw_specs import PRESET_GPUS
 from .configs.model_specs import PRESET_MODELS, ModelConfig, get_quantization_bytes
 from .latency import (
     MODES,
+    ParallelConfig,
     Request,
     StepBreakdown,
     forward_pass_latency,
@@ -48,23 +45,25 @@ GPU_MEMORY_OVERHEAD = 0.08
 # state, so their TTFTs are artificially low.
 WARMUP_FRACTION = 0.10
 
-# After all requests finish, decide saturation by comparing served rate
-# to requested rate. Below this fraction we flag the run as saturated.
-SATURATION_THRESHOLD = 0.95
-
 
 # ---------------------------------------------------------------------------
 # KV budget accounting
 # ---------------------------------------------------------------------------
 
-def _kv_bytes_per_token_summed(model: ModelConfig, context_tokens: int) -> int:
-    """Worst-case KV bytes for one request that grows to ``context_tokens``.
+def _kv_bytes_per_token_summed(
+    model: ModelConfig, context_tokens: int, tp: int = 1,
+) -> int:
+    """Worst-case cluster-wide KV bytes for one request that grows to
+    ``context_tokens``.
 
-    Sums per-layer cost respecting sliding-window caps (SWA layers hold at
-    most ``sliding_window`` tokens regardless of context length).
+    Sums per-layer cost respecting sliding-window caps. When ``tp >
+    n_kv_heads`` each KV head is replicated across ``tp / n_kv_heads``
+    ranks so the cluster-wide KV cache scales by that ratio — modeled by
+    using ``max(n_kv_heads, tp)`` as the effective head count.
     """
     kv_byte = get_quantization_bytes(model.kv_cache_dtype)
-    bytes_per_token_per_layer = 2 * model.n_kv_heads * model.head_dim * kv_byte
+    effective_n_kv = max(model.n_kv_heads, tp)
+    bytes_per_token_per_layer = 2 * effective_n_kv * model.head_dim * kv_byte
     tokens_summed = sum(
         model.effective_kv_tokens(layer_idx, context_tokens)
         for layer_idx in range(model.n_layers)
@@ -72,9 +71,15 @@ def _kv_bytes_per_token_summed(model: ModelConfig, context_tokens: int) -> int:
     return bytes_per_token_per_layer * tokens_summed
 
 
-def compute_kv_budget_bytes(model: ModelConfig, gpu, n_gpus: int) -> int:
-    """KV-cache budget in bytes after weights + overhead are deducted."""
-    total_bytes = int(gpu.mem_capacity * n_gpus)
+def compute_kv_budget_bytes(model: ModelConfig, gpu, parallel: ParallelConfig) -> int:
+    """Per-replica KV-cache budget in bytes after weights + overhead.
+
+    Each TP rank holds 1/TP of the model weights, so the replica's
+    aggregate budget is ``tp * per_gpu_mem - full_weights - tp * overhead``.
+    DP is not factored in: replicas are independent, so the budget is
+    reported per replica.
+    """
+    total_bytes = int(gpu.mem_capacity * parallel.tp)
     weights_bytes = int(weights_vram_gib(model) * (1024 ** 3))
     overhead_bytes = int(total_bytes * GPU_MEMORY_OVERHEAD)
     return max(0, total_bytes - weights_bytes - overhead_bytes)
@@ -100,9 +105,12 @@ class ContinuousBatchingScheduler:
     max_concurrent_requests: int
     kv_budget_bytes: int
     model: ModelConfig
+    tp: int = 1
 
     def _request_worst_case_kv_bytes(self, r: Request) -> int:
-        return _kv_bytes_per_token_summed(self.model, r.prompt_tokens + r.gen_tokens)
+        return _kv_bytes_per_token_summed(
+            self.model, r.prompt_tokens + r.gen_tokens, self.tp,
+        )
 
     def schedule_step(
         self,
@@ -152,16 +160,23 @@ class ContinuousBatchingScheduler:
 
 @dataclass
 class SimulationResult:
-    """Everything the report needs from one simulation run."""
+    """Everything the report needs from one simulation run.
+
+    The simulator only models ONE replica; aggregate (system-level)
+    rates are computed at report time by scaling by ``dp``. The
+    ``requested_rate`` here is the system-level rate the user asked for,
+    so saturation comparisons stay apples-to-apples.
+    """
     finished: list[Request]
     sim_breakdown: StepBreakdown
     n_forward_passes: int
     total_batch_tokens: int
     wall_time_s: float
-    requested_rate: float
-    n_requests: int
+    requested_rate: float          # system-level (sum across DP replicas)
+    n_requests: int                # system-level
+    parallel: ParallelConfig
 
-    # System instrumentation
+    # System instrumentation (per-replica)
     kv_budget_bytes: int
     peak_kv_use_bytes: int
     peak_in_flight: int
@@ -235,11 +250,11 @@ def run_simulation(
     n_requests: int,
     max_batched_tokens: int,
     max_concurrent_requests: int = 1024,
-    n_gpus: int = 1,
+    parallel: ParallelConfig = ParallelConfig(),
     jitter: float = 0.1,
     seed: int = 0,
     progress_cb=None,
-    latency_source: str = "predictor",
+    latency_source: str = "baseline",
 ) -> SimulationResult:
     """Run the simulation. Wall clock advances by each step's modeled time.
 
@@ -253,14 +268,24 @@ def run_simulation(
       request *as each one finishes* — steady-state in-flight = N. Use for
       kernel-efficiency calibration where you want a controlled batch size.
 
+    Parallelism: ``tp`` shards each layer's matmuls/attention heads
+    across TP ranks and adds two ring all-reduces per layer (see
+    ``latency._transformer_layer_s``). ``dp`` replicates the model
+    across independent serving groups — the simulator runs ONE replica
+    with ``request_rate/dp`` arrivals (open-loop) or ``n_requests/dp``
+    requests (closed-loop) and the report scales rates/throughput by
+    ``dp`` at the system level. ``max_concurrent_requests`` is the
+    **per-replica** cap. Total GPU count is ``tp * dp``.
+
     Two latency sources are supported via ``latency_source``:
 
-    * ``"predictor"`` (default) — per-shape latency from the llm-gpu-bench
-      microbench grid (under ``measurements/microbenchmarks/<gpu>/``).
-      Reproduces measured TPOT within ~15% on B200 (vs ~7× error for
-      pure roofline).
-    * ``"roofline"`` — analytic FLOPs/bytes against the GPU's theoretical
-      peaks (efficiency = 1.0 for every op). Baseline / ablation.
+    * ``"baseline"`` (default) — per-shape latency from the llm-gpu-bench
+      microbench grid (under ``configs/hw_profiles/<gpu>/``). This is
+      the realistic projection — reproduces measured TPOT within ~15%
+      on B200 across N=1..256.
+    * ``"theoretical"`` — analytic FLOPs/bytes against the GPU's
+      theoretical peaks (efficiency = 1.0 for every op). The optimistic
+      ceiling; over-predicts throughput by ~5-10× on real hardware.
     """
     if latency_source not in MODES:
         raise ValueError(
@@ -268,32 +293,40 @@ def run_simulation(
     rng = random.Random(seed)
     model = PRESET_MODELS[model_name]
     gpu = PRESET_GPUS[gpu_name]
-    kv_budget = compute_kv_budget_bytes(model, gpu, n_gpus)
+    parallel.validate(model)
+    kv_budget = compute_kv_budget_bytes(model, gpu, parallel)
     scheduler = ContinuousBatchingScheduler(
         max_batched_tokens=max_batched_tokens,
         max_concurrent_requests=max_concurrent_requests,
         kv_budget_bytes=kv_budget,
         model=model,
+        tp=parallel.tp,
     )
 
     closed_loop = math.isinf(request_rate)
+    # DP shards the workload across replicas; we simulate one of them.
+    # System-level rate / count stay in the result for reporting.
+    sys_request_rate = request_rate
+    sys_n_requests = n_requests
+    per_replica_n_requests = max(1, n_requests // parallel.dp)
+    per_replica_rate = request_rate if closed_loop else (request_rate / parallel.dp)
 
     if closed_loop:
         # Closed-loop: pre-generate lengths only; arrivals fire on-demand as
         # requests finish, keeping in-flight at most max_concurrent_requests.
-        lengths = _request_lengths(rng, n_requests, input_len, output_len, jitter)
+        lengths = _request_lengths(rng, per_replica_n_requests, input_len, output_len, jitter)
         arrival_pool: list[Request] = []
-        initial = min(max_concurrent_requests, n_requests)
+        initial = min(max_concurrent_requests, per_replica_n_requests)
         for i in range(initial):
             p, g = lengths[i]
             arrival_pool.append(Request(id=i, arrival_s=0.0, prompt_tokens=p, gen_tokens=g))
         next_dispatch_idx = initial
     else:
         arrival_pool = _build_request_pool(
-            rng, n_requests, input_len, output_len, request_rate, jitter,
+            rng, per_replica_n_requests, input_len, output_len, per_replica_rate, jitter,
         )
         lengths = None
-        next_dispatch_idx = n_requests  # all already in arrival_pool
+        next_dispatch_idx = per_replica_n_requests  # all already in arrival_pool
 
     waiting_queue: list[Request] = []
     running_queue: list[Request] = []
@@ -313,12 +346,12 @@ def run_simulation(
     def _release_kv(r: Request) -> None:
         nonlocal kv_in_use
         kv_in_use = max(0, kv_in_use - _kv_bytes_per_token_summed(
-            model, r.prompt_tokens + r.gen_tokens
+            model, r.prompt_tokens + r.gen_tokens, parallel.tp,
         ))
 
     pool_idx = 0
     while (pool_idx < len(arrival_pool) or waiting_queue or running_queue
-           or (closed_loop and next_dispatch_idx < n_requests)):
+           or (closed_loop and next_dispatch_idx < per_replica_n_requests)):
         # Pull arrivals up to t_now into the waiting queue.
         while pool_idx < len(arrival_pool) and arrival_pool[pool_idx].arrival_s <= t_now:
             waiting_queue.append(arrival_pool[pool_idx])
@@ -352,7 +385,8 @@ def run_simulation(
 
         # Forward pass — single path, latency_source picks the mode.
         step_breakdown = forward_pass_latency(
-            running_queue, gpu_name, model, mode=latency_source,
+            running_queue, gpu_name, model,
+            mode=latency_source, parallel=parallel,
         )
         sim_breakdown.accumulate(step_breakdown)
         step_duration = step_breakdown.total_s
@@ -381,7 +415,7 @@ def run_simulation(
                 if progress_cb is not None:
                     progress_cb(1)
                 # Closed-loop: a slot just freed — dispatch the next request.
-                if closed_loop and next_dispatch_idx < n_requests:
+                if closed_loop and next_dispatch_idx < per_replica_n_requests:
                     p, g = lengths[next_dispatch_idx]
                     arrival_pool.append(Request(
                         id=next_dispatch_idx,
@@ -402,8 +436,9 @@ def run_simulation(
         n_forward_passes=n_forward_passes,
         total_batch_tokens=total_batch_tokens,
         wall_time_s=t_now,
-        requested_rate=request_rate,
-        n_requests=n_requests,
+        requested_rate=sys_request_rate,
+        n_requests=sys_n_requests,
+        parallel=parallel,
         kv_budget_bytes=kv_budget,
         peak_kv_use_bytes=peak_kv_use,
         peak_in_flight=peak_in_flight,
@@ -450,29 +485,28 @@ def _quantile(sorted_vals: list[float], q: float) -> float:
 
 @dataclass
 class RunSummary:
-    # Workload
+    # Workload (system-level: aggregated across DP replicas)
     requested_rate: float
     served_rate: float
     output_token_throughput: float   # generated tokens per second (aggregate)
     n_finished: int
 
-    # Latency percentiles (ms / s)
+    # Parallelism strategy used for the run
+    parallel: ParallelConfig
+
+    # Latency percentiles (ms / s) — identical across replicas, so reported as-is
     ttft_ms: Percentiles
     tpot_ms: Percentiles
     e2e_s: Percentiles
     wait_ms: Percentiles
 
-    # System
+    # System (aggregated across DP replicas — whole-system view)
     wall_time_s: float
     mean_in_flight: float
     peak_in_flight: int
     kv_budget_gib: float
     peak_kv_use_gib: float
     admitted_kv_blocked: int
-
-    # Saturation
-    saturated: bool
-    saturation_reason: str
 
     # Per-forward-pass averages
     n_forward_passes: int
@@ -487,24 +521,8 @@ def _avg_breakdown(breakdown: StepBreakdown, n: int) -> StepBreakdown:
         attn_prefill_s=breakdown.attn_prefill_s / n,
         o_proj_s=breakdown.o_proj_s / n,
         ffn_or_moe_s=breakdown.ffn_or_moe_s / n,
-    )
-
-
-def _saturation_reason(result: SimulationResult, served_rate: float) -> tuple[bool, str]:
-    if result.requested_rate <= 0:
-        return False, ""
-    if served_rate >= SATURATION_THRESHOLD * result.requested_rate:
-        return False, ""
-    kv_pressure = result.peak_kv_use_bytes / max(result.kv_budget_bytes, 1)
-    if kv_pressure >= 0.95 and result.admitted_kv_blocked > 0:
-        return True, (
-            f"KV-cache bound (peak {kv_pressure * 100:.0f}% of budget; "
-            f"{result.admitted_kv_blocked} admission stalls). "
-            "Reduce max context, add VRAM, or lower request_rate."
-        )
-    return True, (
-        "Compute-bound: the forward-pass throughput cannot keep up with "
-        "the requested arrival rate. Lower request_rate or use a faster GPU."
+        comm_s=breakdown.comm_s / n,
+        lm_head_s=breakdown.lm_head_s / n,
     )
 
 
@@ -525,32 +543,41 @@ def summarize_run(result: SimulationResult) -> RunSummary | None:
         for r in measured
     ]
 
-    served_rate = (n / result.wall_time_s) if result.wall_time_s > 0 else 0.0
+    # DP replicas serve independently in parallel, so system-level rates
+    # scale linearly with dp. Per-request latencies are identical on each
+    # replica and don't need scaling. n_finished is reported as the
+    # aggregate count across replicas (per-replica count × dp).
+    dp = result.parallel.dp
+    per_replica_rate = (n / result.wall_time_s) if result.wall_time_s > 0 else 0.0
+    served_rate = per_replica_rate * dp
     total_gen_tokens = sum(r.gen_tokens for r in result.finished)
-    output_token_throughput = (
+    per_replica_tps = (
         total_gen_tokens / result.wall_time_s if result.wall_time_s > 0 else 0.0
     )
-    saturated, reason = _saturation_reason(result, served_rate)
+    output_token_throughput = per_replica_tps * dp
 
+    # System-state aggregates: every replica runs the same workload, so
+    # the system-level value is just the per-replica value × dp. Per-op
+    # forward-pass timings stay per-replica (they're "what one GPU group
+    # does in one step", not a system-wide aggregate).
     n_steps = max(result.n_forward_passes, 1)
     gib = 1024 ** 3
     return RunSummary(
         requested_rate=result.requested_rate,
         served_rate=served_rate,
         output_token_throughput=output_token_throughput,
-        n_finished=n,
+        n_finished=n * dp,
+        parallel=result.parallel,
         ttft_ms=Percentiles.of(ttfts_ms),
         tpot_ms=Percentiles.of(tpots_ms),
         e2e_s=Percentiles.of(e2es_s),
         wait_ms=Percentiles.of(waits_ms),
         wall_time_s=result.wall_time_s,
-        mean_in_flight=result.mean_in_flight,
-        peak_in_flight=result.peak_in_flight,
-        kv_budget_gib=result.kv_budget_bytes / gib,
-        peak_kv_use_gib=result.peak_kv_use_bytes / gib,
-        admitted_kv_blocked=result.admitted_kv_blocked,
-        saturated=saturated,
-        saturation_reason=reason,
+        mean_in_flight=result.mean_in_flight * dp,
+        peak_in_flight=result.peak_in_flight * dp,
+        kv_budget_gib=result.kv_budget_bytes / gib * dp,
+        peak_kv_use_gib=result.peak_kv_use_bytes / gib * dp,
+        admitted_kv_blocked=result.admitted_kv_blocked * dp,
         n_forward_passes=result.n_forward_passes,
         avg_batch_tokens=result.total_batch_tokens / n_steps,
         avg_op_per_step=_avg_breakdown(result.sim_breakdown, n_steps),
@@ -572,13 +599,11 @@ def render_report(summary: RunSummary | None) -> str:
         rb.line("No requests finished to analyze.")
         return rb.build()
 
-    if summary.saturated:
-        rb.line(f"⚠  SATURATED — {summary.saturation_reason}")
-        rb.line()
-
     KEY_WIDTH = 32
 
     rb.heading("Workload & Throughput")
+    p = summary.parallel
+    rb.kv("Parallelism",             f"tp={p.tp} dp={p.dp}  ({p.n_gpus} GPUs total)", KEY_WIDTH)
     rb.kv("Incoming request rate",   f"{summary.requested_rate:.2f} req/s", KEY_WIDTH)
     rb.kv("Completed request rate",  f"{summary.served_rate:.2f} req/s", KEY_WIDTH)
     rb.kv("Output token throughput", f"{summary.output_token_throughput:.1f} tok/s", KEY_WIDTH)
@@ -641,15 +666,15 @@ def render_report(summary: RunSummary | None) -> str:
 
 @tool(
     "Simulate a continuous-batching serving workload and report TTFT/TPOT/"
-    "E2E percentiles, observed concurrency, KV-cache pressure, per-forward-"
-    "pass breakdown, and a saturation flag if the GPU(s) cannot keep up. "
-    "Auto-detects two modes from the workload's `request_rate`: a finite "
-    "rate runs OPEN-loop (Poisson arrivals, concurrency is a result); "
-    "`.inf` runs CLOSED-loop (a new request is dispatched as each one "
-    "finishes, so steady-state in-flight = `max_concurrent_requests`). "
-    "Open-loop is for deployment-capacity sizing; closed-loop is for kernel-"
-    "efficiency calibration at a controlled batch. The workload knobs all "
-    "come from a WorkloadProfile YAML; pass the hardware as `gpu`.",
+    "E2E percentiles, observed concurrency, KV-cache pressure, and per-"
+    "forward-pass breakdown. Auto-detects two modes from the workload's "
+    "`request_rate`: a finite rate runs OPEN-loop (Poisson arrivals, "
+    "concurrency is a result); `.inf` runs CLOSED-loop (a new request is "
+    "dispatched as each one finishes, so steady-state in-flight = "
+    "`max_concurrent_requests`). Open-loop is for deployment-capacity "
+    "sizing; closed-loop is for kernel-efficiency calibration at a "
+    "controlled batch. The workload knobs all come from a WorkloadProfile "
+    "YAML; pass the hardware as `gpu`.",
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain at "
                   "least `model`, `request_rate` (finite or `.inf`), "
@@ -658,19 +683,24 @@ def render_report(summary: RunSummary | None) -> str:
                   "optional in open-loop (defaults to 1024) and REQUIRED "
                   "in closed-loop (it sets the steady-state in-flight N).",
     gpu="Preset GPU name (must exist in PRESET_GPUS).",
-    n_gpus="Number of GPUs sharing the model (for KV-cache budget, default 1).",
-    latency_source="How to model per-forward-pass time. 'predictor' (default) "
-                   "uses the llm-gpu-bench microbench grid "
-                   "(needs measurements/microbenchmarks/<gpu>/*.json). "
-                   "'roofline' uses analytic FLOPs/bytes × the GPU's "
-                   "theoretical peaks (efficiency=1.0 for every op) — "
-                   "baseline / ablation.",
+    tp="Tensor-parallel degree per replica (must divide model head counts; "
+       "default 1). Adds two ring all-reduces per layer modeled against "
+       "the GPU's NVLink bandwidth.",
+    dp="Data-parallel replication factor (default 1). Independent replicas; "
+       "throughput and served rate scale linearly. Total GPUs = tp * dp.",
+    latency_source="How to model per-forward-pass time. 'baseline' (default) "
+                   "uses the per-shape microbench grid for this GPU "
+                   "(configs/hw_profiles/<gpu>/*.json) — the realistic "
+                   "projection. 'theoretical' uses analytic FLOPs/bytes "
+                   "× the GPU's theoretical peaks (efficiency=1.0 for "
+                   "every op) — the optimistic ceiling.",
 )
 def simulate_serving(
     workload_file: str,
     gpu: str,
-    n_gpus: int = 1,
-    latency_source: str = "predictor",
+    tp: int = 1,
+    dp: int = 1,
+    latency_source: str = "baseline",
 ) -> str:
     try:
         from ...workspace import resolve
@@ -701,6 +731,12 @@ def simulate_serving(
     if latency_source not in MODES:
         return f"ERROR: latency_source={latency_source!r} must be one of {MODES}."
 
+    try:
+        parallel = ParallelConfig(tp=tp, dp=dp)
+        parallel.validate(PRESET_MODELS[model])
+    except ValueError as e:
+        return f"ERROR: invalid parallelism: {e}"
+
     result = run_simulation(
         model_name=model,
         gpu_name=gpu,
@@ -710,7 +746,7 @@ def simulate_serving(
         n_requests=num_requests,
         max_batched_tokens=max_num_batched_tokens,
         max_concurrent_requests=max_concurrent_requests,
-        n_gpus=n_gpus,
+        parallel=parallel,
         jitter=range_ratio,
         latency_source=latency_source,
     )
@@ -736,14 +772,18 @@ def _parse_args():
                              "max_concurrent_requests is optional.")
     parser.add_argument("--gpu", type=str, required=True,
                         help="Preset GPU name (PRESET_GPUS key).")
-    parser.add_argument("--n-gpus", type=int, default=1)
+    parser.add_argument("--tp", type=int, default=1,
+                        help="Tensor-parallel degree per replica (default 1).")
+    parser.add_argument("--dp", type=int, default=1,
+                        help="Data-parallel replication factor (default 1).")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--latency-source", type=str, default="predictor",
+    parser.add_argument("--latency-source", type=str, default="baseline",
                         choices=list(MODES),
-                        help="Per-pass latency source. 'predictor' (default) "
-                             "uses the llm-gpu-bench microbench grid. "
-                             "'roofline' uses analytic peaks with all "
-                             "efficiency factors = 1 (baseline / ablation).")
+                        help="Per-pass latency source. 'baseline' (default) "
+                             "uses the per-shape microbench grid (realistic "
+                             "projection). 'theoretical' uses analytic peaks "
+                             "with all efficiency factors = 1 (optimistic "
+                             "ceiling).")
     return parser.parse_args()
 
 
@@ -763,7 +803,7 @@ if __name__ == "__main__":
         n_requests=wf["num_requests"],
         max_batched_tokens=wf["max_num_batched_tokens"],
         max_concurrent_requests=wf.get("max_concurrent_requests", 1024),
-        n_gpus=args.n_gpus,
+        parallel=ParallelConfig(tp=args.tp, dp=args.dp),
         jitter=float(wf.get("range_ratio", 0.0)),
         seed=args.seed,
         latency_source=args.latency_source,

@@ -21,23 +21,21 @@ does NOT apply here.
 
 - **Stage 1** characterises the workload (estimates, past experience, or
   request traces) into concrete knobs.
-- **Stage 2** runs the workload through each hardware candidate. The
-  simulator yields a **theoretical upper bound** per candidate. The
-  workflow then forks into two paths:
+- **Stage 2** runs the workload through each hardware candidate under
+  two latency models, forking into two paths:
   - **Baseline performance** (vLLM, SGLang, etc. as-is). The agent
-    pulls a **closed-loop calibration** record (per-pass kernel
-    efficiency at a fixed in-flight N) from the measurement store and
-    feeds it to `simulate_serving(..., efficiency_factor=k)`. The
-    simulator runs at the deployment's open-loop rate but scales each
-    forward pass by `1/k`, so the equilibrium concurrency shifts up
-    naturally and the projected TPOT / TTFT / E2E reflect the kernel
-    cost. The user picks hardware on those projected numbers. Stage 3
-    captures (or refreshes) the closed-loop calibration on the real
-    server, then runs an open-loop capacity probe and reports
-    measured-vs-projected.
-  - **Potential performance (after optimization)**. The user picks hardware on the
-    theoretical numbers, accepting the implementation gap as something
-    they'll close. Stage 3 measures the baseline against theory and
+    calls `simulate_serving(..., latency_source="baseline")` — the
+    microbench-calibrated realistic projection. No measurement lookup
+    needed; the per-GPU microbench grid *is* the calibration. The user
+    picks hardware on these projected numbers. Stage 3 runs an
+    open-loop capacity probe on the real server and reports
+    measured-vs-baseline-projection.
+  - **Potential performance (after optimization)**. The agent calls
+    `simulate_serving(..., latency_source="theoretical")` — the
+    analytic peak ceiling (FLOPs/bytes × theoretical peaks,
+    efficiency=1.0 everywhere). The user picks hardware on that
+    ceiling, accepting the implementation gap as something they'll
+    close. Stage 3 measures the deployment against the ceiling and
     diagnoses *where* the gap is. Stage 4 (parked) would close it.
 
 Stage 2 reports **both** paths' Pareto tables and the user picks. Only
@@ -59,20 +57,20 @@ closing "let me know" line are required:
 > You want to deploy a model — here's how I'll work through it:
 > 1. **Workload profile** — translate your service description into
 >    concrete numbers (request rate, input/output length, latency target).
-> 2. **Hardware sweep** — simulate each candidate to get the theoretical
->    upper bound, and also project the actual performance of a baseline
->    implementation (vLLM/SGLang) using historical measurements. Two
->    paths to pick from: **baseline performance** — pick hardware on the
->    projected-actual numbers (what the baseline implementation will
->    deliver today); **potential performance (after optimization)** —
->    pick hardware on the theoretical numbers (what you could reach if
->    you close the implementation gap). You decide.
-> 3. **Measure performance** — the baseline-performance path reports
->    the real numbers against the projection; the potential-performance
->    path measures the running implementation and diagnoses where the
->    gap is.
-> 4. *(future work)* Optimisation suggestions for the bottleneck
->    (potential-performance path only).
+> 2. **Hardware sweep** — for each GPU you have, enumerate every
+>    (tp, dp) split that fits and simulate it twice: once for
+>    **what the baseline software stack (vLLM today) will actually
+>    deliver**, and once for **the analytic ceiling — what the
+>    hardware could reach with optimised kernels**. I'll then give
+>    you two recommendations in plain terms:
+>    *"If you deploy with vLLM as-is, X is the best choice. But Y has
+>    the highest potential if you can optimise the implementation."*
+>    You pick which one to take forward.
+> 3. **Measure performance** — run benchmarks on the deployed server
+>    to map its real capacity (max concurrency, max sustainable
+>    request rate). If you picked the optimisation route, also
+>    compare measured vs theoretical to diagnose where the gap is.
+> 4. *(future work)* Optimisation suggestions for the bottleneck.
 >
 > Let me know if you'd rather just chat about specific numbers instead.
 
@@ -91,11 +89,35 @@ prepend it before any Stage-1 work.
 
 **Input**: the user's natural-language service description.
 
-**Process**: Translate it to concrete workload knobs using the rules in
-the system prompt (archetype table, Little's Law for users → concurrency,
-reasoning-budget for output_len, `num_requests` sizing rule). Fill any
-missing field with an *explicitly stated assumption*. Do **not** stall to
-ask the user — proceed with stated assumptions and let them override.
+**Essentials** — these five workload fields are load-bearing decisions
+that the user should own; the agent must not silently default them:
+
+- `model` — the preset key being deployed
+- `request_rate` — req/s the server will see (or `.inf` for closed-loop)
+- `input_len`, `output_len` — workload shape (incl. reasoning budget
+  if the model reasons; state the split if so)
+- `target_request_latency_s` — the SLO
+
+**Process**:
+
+1. **Check the essentials.** For each missing essential, decide
+   between two responses:
+   - **Ask** when the user's description doesn't constrain it enough
+     to make a defensible assumption (e.g. "model" never stated, or
+     SLO unspecified with no archetype hint).
+   - **Assume + emphasize** when the archetype gives a clear default
+     (e.g. user said "code completion in IDE" → archetype lookup gives
+     `input_len` / `output_len` ranges + a typical TTFT). Lead with
+     the assumption in a **bold "Assumptions" block** and invite
+     correction in the same reply. Don't bury it in a footnote.
+   - Either way: do not run Stage 1 tool calls with a missing essential
+     left blank — proceed only after the user answers or you've
+     explicitly stated every assumption.
+
+2. **Derive non-essentials** from the system-prompt rules (`num_requests`
+   sizing, `max_num_batched_tokens` / `max_concurrent_requests`
+   defaults, `range_ratio`). These get an *explicit assumption line*
+   in the Assumptions block but don't need to block on the user.
 
 **Output artifact** → write to `stages/01_workload.yaml`:
 
@@ -132,313 +154,234 @@ assumptions you made, and a one-line invitation to override.
 
 **Process**:
 
-1. **Candidates**:
-   - **If the user named hardware**, validate each name against the
-     catalog (`list_gpus` keys). For any name **not** in the catalog,
-     tell the user plainly: *"I can't evaluate `<name>` — it isn't in
-     my preset catalog. I can use the closest match (`<key>`), or you
-     can drop it."* Do NOT attempt to run `pareto_sweep` with an
-     unknown name; the modeling tools key on preset keys. Proceed only
-     with the validated subset (plus any closest-match substitutions
-     the user accepts).
-   - **If the user didn't name hardware**, ask them what they're
-     considering — *don't* paste the catalog list. Their actual
-     hardware may not even be in the catalog, and offering a menu
-     biases them toward your presets. Only after they answer do you
-     validate as above.
+1. **Candidates** — also an essential the user must own:
+   - **Ask the user what GPUs they have available** — both *which*
+     (preset name) and *how many* each. Don't infer from context
+     ("you mentioned an H100 earlier") and don't silently sweep the
+     catalog. The tool enumerates every valid (tp, dp) split within
+     that count, so the user doesn't pick parallelism by hand.
+   - For each named GPU, validate against the catalog (`list_gpus`
+     keys). For any name not in the catalog, tell the user plainly:
+     *"I can't evaluate `<name>` — it isn't in my preset catalog. I can
+     use the closest match (`<key>`), or you can drop it."* Don't
+     silently substitute.
+   - Heads up: if a GPU has no microbench grid under
+     `agent/tools/modeling/configs/hw_profiles/<gpu>/`, `baseline`
+     mode will raise on it. Flag this before running the sweep
+     ("`pareto_sweep` can't run baseline mode on `<gpu>` — its
+     microbench grid is missing"). The user either picks a different
+     GPU, runs a microbench sweep, or proceeds with theoretical-only
+     for that one.
+   - **Do not run the pareto_sweep tool without a confirmed candidate
+     list** — proceed only after the user names the GPUs and counts.
 
-2. **Theoretical sweep — Table A**: call
-   `pareto_sweep(workload_file="stages/01_workload.yaml",
-   candidates=[...])`. The result is the theoretical Pareto frontier
-   (cost vs latency, saturation-aware). Keep this tool theoretical —
-   do NOT extend it with measurement lookups; the projection happens
-   in step 3 below.
+2. **Baseline projection sweep — Table A**: call
+   ```
+   pareto_sweep(
+       workload_file="stages/01_workload.yaml",
+       candidates=[{"gpu": "<key>", "count": <int>}, ...],
+       latency_source="baseline",
+   )
+   ```
+   The microbench-calibrated realistic projection. Cost per Mtok is
+   the deployment cost (`tp × dp × per-GPU $/h`), so heavier configs
+   are correctly penalised — multi-GPU only earns its keep when it
+   meets the latency target a smaller config cannot.
 
-3. **Projected-actual sweep — Table B** (agent-driven, simulator-applied):
-   - For each candidate that fits and isn't saturated, call
-     `lookup_measurements(model=<workload model>, gpu=<candidate>,
-     mode='closed')`. **The `mode='closed'` filter is critical**:
-     only closed-loop calibration records give apples-to-apples per-
-     forward-pass kernel efficiency. Open-loop records' efficiency
-     factors are *biased* by the equilibrium-shift effect (slow
-     measured → more concurrency → bigger batches → not the same
-     operating point theory was computed at) and must not drive
-     projection.
-   - **Pick the calibration record** by judgement: prefer the most
-     recent at a similar `max_concurrency` and similar lengths.
-     State which record you used and its `efficiency.tpot`.
-   - **Project actual performance via the simulator** — DO NOT scale
-     theoretical numbers manually. Call:
-     ```
-     simulate_serving(
-         workload_file="stages/01_workload.yaml",
-         gpu=<candidate>,
-         efficiency_factor=<calibration.efficiency.tpot>,
-     )
-     ```
-     The simulator applies the efficiency to per-forward-pass wall
-     time; the equilibrium concurrency naturally shifts up (slower
-     per-pass → longer in-flight → larger batches) and the reported
-     TPOT / TTFT / E2E latency are the projected actual numbers at the
-     deployment open-loop rate. Read those into Table B's row for this
-     candidate.
-   - For the `$/1M tok` column, use the projected output throughput
-     (`request_rate × output_len` at sub-saturation, or the simulator's
-     served-rate × output_len when saturated).
-   - If **no closed-loop record exists** for (model, gpu), flag the
-     candidate in Table B with "—" and a note that *calibration is
-     missing*. Do NOT fall back to open-loop efficiency or to copying
-     theoretical numbers — both are biased. Surface this to the user
-     so Stage 3 can capture the calibration first.
-   - Build Table B with the same columns as Table A and mark its own
-     Pareto frontier on projected numbers.
+3. **Theoretical ceiling sweep — Table B**: call the same tool with
+   `latency_source="theoretical"`. The analytic peak ceiling. Use it
+   to scope the implementation-optimisation headroom: where the
+   theoretical pareto frontier shifts vs the baseline frontier tells
+   you how much faster the system *could* run if every kernel hit
+   peak.
 
-4. **Present both tables side by side** and name two recommendations:
-   - **Baseline performance**: cheapest candidate that meets
-     `target_request_latency_s` on **projected actual** numbers.
-   - **Potential performance (after optimization)**: cheapest candidate that meets
-     the target on **theoretical** numbers.
-   - If a candidate appears in only one table (no historical data for
-     Table B), say so plainly. If neither table has a candidate meeting
-     the target, recommend the closest miss in each.
+4. **Pick winners on each table.** From Table A (baseline), find the
+   cheapest config that meets `target_request_latency_s`. From Table B
+   (theoretical), the same. Call these **A★** and **B★**. If neither
+   table has a meeter, pick the closest miss in each and say what
+   would need to change (lower rate, larger GPU budget, more
+   parallelism than available).
 
-5. **Ask the user which path** they want to take. Do NOT pre-decide —
-   the choice depends on whether they want to size against
-   **baseline-performance** numbers (what the baseline implementation
-   will deliver today) or against **potential-performance** numbers
-   (what they could reach by optimising the implementation). Once they
-   pick, restate the chosen plan.
+5. **Present in plain terms** — do NOT use the internal labels
+   "baseline-software path" / "optimized-software path" in your reply
+   to the user. Lead with both tables (compact form is fine), then
+   the recommendations in this template:
 
-   **If the user picks the baseline-performance path on a candidate
-   with no historical record**: you cannot compute a real projection —
-   there's no efficiency factor to apply. Do NOT copy the theoretical
-   numbers into the projection block and pretend it's a projection (the
-   resulting "delta" in Stage 3 will be meaningless). Instead, tell the
-   user plainly: *"I don't have a historical measurement for this
-   (model, gpu) pair, so I can't project the baseline implementation's
-   actual performance. Two options: (a) switch to the
-   potential-performance path and we measure + diagnose against theory;
-   (b) proceed to Stage 3 to capture the first measurement for this
-   pair — future runs will use it for projections."* Let the user pick.
+   > **If you deploy with vLLM (the baseline software today), `<A★ gpu
+   > tp=X dp=Y>` is the best choice** — meets your `<N>s` SLO at
+   > `$<a>/Mtok` on `<n_gpus>` GPU(s).
+   >
+   > **But `<B★ gpu tp=X dp=Y>` has the highest potential if you can
+   > optimise the implementation** — the analytic ceiling is `<M>s` at
+   > `$<b>/Mtok`, which would <undercut A★ / be the cheapest meet /
+   > be the only meet> if you close the kernel gap.
+   >
+   > Which way do you want to go — `<A★>` (deploy today on vLLM) or
+   > `<B★>` (commit to optimising)?
 
-6. **Single-GPU only** for now — the modeling tools don't model TP/PP/DP
-   scaling. Output `n_gpus: 1` and a parallelism stub.
+   Adjust the framing if A★ == B★ ("the same config wins both — vLLM
+   already gets close to the ceiling here") or if one table has no
+   meeter at all ("nothing meets your SLO under vLLM today; only
+   `<B★>` could meet it after optimisation").
+
+   The framework name "vLLM" is the default baseline assumption —
+   swap if the user named a different framework explicitly.
 
 **Output artifact** → write **only the chosen plan** to
 `stages/02_plan.yaml`:
 
 ```yaml
-candidate_set: [<gpu keys>]
-chosen_path: baseline | optimized    # baseline = size on projected-actual / measure & compare
-                                     # optimized = size on theoretical / diagnose gap
+candidate_set:                       # what the user told you they have
+  - {gpu: <key>, count: <int>}
+chosen_path: baseline | optimized    # baseline = baseline latency_source / measure to verify
+                                     # optimized = theoretical latency_source / measure to diagnose gap
 recommended:
   gpu: <key>
-  n_gpus: 1
-  parallelism: {tp: 1, pp: 1, dp: 1}
+  parallelism: {tp: <int>, dp: <int>}
+  n_gpus: <tp * dp>
   rationale: "<why this point under the chosen path>"
 meets_target: <true|false>
-projection:                          # baseline only — null for optimized
-  source_record: "<closed-loop measurement id / timestamp>"
-  source_max_concurrency: <int>      # the N the calibration was probed at
-  efficiency_tpot: <float>           # closed-loop per-pass efficiency applied
-  efficiency_ttft: <float>           # informational; mostly mirrors tpot at saturation
-  projected_ttft_ms: <float>         # from simulate_serving(..., efficiency_factor=tpot)
-  projected_tpot_ms: <float>
-  projected_request_latency_s: <float>
+projected:                           # from the chosen path's table row
+  source: "simulate_serving latency_source=<baseline|theoretical>"
+  ttft_ms: <float>
+  tpot_ms: <float>
+  request_latency_s: <float>
+  cost_per_mtok: <float>
 ```
 
 **Reply to the user**: the two tables (or compact summaries), the two
 recommendations, the path question. After they answer, confirm the
-chosen plan and tell them "next: Stage 3 measures the baseline."
+chosen plan and tell them "next: Stage 3 measures the deployment."
 
 ## Stage 3 — Measure performance
 
 **Input**: WorkloadProfile + DeploymentPlan (with `chosen_path`).
 
-The goal: measure the **actual** performance of the deployed system.
-What we do with that measurement depends on the path the user picked in
-Stage 2. Branch accordingly.
+**Goal**: map the deployed system's actual capacity — the maximum
+sustained request rate it can serve and the maximum concurrency it
+can handle before SLO breaches. Both numbers come from
+`benchmark_serving` against the running server. Whether we *also*
+compare against the theoretical ceiling depends on `chosen_path`.
 
-### Baseline performance
-
-**Goal**: capture (or refresh) the **closed-loop calibration** that
-drives Stage 2's projection, then run an **open-loop capacity** probe
-at the deployment rate and report measured-vs-projected.
-
-Two distinct measurements happen here:
-- **Calibration probe** (closed-loop, `request_rate=.inf`, fixed N).
-  Produces the per-pass kernel efficiency factor that
-  `simulate_serving(..., efficiency_factor=...)` consumes for
-  projection. Apples-to-apples kernel comparison by construction.
-- **Capacity probe** (open-loop, the deployment `request_rate`).
-  Reports the real SLO compliance and request latency at the
-  expected user load.
-
-**Process**:
+**Common preflight** (both paths):
 
 1. **Ask about a running server.** Tell the user the recommended
-   config and ask: *"Do you have an OpenAI-compatible server running
-   this config? Give me the `base_url` and the served `model` name and
-   I'll measure it."*
+   config (`gpu`, `tp`, `dp`) and ask: *"Do you have an OpenAI-
+   compatible server running this config? Give me the `base_url` and
+   the served `model` name and I'll measure it."*
    - **If no** → tell them they need a deployed server, and to come
      back when one exists. Don't fall back to anything.
 
-2. **Calibrate** (closed-loop probe). Skip this step *only* if Stage
-   2 already used a recent closed-loop record at a similar
-   `max_concurrency` and similar lengths; otherwise run it now.
-   - Write a calibration yaml (e.g. `stages/01_workload_cal.yaml`)
-     with the same `model` / `input_len` / `output_len` as the
-     deployment, plus `request_rate: .inf`,
-     `max_concurrent_requests: 16` (or 32 for very fast hardware),
-     `num_requests: 500`.
-   - Call `benchmark_serving(base_url=..., workload_file=<cal yaml>,
-     gpu=<recommended>, tensor_parallel=1)`. The record auto-tags as
-     `mode: closed` and stores the kernel efficiency.
-   - If Stage 2's projection used a *different* efficiency (proxy
-     hardware, stale record, no record), **re-run Stage 2's
-     projection** with the fresh efficiency before continuing — the
-     projection number you compare against should reflect this
-     hardware's actual kernels.
+2. **Max sustained request rate** (open-loop). Drive a rate sweep
+   upward until the SLO breaches or the server saturates. The
+   benchmark records each step automatically as `mode: open`.
+   - Start at the workload's `request_rate` and sweep up in small
+     steps (e.g. ×1.25 per step) until either (a) mean TTFT or E2E
+     exceeds the user's target, or (b) `served_rate` falls below
+     ~95% of the offered rate.
+   - The maximum sustained rate is the last step where SLO still held
+     and the server tracked the offered rate.
+   - For each step, run with `num_requests ≈ 100 × rate` so the queue
+     reaches steady state (shorter runs systematically under-report
+     TPOT / E2E near saturation).
 
-3. **Measure capacity** (open-loop, at the deployment rate). Call
-   `benchmark_serving(base_url=..., workload_file=
-   "stages/01_workload.yaml", gpu=<recommended preset>,
-   tensor_parallel=1)`. Override `model` if the server serves under a
-   different id than the workload's `model`. Record auto-tags as
-   `mode: open`.
+3. **Max concurrency at SLO** (closed-loop). Probe the server at
+   fixed in-flight N to find where per-request latency starts to
+   diverge. Write a calibration YAML with the same `model` /
+   `input_len` / `output_len` as the deployment, plus
+   `request_rate: .inf`, `num_requests: 500`. Run for a small ladder
+   of `max_concurrent_requests` (e.g. 4, 8, 16, 32, 64) and stop when
+   TPOT exceeds the target. Each run records as `mode: closed`.
 
-4. **Compare**: present measured request latency (with TTFT / TPOT
-   breakdown) next to the `projection` block from
-   `stages/02_plan.yaml`. Show the delta as percentages. Report
-   numbers; do **not** say "pass" / "fail" — the user decides what's
-   acceptable.
+### Branch — if the user chose to deploy today on the baseline software
 
-   Throughput isn't compared here — at sub-saturation it just mirrors
-   `request_rate × output_len` on both sides, so the delta is
-   uninformative. Latency (and its TTFT / TPOT decomposition) is the
-   meaningful signal.
-
-   If the projection misses by a lot, the most likely causes are
-   (a) the calibration record came from a different operating point
-   or older framework version, or (b) the deployment rate pushes the
-   system into a regime the calibration didn't cover. Surface the
-   suspected cause; don't just report the delta.
-
-**Output artifact** → write to `stages/03_report.yaml`:
-
-```yaml
-path: baseline
-calibration:                         # the closed-loop probe used / refreshed
-  record_ts: "<measurement timestamp>"
-  max_concurrency: <int>
-  efficiency_tpot: <float>
-  efficiency_ttft: <float>
-projected:                           # from simulate_serving + efficiency_factor
-  request_latency_s: <float>
-  ttft_ms: <float>
-  tpot_ms: <float>
-measured:                            # from open-loop benchmark_serving
-  request_latency_s: <float>
-  ttft_ms: <float>
-  tpot_ms: <float>
-delta:                               # measured / projected
-  request_latency: <float>
-  ttft: <float>
-  tpot: <float>
-```
-
-**Reply to the user**: measured vs projected (latency numbers + delta
-%, with TTFT / TPOT breakdown), the calibration record used, and one
-line on whether the delta is large enough that they may want to
-revisit Stage 2 with a different candidate. End the workflow here.
-
-### Potential performance (after optimization)
-
-**Goal**: measure the running implementation's actual performance,
-compare to the theoretical upper bound, and identify the per-op
-bottleneck — sets up Stage 4 (parked).
-
-The measured numbers come from `benchmark_serving` against the running
-server. The theoretical numbers come from `simulate_serving` and serve
-two purposes: (a) the reference to compute the implementation-efficiency
-gap against, and (b) the per-op breakdown that diagnoses *where* the
-gap is coming from (the real benchmark gives end-to-end numbers but no
-per-op detail).
+**Goal**: confirm what the deployment *actually* delivers and how its
+capacity compares to the Stage 2 baseline projection.
 
 **Process**:
 
-1. **Ask about a running server.** Same as the baseline-performance path.
-   - **If yes** → run the measurement path (steps 2–5).
-   - **If no** → theoretical-only fallback at the end. Tell the user
-     that's a roofline reference, not actual performance, and that they
-     should come back to Stage 3 after deploying.
+4a. **Compare to projection.** Present measured TTFT / TPOT / request
+    latency at the workload's `request_rate` next to the `projected`
+    block from `stages/02_plan.yaml`. Show the delta as percentages.
+    Report numbers; do **not** say "pass" / "fail" — the user decides
+    what's acceptable.
 
-2. **Measure** (primary): `benchmark_serving(base_url=...,
-   workload_file="stages/01_workload.yaml", gpu=<recommended preset>,
-   tensor_parallel=1)`. Single-GPU only for now. Auto-records to the
-   measurement store.
+    If the projection misses by > 20% on TPOT, surface the most likely
+    cause: (a) the microbench grid for this (gpu, tp, dp) is stale
+    relative to the framework version the server is running, or (b)
+    the deployment is in a regime the grid doesn't cover well (SWA
+    prefill, atypical batch shapes). Note "may need a microbench
+    refresh" but don't loop back automatically.
 
-3. **Theoretical reference**: `simulate_serving(
-   workload_file="stages/01_workload.yaml", gpu=<recommended preset>)`.
-   Same workload, hardware filled in. Use for the roofline comparison
-   and the per-op `Bottleneck: <op> — N% of step (BOUND, avg M
-   tokens/batch)` line.
+### Branch — if the user chose to commit to software optimisation
 
-4. **Historical cross-check**: `lookup_measurements(model,
-   recommended_gpu)` for any prior measurements (other framework
-   versions, nearby operating points). Use as a sanity check on the
-   fresh measurement, not as the primary source.
+**Goal**: confirm the deployment delivers and quantify how much
+implementation headroom there is to the theoretical ceiling.
 
-5. **Compute the gap and identify the bottleneck**:
-   - efficiency = measured / theoretical (throughput) and
-     theoretical / measured (latency) — values < 1.0 always indicate
-     measured is worse than the roofline (kernel / framework /
-     scheduling headroom).
-   - Per-op bottleneck from simulation: name the op (NOT
-     "decode" / "prefill" — continuous batching mixes them), state its
-     bound (COMPUTE/MEMORY/BALANCED), and explain why the gap looks the
-     way it does (e.g. "FFN is memory-bound theoretically at 50% of
-     step; measured down_proj likely under-utilises HBM bandwidth on
-     this framework version").
+**Process**:
 
-**Theoretical-only fallback** (no running server):
-- Skip step 2.
-- Still run step 3 (`simulate_serving`) and step 4
-  (`lookup_measurements`).
-- Artifact: `measured: null`, `efficiency: null`.
-- Reply: this is a *theoretical roofline*, not actual performance —
-  come back with `base_url` once deployed.
+4b. **Theoretical reference.** Call `simulate_serving(workload_file=
+    "stages/01_workload.yaml", gpu=<recommended>, tp=<X>, dp=<Y>,
+    latency_source="theoretical")`. Use the per-op breakdown to name
+    the bottleneck operation.
+
+5b. **Compute the gap and identify the bottleneck**:
+    - efficiency = measured / theoretical (throughput) and
+      theoretical / measured (latency) — values < 1.0 always indicate
+      measured is worse than the ceiling (kernel / framework /
+      scheduling headroom).
+    - Per-op bottleneck from the theoretical simulation: name the op
+      (NOT "decode" / "prefill" — continuous batching mixes them) and
+      explain why the gap looks the way it does (e.g. "FFN dominates
+      the step at 65%; measured down_proj likely under-utilises HBM
+      bandwidth on this framework version").
 
 **Output artifact** → write to `stages/03_report.yaml`:
 
 ```yaml
-path: optimized
-theoretical:
-  output_throughput_tps: <float>
+path: baseline | optimized
+deployment:
+  gpu: <key>
+  parallelism: {tp: <int>, dp: <int>}
+  n_gpus: <tp * dp>
+capacity:                              # both paths report this
+  max_sustained_rate_rps: <float>      # last open-loop step that met SLO
+  max_concurrency_at_slo: <int>        # last closed-loop N that met SLO
+measured_at_workload:                  # at workload_file's request_rate
   request_latency_s: <float>
   ttft_ms: <float>
   tpot_ms: <float>
-  cost_per_mtok_output: <float>
-measured:                            # or null
-  output_throughput_tps: <float>
+# Baseline path only:
+projected:                             # from stages/02_plan.yaml
   request_latency_s: <float>
-efficiency:                          # null if no measurement
-  output_throughput: <float>
+  ttft_ms: <float>
+  tpot_ms: <float>
+delta_vs_projected:                    # measured / projected
   request_latency: <float>
+  ttft: <float>
+  tpot: <float>
+# Optimized path only:
+theoretical:
+  request_latency_s: <float>
+  ttft_ms: <float>
+  tpot_ms: <float>
+efficiency:
+  request_latency: <float>             # theoretical / measured
+  throughput: <float>                  # measured / theoretical
 bottleneck:
-  op: <qkv_proj | attn_core | o_proj | up_gate_proj | down_proj | lm_head>
+  op: <qkv | attn_decode | attn_prefill | o_proj | ffn_or_moe | comm>
   pct_of_step: <float>
-  avg_tokens: <float>
-  bound: <COMPUTE | MEMORY | BALANCED>
-gap_explanation: "<source: <record_ts>, basis: ...>"   # or null
 ```
 
-**Reply to the user**: lead with the **measured** numbers (or
-theoretical, if no server was available, clearly labelled), then the
-efficiency gap as a percentage of theoretical, then the bottleneck op
-and a one-line interpretation of where the gap comes from. One-line
-lead-in to Stage 4 (parked) — that's where closing the gap would
-happen.
+**Reply to the user**: lead with **capacity** (max sustained rate, max
+concurrency at SLO) — that's the headline. Then branch-specific
+detail: if they chose to deploy today, show measured vs Stage-2
+projection (delta %); if they chose to optimise, show the efficiency
+gap to the theoretical ceiling + the bottleneck op and a one-line
+interpretation, then a one-line lead-in to Stage 4 (parked). Same
+"plain terms" rule as Stage 2 — don't echo internal labels like
+`chosen_path: optimized` to the user; describe the branch in the
+language they used when they picked it.
 
 ## Stage 4 — Performance optimization (FUTURE WORK)
 
@@ -458,6 +401,11 @@ explore the design space further.
 
 - **Announce each stage** as a markdown header before running it
   (`**Stage 1 — Service requirement → Workload profile**`).
+- **Plan the stage before executing it.** Immediately after the stage
+  header, write a short 2-4 bullet plan listing the tool calls (and
+  questions, if any essentials are missing) you intend to make in
+  this stage. THEN start running them. Don't dive straight from the
+  header into a tool call — the user should see what's coming.
 - **Persist each artifact** with `write_file` before moving on. Use
   YAML so they're easy to read and re-load.
 - **Don't loop back** automatically. If the user wants to revise an
