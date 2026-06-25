@@ -72,8 +72,18 @@ def kv_cache_vram_gib(
     return total_bytes / _GIB
 
 
+def _weight_dtype_summary(spec: ModelConfig) -> str:
+    """One-line summary of attn and ffn weight dtypes.
+
+    Collapses to a single token when they agree (the common case for
+    a fully-bf16 / fully-fp16 model)."""
+    if spec.attn_weight_dtype == spec.ffn_weight_dtype:
+        return spec.attn_weight_dtype
+    return f"attn={spec.attn_weight_dtype} ffn={spec.ffn_weight_dtype}"
+
+
 def _render_report(
-    model_name: str,
+    spec: ModelConfig,
     concurrency: int,
     context_length: int,
     kv_dtype: str,
@@ -85,7 +95,8 @@ def _render_report(
     rb = ReportBuilder(width=55)
     rb.banner("LLM VRAM ESTIMATION REPORT").line()
     rb.heading("Deployment Parameters")
-    rb.kv("Model Name", model_name)
+    rb.kv("Model Name", spec.name)
+    rb.kv("Weights Precision", _weight_dtype_summary(spec))
     rb.kv("Target Concurrency", f"{concurrency} concurrent requests")
     rb.kv("Context Length", f"{context_length:,} tokens / request")
     rb.kv("KV Cache Precision", f"{kv_dtype} ({kv_dtype_bytes} bytes/param)")
@@ -115,7 +126,7 @@ def estimate_memory(model: str, concurrency: int, context_length: int) -> str:
     weights_gib = weights_vram_gib(spec)
     kv_gib = kv_cache_vram_gib(spec, concurrency, context_length)
     return _render_report(
-        model_name=model,
+        spec=spec,
         concurrency=concurrency,
         context_length=context_length,
         kv_dtype=spec.kv_cache_dtype,

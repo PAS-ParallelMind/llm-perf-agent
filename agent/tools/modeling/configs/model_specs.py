@@ -122,6 +122,27 @@ PRESET_MODELS: dict[str, ModelConfig] = {
         sliding_window=128,
         reasoning_mode="hybrid",  # configurable reasoning effort (low/med/high)
     ),
+    "openai/gpt-oss-120b": ModelConfig(
+        name="openai/gpt-oss-120b",
+        model_orig_dtype="bf16",
+        ffn_weight_dtype="mxfp4",
+        attn_weight_dtype="bf16",
+        activation_dtype="bf16",
+        kv_cache_dtype="bf16",
+        n_layers=36,                # vs 24 in 20b
+        hidden_size=2880,           # same as 20b
+        vocab_size=201088,          # same tokenizer
+        n_attention_heads=64,       # same attention shape as 20b
+        n_kv_heads=8,
+        head_dim=64,
+        intermediate_size=2880,     # not used (MoE) — kept symmetric with 20b
+        moe_intermediate_size=2880,
+        n_experts=128,              # vs 32 in 20b — same top_k
+        top_k=4,
+        max_seq_len=131072,
+        sliding_window=128,         # interleaved SWA / full attention layers
+        reasoning_mode="hybrid",
+    ),
     "Qwen/Qwen3-Coder-30B-A3B-Instruct": ModelConfig(
         name="Qwen/Qwen3-Coder-30B-A3B-Instruct",
         model_orig_dtype="bf16",
