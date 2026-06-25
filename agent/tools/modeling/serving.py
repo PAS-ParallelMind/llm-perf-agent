@@ -50,6 +50,23 @@ WARMUP_FRACTION = 0.10
 # KV budget accounting
 # ---------------------------------------------------------------------------
 
+def auto_num_requests(request_rate: float) -> int:
+    """Tool-side default for ``num_requests``, hard-coded so the agent
+    can't get this knob wrong.
+
+    Short runs at high rates finish before the queue reaches steady-
+    state depth, which makes mean TTFT / TPOT / E2E look artificially
+    optimistic — empirically by ~70% near saturation. Sizing for ~120 s
+    of arrivals avoids that. Capped at 6000 to keep wall time sane on
+    slow hardware with long outputs; floored at 200 so very-low-rate
+    runs still have enough samples for stable percentiles. Closed-loop
+    (``rate=inf``) falls back to 500 — typical calibration sample size.
+    """
+    if not math.isfinite(request_rate) or request_rate <= 0:
+        return 500
+    return min(6000, max(200, int(120 * request_rate)))
+
+
 def _kv_bytes_per_token_summed(
     model: ModelConfig, context_tokens: int, tp: int = 1,
 ) -> int:
@@ -678,8 +695,10 @@ def render_report(summary: RunSummary | None) -> str:
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain at "
                   "least `model`, `request_rate` (finite or `.inf`), "
-                  "`input_len`, `output_len`, `num_requests`, "
-                  "`max_num_batched_tokens`. `max_concurrent_requests` is "
+                  "`input_len`, `output_len`, `max_num_batched_tokens`. "
+                  "`num_requests` is IGNORED if present — the tool "
+                  "auto-derives it from `request_rate` for statistical "
+                  "convergence. `max_concurrent_requests` is "
                   "optional in open-loop (defaults to 1024) and REQUIRED "
                   "in closed-loop (it sets the steady-state in-flight N).",
     gpu="Preset GPU name (must exist in PRESET_GPUS).",
@@ -713,7 +732,6 @@ def simulate_serving(
     request_rate = wf.get("request_rate", 0.0)
     input_len = wf.get("input_len", 0)
     output_len = wf.get("output_len", 0)
-    num_requests = wf.get("num_requests", 0)
     max_num_batched_tokens = wf.get("max_num_batched_tokens", 0)
     max_concurrent_requests = wf.get("max_concurrent_requests", 0) or 1024
     range_ratio = float(wf.get("range_ratio", 0.0))
@@ -736,6 +754,11 @@ def simulate_serving(
         parallel.validate(PRESET_MODELS[model])
     except ValueError as e:
         return f"ERROR: invalid parallelism: {e}"
+
+    # num_requests is hard-coded (auto-derived from request_rate). Any
+    # value in the YAML is ignored — the formula matters for statistical
+    # convergence near saturation and we don't want the agent guessing.
+    num_requests = auto_num_requests(rate_f)
 
     result = run_simulation(
         model_name=model,
@@ -761,15 +784,17 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description="Simulate a continuous-batching serving workload under "
                     "Poisson arrivals. Workload knobs (model, request_rate, "
-                    "input/output_len, num_requests, batched-tokens, "
-                    "max-concurrent) come from a WorkloadProfile YAML."
+                    "input/output_len, batched-tokens, max-concurrent) come "
+                    "from a WorkloadProfile YAML. num_requests is "
+                    "auto-derived from request_rate."
     )
     parser.add_argument("--workload-file", type=str, required=True,
                         help="Path to a WorkloadProfile YAML (relative to "
                              "CWD or absolute). Must contain model, "
                              "request_rate, input_len, output_len, "
-                             "num_requests, max_num_batched_tokens. "
-                             "max_concurrent_requests is optional.")
+                             "max_num_batched_tokens. max_concurrent_requests "
+                             "is optional. num_requests is auto-derived from "
+                             "request_rate.")
     parser.add_argument("--gpu", type=str, required=True,
                         help="Preset GPU name (PRESET_GPUS key).")
     parser.add_argument("--tp", type=int, default=1,
@@ -794,13 +819,14 @@ if __name__ == "__main__":
 
     wf = _yaml.safe_load(_Path(args.workload_file).read_text()) or {}
     print(f"running workload simulation from {args.workload_file}...")
+    rate_f = float(wf["request_rate"])
     result = run_simulation(
         model_name=wf["model"],
         gpu_name=args.gpu,
-        request_rate=float(wf["request_rate"]),
+        request_rate=rate_f,
         input_len=wf["input_len"],
         output_len=wf["output_len"],
-        n_requests=wf["num_requests"],
+        n_requests=auto_num_requests(rate_f),
         max_batched_tokens=wf["max_num_batched_tokens"],
         max_concurrent_requests=wf.get("max_concurrent_requests", 1024),
         parallel=ParallelConfig(tp=args.tp, dp=args.dp),

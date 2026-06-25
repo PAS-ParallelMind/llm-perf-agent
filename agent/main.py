@@ -140,32 +140,23 @@ def _export_trace(agent: ChatAgent, workspace: Path, meta: SessionMeta) -> None:
 # REPL
 # ---------------------------------------------------------------------------
 
-_HELP = (
-    "/exit, /quit   leave the REPL\n"
-    "/reset         clear conversation history\n"
-    "/tools         list registered tools\n"
-    "/help          show this message"
-)
-
-
 def _handle_slash(cmd: str, agent: ChatAgent) -> bool:
-    """Return True if the input was a slash command (and was handled)."""
+    """Return True if the input was a slash command (and was handled).
+
+    ``/exit`` / ``/quit`` are REPL-only and intercepted here; everything
+    else routes through :mod:`agent.slash`, which the webui shares so
+    semantics stay identical.
+    """
     cmd = cmd.strip()
     if cmd in {"/exit", "/quit"}:
         raise SystemExit(0)
-    if cmd == "/help":
-        console.print(Panel(_HELP, border_style="yellow", title="commands"))
-        return True
-    if cmd == "/reset":
-        agent.reset()
-        console.print("[yellow]conversation reset.[/]")
-        return True
-    if cmd == "/tools":
-        lines = [f"  {n}" for n in sorted(TOOLS)]
-        console.print(Panel("\n".join(lines) or "(none)",
-                            border_style="cyan", title="tools"))
-        return True
-    return False
+    from .slash import dispatch_slash
+    result = dispatch_slash(cmd, agent)
+    if result is None:
+        return False
+    if result.response:
+        console.print(Panel(result.response, border_style="yellow", title=cmd))
+    return True
 
 
 def main() -> None:

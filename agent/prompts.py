@@ -29,10 +29,10 @@ _DEFAULT_TASK_PROMPT = (
     "a real load through a running vLLM/OpenAI-compatible server via "
     "`vllm bench serve` and reports measured TTFT/TPOT/throughput). "
     "`benchmark_serving` mirrors `simulate_serving`'s parameters, so use "
-    "it to ground-truth a modeled estimate; it records results to the "
-    "measurement store, which `lookup_measurements` reads back to "
-    "calibrate future theory. After a tool returns, interpret the result "
-    "for the user — don't just dump raw numbers."
+    "it to ground-truth a modeled estimate; if the measured number "
+    "diverges from the prediction, save a brief note via `remember` so "
+    "future sessions know about the gap. After a tool returns, interpret "
+    "the result for the user — don't just dump raw numbers."
 )
 
 

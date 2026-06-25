@@ -24,6 +24,7 @@ agent/
   fake_engine.py     scripted engine for --dry-run
   prompts.py         system prompt + memory index
   memory.py          remember / recall tools, MEMORY.md
+  slash.py           shared slash-command dispatch (REPL + webui)
   types.py           SessionMeta dataclass
   workspace.py       session workspace (cwd for tools)
   tools/
@@ -33,7 +34,6 @@ agent/
     benchmarking/
       benchmark.py     benchmark_serving — MEASURED TTFT/TPOT/throughput
                        (wraps `vllm bench serve` against a live endpoint)
-      measurements.py  record_measurement / lookup_measurements store
     modeling/
       memory.py      estimate_memory    — weights + KV cache VRAM breakdown
       latency.py     (plumbing)          — per-forward-pass latency model used by serving.py
@@ -45,7 +45,7 @@ agent/
         hw_profiles/   per-GPU microbench grids (gitignored — measured)
         model_specs.py PRESET_MODELS    — gpt-oss-20b, Qwen3-Coder-30B (BF16 + AWQ-4bit)
     planning/
-      pareto_sweep.py  pareto_sweep     — multi-candidate (gpu, tp, dp) sweep
+      evaluate_all.py  evaluate_all     — multi-candidate (gpu, tp, dp) sweep
                                           for the deployment-planning skill
     skills.py          list_skills / invoke_skill — pull a multi-step playbook
 runs/                per-session dirs (run.yaml + batch/session/...)
@@ -59,8 +59,9 @@ microbench-calibrated (`baseline` mode, the realistic projection) or
 roofline (`theoretical` mode, the optimistic ceiling). The
 `benchmarking/benchmark_serving` tool is the **measured** counterpart:
 it drives a synthetic workload through a *running* OpenAI-compatible
-server with `vllm bench serve` and reports real TTFT / TPOT / throughput,
-then records the result so estimates can be calibrated against it.
+server with `vllm bench serve` and reports real TTFT / TPOT / throughput.
+When the measurement diverges from the prediction, the agent saves a
+brief note via `remember` (no separate measurement store).
 
 ## Performance modeling tools
 
@@ -93,10 +94,12 @@ simulate_serving(workload_file, gpu, tp=1, dp=1,
 ```
 
 - `workload_file` is a YAML carrying every workload knob (model,
-  request_rate, input/output_len, num_requests, max_num_batched_tokens,
-  optional max_concurrent_requests / range_ratio /
-  target_request_latency_s). Keeps simulator and benchmark
-  apples-to-apples by reading the same file.
+  request_rate, input/output_len, max_num_batched_tokens, optional
+  max_concurrent_requests / range_ratio / target_request_latency_s).
+  Keeps simulator and benchmark apples-to-apples by reading the same
+  file. `num_requests` is **not** a YAML knob — the tool auto-derives
+  it from `request_rate` (`min(6000, max(200, 120 × rate))`; closed-
+  loop fallback 500) so the agent can't get it wrong.
 - `tp` / `dp` set the parallelism (tensor-parallel + data-parallel
   replicas). Total GPUs = tp × dp. TP shards heads + intermediate per
   layer and adds two ring all-reduces using the GPU's NVLink
@@ -124,7 +127,7 @@ uv run python -m agent.tools.modeling.serving \
     --tp 1 --dp 1 --latency-source baseline
 ```
 
-### `pareto_sweep`
+### `evaluate_all`
 
 For each GPU type the user has available, enumerates every valid
 `(tp, dp)` split (with `tp*dp <= count` and `tp` dividing the model's
@@ -137,7 +140,7 @@ deployment cost (`tp × dp × per-GPU $/h`), so heavier configurations
 are correctly penalised.
 
 ```
-pareto_sweep(workload_file, candidates, latency_source="baseline") -> report
+evaluate_all(workload_file, candidates, latency_source="baseline") -> report
 # candidates: [{"gpu": "<PRESET_GPUS key>", "count": <int>}, ...]
 ```
 
@@ -150,82 +153,59 @@ The measured counterpart to `simulate_serving`. Drives a synthetic
 vLLM) with `vllm bench serve` and reports real TTFT / TPOT / ITL / E2EL
 (mean / median / p99) plus request and token throughput. The parameters
 mirror `simulate_serving` so a modeled estimate and a real measurement
-sit side by side. On success it records the result to the measurement
-store (see below) — which **also stores the corresponding theoretical
-roofline at matching TP/DP** alongside, so each record documents
-reality and the analytic ceiling together.
+sit side by side. There is no measurement store; cross-session
+continuity comes from `remember` notes the agent saves when measured
+diverges from predicted (see "Tracking prediction drift" below).
 
 ```
-benchmark_serving(base_url, model, request_rate, input_len, output_len,
-                  num_requests, max_concurrency=0, range_ratio=0.0,
-                  endpoint="/v1/completions", gpu="",
+benchmark_serving(base_url, workload_file, endpoint="/v1/completions",
+                  gpu="",
                   tensor_parallel=1, pipeline_parallel=1, data_parallel=1,
                   expert_parallel=False, ignore_eos=True) -> report
 ```
 
 - `base_url` is the server **root** (`http://host:8000`); a trailing
   `/v1` is stripped automatically.
-- `model` is a single identifier — prefer a `PRESET_MODELS` key / HF id
-  (e.g. `openai/gpt-oss-20b`). It is the tokenizer source *and* the key
-  that lets the recorded theoretical baseline be computed. If the server
+- `workload_file` is the same YAML shape `simulate_serving` consumes
+  (model, request_rate, input/output_len, optional max_concurrent_requests
+  / range_ratio). `num_requests` is auto-derived from `request_rate`
+  — don't put it in the YAML. Pass `request_rate: inf` for closed-loop
+  mode.
+- `model` is read from the YAML — prefer a `PRESET_MODELS` key / HF id
+  (e.g. `openai/gpt-oss-20b`). It is the tokenizer source. If the server
   serves under a different id (e.g. a local path), the tool auto-detects
   it from `/v1/models` and passes `--served-model-name` for you — the
   report's "Served as" line shows which id requests actually used.
-- `request_rate` is the load knob (req/s, Poisson arrivals — mirrors
-  `simulate_serving`). Pass `"inf"` to send everything at once
-  (closed-loop, bounded by `max_concurrency`); in that mode the recorded
-  theoretical baseline is skipped with a note, since the modeling
-  simulator is open-loop.
-- `max_concurrency` is an optional in-flight cap (default `0` = no cap —
-  pure open-loop at `request_rate`). Concurrency is now a **result** of
-  the run (observed peak in-flight), not an input.
-- `gpu` is optional but recommended: it tags the recorded measurement so
-  later lookups can calibrate by hardware, and (with a single-GPU,
-  preset model+GPU and a finite `request_rate`) enables the stored
-  theoretical baseline. Prefer a `PRESET_GPUS` name.
+- `gpu` labels the measurement in the report header; prefer a
+  `PRESET_GPUS` name. Blank = "unknown".
 - `tensor_parallel` / `pipeline_parallel` / `data_parallel` /
   `expert_parallel` describe the **server's** parallelism layout (TP / PP
   / DP / EP). `vllm bench serve` is a *client* — it can't change how the
   server is sharded — so these are descriptive metadata: they're echoed
-  in the report (total GPUs = TP×PP×DP) and stored on the measurement so
-  results from different layouts aren't conflated on lookup. The stored
-  theoretical baseline now respects TP and DP (it runs the simulator with
-  the same parallelism the benchmark reports); PP is still unmodelled and
-  any `pipeline_parallel != 1` falls back to "not computed".
+  in the report (total GPUs = TP×PP×DP). PP is still unmodelled and
+  any `pipeline_parallel != 1` makes drift-comparison against the
+  simulator meaningless.
 
 Requires `vllm` installed and a reachable, already-running server. Also
 runnable as a CLI:
 
 ```bash
 uv run python -m agent.tools.benchmarking.benchmark \
-    --base-url http://localhost:8000 --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
-    --request-rate 10 --input-len 1024 --output-len 128 --num-requests 200 \
+    --base-url http://localhost:8000 \
+    --workload-file stages/01_workload.yaml \
     --gpu h100-sxm
 ```
 
-### Measurement store (`record_measurement` / `lookup_measurements`)
+### Tracking prediction drift
 
-Successful benchmarks (and user-reported numbers) are persisted to a
-shared, cross-session JSONL store under `$AGENT_MEASUREMENTS_DIR`
-(default `measurements/`). Each record captures the measured metrics
-**and the corresponding theoretical roofline** — computed from the same
-preset model + GPU at the same operating point via the serving simulator
-— plus the **efficiency factor** (fraction of the roofline achieved:
-throughput = measured ÷ theory, latency = theory ÷ measured). So a single
-record reads, e.g.:
-
-```
-gpt-oss-20b on 4090 | rate=5 req/s, c=11 (peak in-flight) in=256 out=64 tp=1
-  measured: out=305 tok/s, TTFT=43ms, TPOT=7.4ms
-  theory  : out=267 tok/s, TTFT=15ms, TPOT=4.4ms  [SATURATED in theory]
-            | efficiency: output tput 114%, TPOT 60% of ideal
-```
-
-`lookup_measurements(model, gpu)` returns matching records so the agent
-can reality-adjust a fresh estimate. Theory is computed only when the
-model and GPU are exact preset names and the deployment is single-GPU
-(the modeling tools don't yet model TP/PP/DP scaling); otherwise the
-record stores a short note explaining why theory was skipped.
+The agent doesn't maintain a measurement store. Instead, when
+`benchmark_serving` produces a number that diverges meaningfully from
+the matching `simulate_serving(latency_source="baseline")` prediction
+(rule of thumb: > 20% TPOT gap), the agent saves a one-line
+observation via `remember`. Those notes are loaded automatically into
+the system prompt on future sessions, so the agent has cross-session
+awareness of where the microbench grid for a given `(model, gpu)`
+pair may be stale — without needing a separate JSONL store.
 
 ## Quick start
 
@@ -242,14 +222,20 @@ uv run python -m agent.main \
     --base-url http://localhost:8000/v1
 ```
 
-Slash commands inside the REPL:
+Slash commands inside the REPL (and the webui input box):
 
 ```
 /help      list commands
 /tools     list registered tools
+/plan      load the deployment_planning playbook (activates planning mode)
 /reset     clear conversation history (keep the session dir)
-/exit      quit
+/exit      quit (REPL only)
 ```
+
+`/plan` is the user-facing way to enter planning mode — the slash
+command pre-loads the playbook into the conversation, after which
+the agent walks through the four-stage deployment workflow. The
+agent doesn't invoke this on its own; you opt in explicitly.
 
 ## Configuration via YAML
 
@@ -323,7 +309,7 @@ and wraps `vllm bench serve` (subprocess) against a live endpoint. To add
 a different load shape (e.g. a ShareGPT dataset, a concurrency sweep, or
 a single-stream latency probe), add a sibling `@tool` that builds a
 different `vllm bench serve` argument list and parses its `--save-result`
-JSON via the same `ReportBuilder` and `record_measurement` plumbing.
+JSON via the same `ReportBuilder` plumbing.
 
 ### Add a new tool
 

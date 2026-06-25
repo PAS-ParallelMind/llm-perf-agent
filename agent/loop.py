@@ -183,6 +183,25 @@ class ChatAgent:
         return (len(json.dumps(self.messages, default=str))
                 + len(json.dumps(tool_schemas, default=str)))
 
+    # Transient reminder appended to every LLM request so the narration
+    # rule is fresh in the model's context. NOT persisted to
+    # ``self.messages``: the trace stays clean, the webui doesn't see
+    # harness text, and the user's record of the conversation contains
+    # only what they and the assistant said.
+    _NARRATION_REMINDER = (
+        "Reminder: before any tool call, your assistant message MUST "
+        "contain one short sentence of TEXT explaining what you're "
+        "about to do. Don't emit tool calls with empty content."
+    )
+
+    def _messages_for_engine(self) -> list[dict[str, Any]]:
+        """``self.messages`` with the transient narration reminder
+        appended. Use this whenever calling ``engine.chat`` so the
+        reminder reaches the model without polluting persistent state."""
+        return self.messages + [
+            {"role": "system", "content": self._NARRATION_REMINDER}
+        ]
+
     def _trim_context(self, tool_schemas: list[dict[str, Any]],
                       aggressive: bool = False) -> int:
         """Elide the bodies of the oldest tool-result messages until the
@@ -280,13 +299,17 @@ class ChatAgent:
 
             llm_start = time.monotonic()
             try:
-                msg = self.engine.chat(self.messages, tools=tool_schemas)
+                msg = self.engine.chat(
+                    self._messages_for_engine(), tools=tool_schemas,
+                )
             except ContextLengthExceeded:
                 # Estimate was off — trim hard and retry once.
                 n = self._trim_context(tool_schemas, aggressive=True)
                 console.print(f"[yellow]· context overflow: elided {n} old tool "
                               f"result(s), retrying[/]")
-                msg = self.engine.chat(self.messages, tools=tool_schemas)
+                msg = self.engine.chat(
+                    self._messages_for_engine(), tools=tool_schemas,
+                )
             llm_elapsed_ms = round((time.monotonic() - llm_start) * 1000)
 
             # Capture the exact request payload that was just sent, for the

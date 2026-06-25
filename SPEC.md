@@ -105,8 +105,6 @@ and `tools.base.dispatch(name, args)` to execute each call.
 | `grep`              | tools/fs.py                         | Regex across workspace                                 |
 | `bash`              | tools/bash.py                       | Shell exec, timeout-bounded                            |
 | `benchmark_serving` | tools/benchmarking/benchmark.py     | MEASURED serving probe: wraps `vllm bench serve` → TTFT/TPOT/throughput |
-| `record_measurement`| tools/benchmarking/measurements.py  | Persist a measured result to the cross-session store    |
-| `lookup_measurements`| tools/benchmarking/measurements.py | Read back measured results to calibrate estimates       |
 | `estimate_memory`   | tools/modeling/memory.py            | VRAM breakdown: weights + KV cache (per model/concurrency/context) |
 | `simulate_serving`  | tools/modeling/serving.py           | Continuous-batching workload sim: TTFT / TPOT / throughput. `latency_source`: `baseline` (microbench-calibrated, default) or `theoretical` (analytic roofline) |
 | `remember`          | memory.py                           | Save a memory file + index entry                       |
@@ -117,12 +115,12 @@ names from `tools/modeling/configs/`, plus workload-shape ints) and
 return a formatted text report rendered via `tools/modeling/report.py`.
 `benchmark_serving` is the measured counterpart to `simulate_serving`:
 it shells out to `vllm bench serve` (keeping vLLM's torch/CUDA import out
-of the agent process), parses the `--save-result` JSON, renders via the
-same `ReportBuilder`, and on success records the result through
-`record_measurement` so `lookup_measurements` can calibrate later
-estimates. It needs `vllm` installed and a reachable running server, and
-takes real wall-clock time — the loop's per-turn anti-thrash cap keeps it
-from being re-fired blindly.
+of the agent process), parses the `--save-result` JSON, and renders via
+the same `ReportBuilder`. There is no cross-session measurement store;
+when a measurement diverges from the prediction the agent saves a
+one-line observation via `remember` instead. It needs `vllm` installed
+and a reachable running server, and takes real wall-clock time — the
+loop's per-turn anti-thrash cap keeps it from being re-fired blindly.
 
 ---
 

@@ -24,7 +24,6 @@ from pathlib import Path
 from ..base import tool
 from ..modeling.report import ReportBuilder
 from ...workspace import get_root
-from .measurements import record_measurement
 
 # vLLM bench serve builds the request URL as ``base_url + endpoint`` but also
 # hits ``base_url + /v1/models`` and ``base_url + /metrics`` on its own, so
@@ -224,46 +223,6 @@ def _render_report(
     return rb.build()
 
 
-def _record_to_store(
-    data: dict,
-    *,
-    workload_file: str,
-    model: str,
-    gpu: str,
-    tensor_parallel: int,
-    pipeline_parallel: int,
-    data_parallel: int,
-    expert_parallel: bool,
-) -> str:
-    """Persist the measured result in the cross-session measurement store so
-    future estimates can be calibrated. Returns a one-line status."""
-    if not data.get("completed"):  # all requests failed → don't pollute the store
-        return "(not recorded: no requests completed — metrics would be all-zero)"
-    # `concurrency` stored here is the OBSERVED peak in-flight (the bridge to
-    # the simulator's load notion). For an open-loop run it's what actually
-    # happened; for a closed-loop run (request_rate=inf + max_concurrency cap)
-    # it's the cap itself.
-    observed_peak = int(data.get("max_concurrent_requests") or 0)
-    record_measurement(
-        workload_file=workload_file,
-        gpu=gpu or "unknown",
-        concurrency=observed_peak,
-        ttft_ms=data.get("mean_ttft_ms", 0.0),
-        tpot_ms=data.get("mean_tpot_ms", 0.0),
-        tensor_parallel=tensor_parallel,
-        pipeline_parallel=pipeline_parallel,
-        data_parallel=data_parallel,
-        expert_parallel=expert_parallel,
-        source="vllm bench serve",
-        notes=f"completed={data.get('completed', '?')}, "
-              f"served_rate={data.get('request_throughput', 0.0):.3f} req/s",
-    )
-    if not gpu:
-        return ("recorded to measurement store (gpu='unknown' — pass `gpu` "
-                "with the server's GPU preset so lookups can calibrate by hardware)")
-    return f"recorded to measurement store as {model} on {gpu}"
-
-
 def run_benchmark(
     *,
     base_url: str,
@@ -371,17 +330,7 @@ def run_benchmark(
         wall_s=wall_s,
         data=data,
     )
-    recorded = _record_to_store(
-        data,
-        workload_file=workload_file,
-        model=model,
-        gpu=gpu,
-        tensor_parallel=tensor_parallel,
-        pipeline_parallel=pipeline_parallel,
-        data_parallel=data_parallel,
-        expert_parallel=expert_parallel,
-    )
-    return f"{report}\n\n[raw result saved to {result_filename}]\n[{recorded}]"
+    return f"{report}\n\n[raw result saved to {result_filename}]"
 
 
 @tool(
@@ -395,16 +344,16 @@ def run_benchmark(
              "'/v1' is stripped automatically).",
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain `model`, "
-                  "`request_rate`, `input_len`, `output_len`, `num_requests`. "
-                  "`max_concurrent_requests` (optional) maps to "
-                  "`--max-concurrency`. `range_ratio` (optional, default "
-                  "0.0) sets per-request length jitter. Pass "
-                  "`request_rate: inf` in the YAML for closed-loop mode.",
+                  "`request_rate`, `input_len`, `output_len`. `num_requests` "
+                  "is auto-derived from `request_rate`. `max_concurrent_requests` "
+                  "(optional) maps to `--max-concurrency`. `range_ratio` "
+                  "(optional, default 0.0) sets per-request length jitter. "
+                  "Pass `request_rate: inf` in the YAML for closed-loop mode.",
     endpoint="API path appended to base_url; '/v1/completions' (default) or "
              "'/v1/chat/completions'.",
-    gpu="GPU the server runs on (prefer a PRESET_GPUS name). Tags the "
-        "recorded measurement so later lookup_measurements can calibrate by "
-        "hardware. Blank = recorded as 'unknown'.",
+    gpu="GPU the server runs on (prefer a PRESET_GPUS name). Used in the "
+        "report header so the measured numbers are unambiguously tagged to "
+        "hardware. Blank = labelled 'unknown'.",
     tensor_parallel="The server's tensor-parallel size (TP). Descriptive "
                     "metadata — the server is already running with this "
                     "layout; the benchmark does not set it. Default 1.",
@@ -440,7 +389,6 @@ def benchmark_serving(
     request_rate = str(rr) if rr is not None else ""
     input_len = wf.get("input_len", 0)
     output_len = wf.get("output_len", 0)
-    num_requests = wf.get("num_requests", 0)
     max_concurrency = wf.get("max_concurrent_requests", 0)
     range_ratio = float(wf.get("range_ratio", 0.0))
 
@@ -448,6 +396,13 @@ def benchmark_serving(
         return f"ERROR: workload {workload_file!r} is missing `model`."
     if not request_rate:
         return f"ERROR: workload {workload_file!r} is missing `request_rate`."
+
+    # num_requests is hard-coded — see modeling.serving.auto_num_requests.
+    from ..modeling.serving import auto_num_requests
+    try:
+        num_requests = auto_num_requests(float(rr))
+    except (TypeError, ValueError):
+        num_requests = auto_num_requests(0.0)  # falls through to closed-loop default
 
     return run_benchmark(
         base_url=base_url,
@@ -475,19 +430,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Measured serving benchmark (wraps vllm bench serve). "
                     "Workload knobs (model, request_rate, input/output_len, "
-                    "num_requests, max_concurrency) come from a "
-                    "WorkloadProfile YAML."
+                    "max_concurrency) come from a WorkloadProfile YAML. "
+                    "num_requests is auto-derived from request_rate."
     )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--workload-file", required=True,
                         help="Path to a WorkloadProfile YAML. Must contain "
-                             "model, request_rate, input_len, output_len, "
-                             "num_requests. max_concurrent_requests "
-                             "(optional) maps to --max-concurrency. "
-                             "range_ratio (optional) controls length jitter.")
+                             "model, request_rate, input_len, output_len. "
+                             "max_concurrent_requests (optional) maps to "
+                             "--max-concurrency. range_ratio (optional) "
+                             "controls length jitter. num_requests is "
+                             "auto-derived from request_rate.")
     parser.add_argument("--endpoint", type=str, default="/v1/completions")
     parser.add_argument("--gpu", type=str, default="",
-                        help="GPU preset name. Tags the recorded measurement.")
+                        help="GPU preset name. Labels the measurement in the report header.")
     parser.add_argument("--tensor-parallel", type=int, default=1)
     parser.add_argument("--pipeline-parallel", type=int, default=1)
     parser.add_argument("--data-parallel", type=int, default=1)
@@ -500,6 +456,11 @@ if __name__ == "__main__":
     rr = wf.get("request_rate")
     if rr is None:
         raise SystemExit(f"workload {args.workload_file!r} missing request_rate")
+    from ..modeling.serving import auto_num_requests
+    try:
+        cli_num_requests = auto_num_requests(float(rr))
+    except (TypeError, ValueError):
+        cli_num_requests = auto_num_requests(0.0)
 
     print(run_benchmark(
         base_url=args.base_url,
@@ -508,7 +469,7 @@ if __name__ == "__main__":
         request_rate=str(rr),
         input_len=wf["input_len"],
         output_len=wf["output_len"],
-        num_requests=wf["num_requests"],
+        num_requests=cli_num_requests,
         max_concurrency=wf.get("max_concurrent_requests", 0),
         range_ratio=float(wf.get("range_ratio", 0.0)),
         endpoint=args.endpoint,

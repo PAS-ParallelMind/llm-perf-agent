@@ -188,12 +188,32 @@ class SessionStore:
         SSE endpoint can stream step / tool events to the browser as they
         happen. The per-session lock means concurrent callers for the same
         session serialize (later one waits for the in-flight turn).
+
+        Slash commands (``/plan``, ``/reset``, ``/tools``, ``/help``) are
+        intercepted via :mod:`agent.slash` and never hit the model — they
+        return a synthetic turn with the slash response as ``reply``.
         """
+        from agent.slash import dispatch_slash
+
         entry = self._get_or_resume(name)
         with entry.lock:
             # Re-point the workspace anchor at this session's dir in case
             # another session was used in between.
             set_root(entry.workspace)
+
+            if message.lstrip().startswith("/"):
+                slash = dispatch_slash(message.lstrip(), entry.agent)
+                if slash is not None:
+                    _export_trace(entry.agent, entry.workspace, entry.meta)
+                    return {
+                        "reply":      slash.response or "",
+                        "steps":      0,
+                        "elapsed_s":  0.0,
+                        "truncated":  False,
+                        "messages":   list(entry.agent.messages),
+                        "turns":      entry.meta.turns,
+                    }
+
             result: TurnResult = entry.agent.chat(message, on_event=on_event)
             entry.meta.turns += 1
             entry.meta.total_steps += result.steps

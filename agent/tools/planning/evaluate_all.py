@@ -1,4 +1,4 @@
-"""Hardware Pareto sweep — Stage 2 of the deployment-planning workflow.
+"""Stage-2 hardware sweep — evaluate every (gpu, tp, dp) candidate.
 
 For each candidate (gpu, tp, dp): check the model weights fit on the
 replica's aggregate VRAM (TP shards weights across `tp` GPUs), run the
@@ -74,15 +74,19 @@ class _CandidateRow:
 
 
 def _enumerate_parallelism(model_spec, count: int) -> list[ParallelConfig]:
-    """All valid (tp, dp) splits with tp*dp <= count and tp dividing
-    the head counts. Single-GPU (tp=1, dp=1) is always included."""
+    """All valid (tp, dp) splits with tp*dp <= count, tp a power of 2,
+    and tp dividing the head counts. Single-GPU (tp=1, dp=1) is always
+    included. (Real deployments effectively only use power-of-2 TP
+    degrees, so non-power-of-2 candidates are skipped to keep the
+    sweep table focused on plausible configurations.)"""
     out: list[ParallelConfig] = []
     head_lcd = min(model_spec.n_attention_heads, model_spec.n_kv_heads)
-    for tp in range(1, count + 1):
-        if head_lcd % tp != 0:
-            continue
-        for dp in range(1, count // tp + 1):
-            out.append(ParallelConfig(tp=tp, dp=dp))
+    tp = 1
+    while tp <= count:
+        if head_lcd % tp == 0:
+            for dp in range(1, count // tp + 1):
+                out.append(ParallelConfig(tp=tp, dp=dp))
+        tp *= 2
     return out
 
 
@@ -213,7 +217,7 @@ def _format_table(
     latency_source: str,
 ) -> str:
     rb = ReportBuilder(width=118)
-    rb.banner(f"HARDWARE PARETO SWEEP — {latency_source.upper()} MODE")
+    rb.banner(f"HARDWARE SWEEP — {latency_source.upper()} MODE")
     rb.line()
     headers = ["gpu", "tp", "dp", "n_gpu", "fits?", "KV peak", "served (r/s)",
                "req lat (s)", "ttft (ms)", "tpot (ms)", "$/1M tok",
@@ -280,8 +284,9 @@ def _format_table(
     "All workload knobs come from the YAML.",
     workload_file="Workspace-relative path to a WorkloadProfile YAML "
                   "(e.g. 'stages/01_workload.yaml'). Must contain `model`, "
-                  "`request_rate`, `input_len`, `output_len`, `num_requests`, "
-                  "`max_num_batched_tokens`. `max_concurrent_requests` and "
+                  "`request_rate`, `input_len`, `output_len`, "
+                  "`max_num_batched_tokens`. `num_requests` is auto-derived "
+                  "from `request_rate`. `max_concurrent_requests` and "
                   "`target_request_latency_s` are optional.",
     candidates="List of `{gpu: <PRESET_GPUS key>, count: <int>}` entries "
                "describing what the user has available. The tool enumerates "
@@ -293,7 +298,7 @@ def _format_table(
                    "(efficiency=1.0 every op); useful for headroom analysis "
                    "but over-predicts throughput on real hardware.",
 )
-def pareto_sweep(
+def evaluate_all(
     workload_file: str,
     candidates: list,
     latency_source: str = "baseline",
@@ -309,11 +314,13 @@ def pareto_sweep(
     request_rate = wf.get("request_rate", 0.0)
     input_len = wf.get("input_len", 0)
     output_len = wf.get("output_len", 0)
-    num_requests = wf.get("num_requests", 0)
     max_num_batched_tokens = wf.get("max_num_batched_tokens", 0)
     max_concurrent_requests = wf.get("max_concurrent_requests", 0) or 1024
     range_ratio = float(wf.get("range_ratio", 0.0))
     target_request_latency_s = wf.get("target_request_latency_s", 0.0)
+    # num_requests is hard-coded — see modeling.serving.auto_num_requests.
+    from ..modeling.serving import auto_num_requests
+    num_requests = auto_num_requests(float(request_rate))
 
     if model not in PRESET_MODELS:
         return (f"ERROR: unknown model {model!r}. "

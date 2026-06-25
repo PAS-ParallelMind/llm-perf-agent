@@ -13,33 +13,63 @@ the four stages below in order. Persist a structured artifact at the end of
 each stage to `stages/0N_<name>.yaml` so the run is auditable and re-entrant.
 Announce each stage as you enter it (e.g. `**Stage 1 — Service requirement**`).
 
-**Mode override**: in planning mode, **sweeping over candidates is the
-point** of Stage 2. The base system-prompt rule "converge, don't sweep"
-does NOT apply here.
+## HARD RULES (apply to every stage; do NOT skip)
+
+- **Provide tool-call narration.** Before each tool invocation, briefly explain what you are about to do. After the tool returns, summarize the key findings, including the most important metrics and their units, followed by a concise interpretation.
+
+  Examples:
+
+  * Before: "Checking memory requirements for the selected deployment."
+  * After: "Estimated memory requirement is 67.2 GB. The model fits on an 80 GB GPU with moderate headroom."
+
+  Do not silently execute tool calls, chain multiple tools without explanation, or present raw results without interpretation. Detailed tables should only be shown when requested.
+- **Persist artifacts.** Each stage writes its YAML artifact to
+   `stages/0N_*.yaml` via `write_file` before declaring the stage done.
+- **One-stage corrections.** If the user revises an earlier stage,
+   do just that stage and propagate downstream — don't loop back
+   silently.
+- **Plain terms in replies.** Never use the words "baseline" or
+   "theoretical" in user-facing text — they're internal mode names
+   and confuse the reader. Say "what vLLM delivers today" (or the
+   actual serving framework the user named) for the realistic
+   projection, and "the hardware's analytic ceiling" for the peak.
+   Never echo internal labels like "Table A", "chosen_path", or
+   `latency_source` to the user either.
+- **Present result, then proceed.** Each stage must end with a
+   clear summary of what it produced — the workload profile for
+   Stage 1, the two recommendations + headroom for Stage 2, the
+   actual performance + verification + headroom for Stage 3 — before
+   you announce the next stage or fire any of its tool calls. Do
+   NOT chain straight from Stage N's last tool call into Stage N+1's
+   plan and tools in the same turn without a result section in
+   between. The user should be able to read each stage's output as
+   a self-contained answer before the next stage starts.
 
 ## Mental model — what the workflow is doing
 
-- **Stage 1** characterises the workload (estimates, past experience, or
-  request traces) into concrete knobs.
-- **Stage 2** runs the workload through each hardware candidate under
-  two latency models, forking into two paths:
-  - **Baseline performance** (vLLM, SGLang, etc. as-is). The agent
-    calls `simulate_serving(..., latency_source="baseline")` — the
-    microbench-calibrated realistic projection. No measurement lookup
-    needed; the per-GPU microbench grid *is* the calibration. The user
-    picks hardware on these projected numbers. Stage 3 runs an
-    open-loop capacity probe on the real server and reports
-    measured-vs-baseline-projection.
-  - **Potential performance (after optimization)**. The agent calls
-    `simulate_serving(..., latency_source="theoretical")` — the
-    analytic peak ceiling (FLOPs/bytes × theoretical peaks,
-    efficiency=1.0 everywhere). The user picks hardware on that
-    ceiling, accepting the implementation gap as something they'll
-    close. Stage 3 measures the deployment against the ceiling and
-    diagnoses *where* the gap is. Stage 4 (parked) would close it.
-
-Stage 2 reports **both** paths' Pareto tables and the user picks. Only
-the chosen plan is persisted.
+- **Stage 1 — Understand the workload.** Turn the user's service
+  description into concrete knobs (request rate, in/out length, SLO).
+- **Stage 2 — Evaluate every deployment option and pick the
+  platform.** For each viable (gpu, tp, dp), predict performance
+  under what vLLM delivers today AND under the analytic ceiling.
+  Recommend the best-performance and best-cost configs (both from
+  the vLLM projection), and show per-platform headroom so the user
+  picks with the long-horizon potential in view.
+- **Stage 3 — Report the actual performance of the chosen platform.**
+  The primary deliverable is what the deployed server actually does:
+  capacity (max sustained request rate, max concurrency at SLO) and
+  per-request latencies (TTFT, TPOT, E2E). Two supporting analyses
+  sit alongside: **verification** (does the measurement track the
+  Stage-2 vLLM projection? — gives the user confidence the prediction
+  is trustworthy) and **headroom** (how much room is left between
+  measured performance and the hardware's analytic ceiling? — sets up
+  Stage 4).
+- **Stage 4 — optimize the software implementation.** Given the
+  Stage 3 headroom and the bottleneck op, suggest software-level
+  changes (kernel choice, scheduler tuning, prefix caching,
+  speculative decoding, etc.) to close the gap. **Currently parked**
+  — the tools to drive it don't exist yet; the agent can list what
+  *would* be done but can't execute.
 
 ## STEP 0 — REQUIRED road-map (write this FIRST, do not skip)
 
@@ -55,22 +85,27 @@ verbatim or lightly paraphrased — the four numbered bullets and the
 closing "let me know" line are required:
 
 > You want to deploy a model — here's how I'll work through it:
-> 1. **Workload profile** — translate your service description into
->    concrete numbers (request rate, input/output length, latency target).
-> 2. **Hardware sweep** — for each GPU you have, enumerate every
->    (tp, dp) split that fits and simulate it twice: once for
->    **what the baseline software stack (vLLM today) will actually
->    deliver**, and once for **the analytic ceiling — what the
->    hardware could reach with optimised kernels**. I'll then give
->    you two recommendations in plain terms:
->    *"If you deploy with vLLM as-is, X is the best choice. But Y has
->    the highest potential if you can optimise the implementation."*
->    You pick which one to take forward.
-> 3. **Measure performance** — run benchmarks on the deployed server
->    to map its real capacity (max concurrency, max sustainable
->    request rate). If you picked the optimisation route, also
->    compare measured vs theoretical to diagnose where the gap is.
-> 4. *(future work)* Optimisation suggestions for the bottleneck.
+> 1. **Understand the workload** — translate your service description
+>    into concrete numbers (request rate, input/output length, SLO).
+> 2. **Evaluate deployment solutions** — for each GPU
+>    you have, simulate every viable (tp, dp) split twice: once for
+>    **what vLLM will actually deliver today**, and once for **the
+>    hardware's analytic ceiling**. I'll recommend the best-performance
+>    and best-cost configs from the vLLM numbers, and show per-platform
+>    headroom so you can see which platforms have the most room to
+>    grow as software matures. You pick one to deploy.
+> 3. **Report the actual performance of the chosen platform** — run
+>    benchmarks on the deployed server and tell you what it actually
+>    delivers: max sustained request rate, max concurrency at SLO,
+>    and per-request TTFT / TPOT / E2E. Alongside the headline, I'll
+>    also (a) verify the measurement against the Stage-2 vLLM
+>    projection (does the prediction hold up?) and (b) show the
+>    headroom to the hardware's analytic ceiling (how much room for
+>    optimisation).
+> 4. *(future work)* **optimize the software implementation** —
+>    suggest kernel / scheduler / serving-stack changes to close the
+>    Stage-3 headroom. Currently parked; I can describe what would
+>    be done but can't run it.
 >
 > Let me know if you'd rather just chat about specific numbers instead.
 
@@ -81,7 +116,7 @@ same assistant message that starts Stage 1, then continue.
 road-map bullets? If not, you skipped Step 0 — fix it before any
 Stage-1 tool call.
 
-## Stage 1 — Service requirement → Workload profile
+## Stage 1 — Understand the workload
 
 **Gate**: before reading anything else in this section, confirm the
 Step-0 road-map is in your reply for this turn. If it isn't, stop —
@@ -94,16 +129,15 @@ that the user should own; the agent must not silently default them:
 
 - `model` — the preset key being deployed
 - `request_rate` — req/s the server will see (or `.inf` for closed-loop)
-- `input_len`, `output_len` — workload shape (incl. reasoning budget
-  if the model reasons; state the split if so)
-- `target_request_latency_s` — the SLO
+- `input_len`, `output_len` — the avg input, output context length of the requests
+- `target_request_latency_s` — the SLO. Stage 2 evalutes whether a hardware configuration candidate meet the requirement.
 
 **Process**:
 
 1. **Check the essentials.** For each missing essential, decide
    between two responses:
    - **Ask** when the user's description doesn't constrain it enough
-     to make a defensible assumption (e.g. "model" never stated, or
+     to make a defensible assumption (e.g. `model` never stated, or
      SLO unspecified with no archetype hint).
    - **Assume + emphasize** when the archetype gives a clear default
      (e.g. user said "code completion in IDE" → archetype lookup gives
@@ -114,10 +148,19 @@ that the user should own; the agent must not silently default them:
      left blank — proceed only after the user answers or you've
      explicitly stated every assumption.
 
-2. **Derive non-essentials** from the system-prompt rules (`num_requests`
-   sizing, `max_num_batched_tokens` / `max_concurrent_requests`
-   defaults, `range_ratio`). These get an *explicit assumption line*
-   in the Assumptions block but don't need to block on the user.
+2. **Derive non-essentials** from the system-prompt rules
+   (`max_num_batched_tokens` / `max_concurrent_requests` defaults,
+   `range_ratio`). These get an *explicit assumption line* in the
+   Assumptions block but don't need to block on the user.
+   `num_requests` is auto-derived by the tools — do NOT write it
+   into the workload YAML.
+
+3. **When the user supplied every essential explicitly**, do NOT
+   invent assumptions. The Assumptions block is for values *you*
+   chose because the user didn't state them. If every essential came
+   straight from the user and the non-essentials all match the
+   system-prompt defaults, **omit the assumptions block entirely**
+   from both the artifact and the reply — there's nothing to flag.
 
 **Output artifact** → write to `stages/01_workload.yaml`:
 
@@ -125,19 +168,17 @@ that the user should own; the agent must not silently default them:
 model: <PRESET_MODELS key>
 request_rate: <float>              # req/s, Poisson arrivals (NOT concurrency)
 input_len: <int>
-output_len: <int>                  # incl. reasoning budget if model reasons
-num_requests: <int>                # max(200, ~100 × request_rate) — ~100s of arrivals so the queue reaches steady state
+output_len: <int>                  # user-supplied; reasoning budget is already folded in
 max_num_batched_tokens: <int>      # vLLM --max-num-batched-tokens (e.g. 8192)
 max_concurrent_requests: <int>     # vLLM --max-num-seqs server cap (e.g. 1024)
 range_ratio: <float>               # 0.0 = fixed lengths (clean modeled-vs-measured
                                    # comparison); 0.1 = ±10% per-request jitter
 target_request_latency_s: <float>  # end-to-end per-request seconds
+# OPTIONAL — only present when the agent had to assume one or more
+# values. One bullet per assumption: <field>: <value> — <why>.
+# Omit the whole `assumptions:` key if everything was user-supplied.
 assumptions:
-  archetype: <chat|RAG|code|summarization|agentic>
-  think_time_s: <float>
-  peak_active_fraction: <float>
-  reasoning_budget_tokens: <int|0 if non-reasoning model>
-  notes: "<anything else worth surfacing>"
+  - "<field>: <value> — <why this default was chosen>"
 ```
 
 Concurrency is **not** a workload knob in this schema — it's a *result*
@@ -145,10 +186,16 @@ of running the workload through the server (the simulator and benchmark
 both report observed peak / mean in-flight). The deployer's lever is
 the arrival rate.
 
-**Reply to the user**: a tight summary — the workload knobs you chose, the
-assumptions you made, and a one-line invitation to override.
+**Reply to the user** (HARD RULE #5 — present-then-proceed): write
+this as the final content of the Stage 1 turn, before any Stage 2
+announcement. A tight summary of the workload knobs you captured.
+**Only** include an "Assumptions" section if step 3's condition is
+false (i.e. you actually had to assume one or more values); if every
+essential came from the user, skip it. Close with a one-line
+invitation to override. Stage 2 starts in the **next** turn, after
+the user either confirms or asks for changes.
 
-## Stage 2 — Workload + candidates → Deployment plan
+## Stage 2 — Evaluate deployment solutions
 
 **Input**: WorkloadProfile from Stage 1.
 
@@ -168,109 +215,223 @@ assumptions you made, and a one-line invitation to override.
    - Heads up: if a GPU has no microbench grid under
      `agent/tools/modeling/configs/hw_profiles/<gpu>/`, `baseline`
      mode will raise on it. Flag this before running the sweep
-     ("`pareto_sweep` can't run baseline mode on `<gpu>` — its
+     ("`evaluate_all` can't run baseline mode on `<gpu>` — its
      microbench grid is missing"). The user either picks a different
      GPU, runs a microbench sweep, or proceeds with theoretical-only
      for that one.
-   - **Do not run the pareto_sweep tool without a confirmed candidate
+   - **Do not run the evaluate_all tool without a confirmed candidate
      list** — proceed only after the user names the GPUs and counts.
 
-2. **Baseline projection sweep — Table A**: call
+   **Do NOT pre-flight a fit check with `estimate_memory` before
+   `evaluate_all`.** Reasons:
+   - `evaluate_all`'s `_evaluate` step already gates each candidate
+     on weights-fit (per-replica VRAM after TP sharding) and surfaces
+     KV-bound saturation as a row note. Anything `estimate_memory`
+     would tell you, the sweep already tells you per row.
+   - `max_concurrent_requests` in the workload YAML is a **server-
+     policy cap** (vLLM's `--max-num-seqs`), NOT the steady-state
+     in-flight count. Calling `estimate_memory(concurrency=
+     max_concurrent_requests)` produces a worst-case VRAM number that
+     is almost always pessimistic — actual concurrency is determined
+     by `request_rate` and per-request service time (Little's Law),
+     and the simulator's admission control derives it dynamically.
+     A worst-case fit check at the policy cap will tell you "nothing
+     fits" even for workloads where every candidate is comfortable.
+   - Pre-flighting any extra step that wasn't in the announced plan
+     also violates HARD RULE #1. If the sweep is in the plan, run
+     the sweep — don't insert a fit gate first.
+
+2. **vLLM projection sweep — Table A**: call
    ```
-   pareto_sweep(
+   evaluate_all(
        workload_file="stages/01_workload.yaml",
        candidates=[{"gpu": "<key>", "count": <int>}, ...],
        latency_source="baseline",
    )
    ```
-   The microbench-calibrated realistic projection. Cost per Mtok is
-   the deployment cost (`tp × dp × per-GPU $/h`), so heavier configs
-   are correctly penalised — multi-GPU only earns its keep when it
-   meets the latency target a smaller config cannot.
+   `latency_source="baseline"` is the API string for the microbench-
+   calibrated mode — it projects what vLLM actually delivers today.
+   Cost per Mtok is the deployment cost (`tp × dp × per-GPU $/h`), so
+   heavier configs are correctly penalised — multi-GPU only earns
+   its keep when it meets the latency target a smaller config
+   cannot.
 
-3. **Theoretical ceiling sweep — Table B**: call the same tool with
-   `latency_source="theoretical"`. The analytic peak ceiling. Use it
-   to scope the implementation-optimisation headroom: where the
-   theoretical pareto frontier shifts vs the baseline frontier tells
-   you how much faster the system *could* run if every kernel hit
-   peak.
+3. **Analytic ceiling sweep — Table B**: call the same tool with
+   `latency_source="theoretical"` (API string). The analytic peak
+   ceiling, used here as **context for the headroom story**, not as
+   an alternative recommendation. For each candidate, the ratio
+   `vllm_latency / ceiling_latency` is how much faster the hardware
+   *could* run if its kernels matured.
 
-4. **Pick winners on each table.** From Table A (baseline), find the
-   cheapest config that meets `target_request_latency_s`. From Table B
-   (theoretical), the same. Call these **A★** and **B★**. If neither
-   table has a meeter, pick the closest miss in each and say what
-   would need to change (lower rate, larger GPU budget, more
-   parallelism than available).
+4. **Pick TWO recommendations from Table A (vLLM)** — ranked on
+   **predicted latency**, not throughput-normalized cost:
 
-5. **Present in plain terms** — do NOT use the internal labels
-   "baseline-software path" / "optimized-software path" in your reply
-   to the user. Lead with both tables (compact form is fine), then
-   the recommendations in this template:
+   - **Performance winner** — the config with the *lowest
+     `request_latency_s`* that **meets `target_request_latency_s`**.
+     Lowest latency = best deploy if latency is the binding concern.
+   - **Cost winner** — the config with the *fewest total `n_gpus`*
+     that **meets `target_request_latency_s`**. Fewest GPUs = least
+     hardware spend, since deployment cost is `n_gpus × per-GPU $/h`
+     regardless of how the GPUs are split between TP and DP. Use
+     lowest `request_latency_s` as the tiebreaker when multiple
+     configs share the same `n_gpus`.
 
-   > **If you deploy with vLLM (the baseline software today), `<A★ gpu
-   > tp=X dp=Y>` is the best choice** — meets your `<N>s` SLO at
-   > `$<a>/Mtok` on `<n_gpus>` GPU(s).
+   Notes on ranking:
+   - Use `request_latency_s` from the table as-is — the predicted
+     latency for completed requests is what the user cares about.
+     Do NOT filter by `served (r/s)` or invent a saturation gate;
+     just rank by latency.
+   - The `$/1M tok` column in the table is throughput-normalized
+     (it folds in served-rate). Don't use it as the cost-rank key —
+     two configs with the same `n_gpus` use the same hardware and
+     are equally expensive to run, even if the table prints
+     different `$/Mtok` numbers.
+
+   If no config in your GPU budget meets the SLO, recommend the
+   closest miss and be honest: "no config in your GPU budget meets
+   the `<N>s` SLO under vLLM today — closest miss is `<X>` at
+   `<Y>s`. Options: lower the rate, bigger GPU budget, or accept
+   the slower latency."
+
+   When the same config wins both axes, call that out explicitly
+   ("the cheapest config is also the fastest — nothing to trade off").
+
+5. **Present in plain terms** — re-read HARD RULE #4: the words
+   "baseline" and "theoretical" must NOT appear anywhere in your
+   user-facing reply. Use "vLLM" (or the actual framework name) for
+   the realistic projection and "analytic ceiling" for the peak.
+
+   **Show simulation results for the two best configurations only.**
+   Don't dump every (gpu, tp, dp) row — the user wants to see the
+   numbers behind the recommendations, not the whole sweep. Pick
+   the performance winner and the cost winner from the vLLM table
+   (per step 4), then surface each pick's full numbers (TTFT, TPOT,
+   request latency, $/Mtok) and its analytic-ceiling counterpart so
+   the user can see the headroom right next to the recommendation.
+
+   Use this template:
+
+   > **Best performance** — `<gpu_p> tp=X dp=Y>` on `<n_gpus_p>` GPU(s)
+   > (~`$<n_gpus_p × per_gpu_hourly>/h` hardware):
    >
-   > **But `<B★ gpu tp=X dp=Y>` has the highest potential if you can
-   > optimise the implementation** — the analytic ceiling is `<M>s` at
-   > `$<b>/Mtok`, which would <undercut A★ / be the cheapest meet /
-   > be the only meet> if you close the kernel gap.
+   > | metric | vLLM today | analytic ceiling |
+   > |---|---:|---:|
+   > | request latency | `<lat_p>s` | `<lat_p_ceiling>s` |
+   > | TTFT (mean) | `<ttft_p>ms` | `<ttft_p_ceiling>ms` |
+   > | TPOT (mean) | `<tpot_p>ms` | `<tpot_p_ceiling>ms` |
+   > | meets `<N>s` SLO | ✓/✗ | — |
    >
-   > Which way do you want to go — `<A★>` (deploy today on vLLM) or
-   > `<B★>` (commit to optimising)?
+   > Headroom: **`<latency_p / latency_p_ceiling>×`** between vLLM
+   > and the ceiling.
+   >
+   > **Best cost** — `<gpu_c> tp=X dp=Y>` on `<n_gpus_c>` GPU(s)
+   > (~`$<n_gpus_c × per_gpu_hourly>/h` hardware):
+   > _[same table shape as above]_
+   >
+   > Headroom: **`<latency_c / latency_c_ceiling>×`**.
 
-   Adjust the framing if A★ == B★ ("the same config wins both — vLLM
-   already gets close to the ceiling here") or if one table has no
-   meeter at all ("nothing meets your SLO under vLLM today; only
-   `<B★>` could meet it after optimisation").
+   Hardware cost goes in the header as `$/h = n_gpus × per-GPU $/h`
+   (a fixed-rate number — same `n_gpus` ⇒ same hourly cost),
+   **not** as throughput-normalized `$/Mtok`. The `$/Mtok` column
+   from the evaluate_all table is useful information but it folds
+   in achieved throughput, so two same-n_gpus configs can print
+   wildly different `$/Mtok` even though their hardware cost is
+   identical — that confused users in past runs, so we lead with
+   `$/h` here.
+   >
+   > Both recommendations are sized against what vLLM delivers
+   > today. The headroom column shows how much room each platform
+   > has if the kernel ecosystem matures — useful for long-horizon
+   > planning, but optimising kernels is hard so we don't size
+   > against the ceiling.
+   >
+   > Which one do you want to take forward — performance, cost, or
+   > something else?
 
-   The framework name "vLLM" is the default baseline assumption —
-   swap if the user named a different framework explicitly.
+   Collapse to one config (and drop the "which one?" question) when
+   performance and cost picks are the same. When no config meets
+   SLO, replace the cost block with one honest line ("nothing in
+   your GPU budget meets the `<N>s` SLO under vLLM today — closest
+   miss is `<X>` at `<Y>s`; options: lower the rate, bigger GPU
+   budget, or accept the slower latency") and still show the
+   performance winner's table.
 
-**Output artifact** → write **only the chosen plan** to
-`stages/02_plan.yaml`:
+   The framework name "vLLM" is the default assumption for what's
+   running on the server — swap if the user named a different
+   framework explicitly (SGLang, TensorRT-LLM, etc.).
+
+**Output artifact** → write to `stages/02_plan.yaml`:
 
 ```yaml
 candidate_set:                       # what the user told you they have
   - {gpu: <key>, count: <int>}
-chosen_path: baseline | optimized    # baseline = baseline latency_source / measure to verify
-                                     # optimized = theoretical latency_source / measure to diagnose gap
-recommended:
-  gpu: <key>
-  parallelism: {tp: <int>, dp: <int>}
-  n_gpus: <tp * dp>
-  rationale: "<why this point under the chosen path>"
-meets_target: <true|false>
-projected:                           # from the chosen path's table row
-  source: "simulate_serving latency_source=<baseline|theoretical>"
-  ttft_ms: <float>
-  tpot_ms: <float>
-  request_latency_s: <float>
-  cost_per_mtok: <float>
+recommendations:                     # both from Table A (vLLM projection)
+  performance:                       # lowest request_latency_s that meets SLO
+    gpu: <key>
+    parallelism: {tp: <int>, dp: <int>}
+    n_gpus: <tp * dp>
+    deployment_cost_per_hour: <float> # n_gpus × per-GPU $/h (fixed-rate, not throughput-normalized)
+    request_latency_s: <float>
+    ttft_ms: <float>
+    tpot_ms: <float>
+    meets_target: <true|false>
+  cost:                              # fewest n_gpus that meets SLO; null if none
+    gpu: <key>
+    parallelism: {tp: <int>, dp: <int>}
+    n_gpus: <tp * dp>
+    deployment_cost_per_hour: <float>
+    request_latency_s: <float>
+    ttft_ms: <float>
+    tpot_ms: <float>
+headroom:                            # ratio vllm/ceiling per candidate
+  - {gpu: <key>, tp: <int>, dp: <int>, ratio: <float>}
+  - ...
 ```
 
-**Reply to the user**: the two tables (or compact summaries), the two
-recommendations, the path question. After they answer, confirm the
-chosen plan and tell them "next: Stage 3 measures the deployment."
+**Reply to the user** (HARD RULE #5 — present-then-proceed): write
+this as the final content of the Stage 2 turn, before any Stage 3
+announcement. The two tables (or compact summaries), the two
+recommendations, the headroom block, and the "which one?" question
+(skip if perf == cost). Stage 3's input is whichever recommendation
+the user picks; record their pick before moving on. **Wait for the
+user's pick — do NOT start Stage 3 tool calls in the same turn.**
 
-## Stage 3 — Measure performance
+## Stage 3 — Report the actual performance of the chosen platform
 
-**Input**: WorkloadProfile + DeploymentPlan (with `chosen_path`).
+**Input**: WorkloadProfile + the user's pick from Stage 2's two
+recommendations (performance or cost) in `stages/02_plan.yaml`.
+Record the pick in the Stage 3 artifact so the trace shows which
+config was actually deployed.
 
-**Goal**: map the deployed system's actual capacity — the maximum
-sustained request rate it can serve and the maximum concurrency it
-can handle before SLO breaches. Both numbers come from
-`benchmark_serving` against the running server. Whether we *also*
-compare against the theoretical ceiling depends on `chosen_path`.
+**Goal**: the **headline deliverable** is the actual performance of
+the deployed configuration — capacity (max sustained request rate,
+max concurrency at SLO) plus per-request latencies (TTFT, TPOT, E2E)
+measured against the real server. This is what the user takes away
+from Stage 3.
 
-**Common preflight** (both paths):
+Two supporting analyses are presented alongside the headline numbers
+(not as separate top-level deliverables):
 
-1. **Ask about a running server.** Tell the user the recommended
-   config (`gpu`, `tp`, `dp`) and ask: *"Do you have an OpenAI-
-   compatible server running this config? Give me the `base_url` and
-   the served `model` name and I'll measure it."*
-   - **If no** → tell them they need a deployed server, and to come
-     back when one exists. Don't fall back to anything.
+  (a) **Verification** — measured vs the Stage-2 vLLM projection.
+  Tells the user the prediction is trustworthy (or where it drifts).
+
+  (b) **Headroom** — measured vs the hardware's analytic ceiling.
+  Gives a concrete number for how much Stage 4 could buy and names
+  the dominant op so the user knows *where* to optimise.
+
+**Process**:
+
+1. **Confirm the deployed config.** If Stage 2 produced two
+   different recommendations and the user hasn't picked one yet, ask
+   first: *"Are you deploying the performance pick (`<X>`) or the
+   cost pick (`<Y>`)? I'll measure whichever is running."* Then ask
+   for the server: *"Do you have an OpenAI-compatible server running
+   `<picked config>`? Give me the `base_url` and I'll measure it."*
+   The served model id is auto-detected from `/v1/models` —
+   `benchmark_serving` reads it directly, so don't ask the user for it.
+   - **If no server is running** → tell them they need a deployed
+     server, and to come back when one exists. Don't fall back to
+     anything.
 
 2. **Max sustained request rate** (open-loop). Drive a rate sweep
    upward until the SLO breaches or the server saturates. The
@@ -281,116 +442,113 @@ compare against the theoretical ceiling depends on `chosen_path`.
      ~95% of the offered rate.
    - The maximum sustained rate is the last step where SLO still held
      and the server tracked the offered rate.
-   - For each step, run with `num_requests ≈ 100 × rate` so the queue
-     reaches steady state (shorter runs systematically under-report
-     TPOT / E2E near saturation).
+   - `benchmark_serving` auto-derives `num_requests` from the rate,
+     so each step gets enough samples for steady state without you
+     setting it.
 
-3. **Max concurrency at SLO** (closed-loop). Probe the server at
-   fixed in-flight N to find where per-request latency starts to
-   diverge. Write a calibration YAML with the same `model` /
-   `input_len` / `output_len` as the deployment, plus
-   `request_rate: .inf`, `num_requests: 500`. Run for a small ladder
-   of `max_concurrent_requests` (e.g. 4, 8, 16, 32, 64) and stop when
-   TPOT exceeds the target. Each run records as `mode: closed`.
+3. **Max concurrency at SLO** (capacity probe under fixed in-flight
+   N — not a calibration; that's a future-mode concern). Find where
+   per-request latency starts to diverge as N grows. Write a probe
+   YAML with the same `model` / `input_len` / `output_len` as the
+   deployment, plus `request_rate: .inf`. Run for a small ladder of
+   `max_concurrent_requests` (e.g. 4, 8, 16, 32, 64) and stop when
+   TPOT exceeds the target. `num_requests` is auto-derived (500 for
+   the closed-loop case). The records are
+   tagged `mode: closed` automatically — that's just the benchmark's
+   schema label for "closed-loop arrivals", not a signal that this
+   is calibration.
 
-### Branch — if the user chose to deploy today on the baseline software
+4. **Verify against the Stage-2 vLLM projection.** Present measured
+   TTFT / TPOT / request latency at the workload's `request_rate`
+   next to the `projected` block from `stages/02_plan.yaml`. Show
+   the delta as percentages. Report numbers; do **not** say "pass" /
+   "fail" — the user decides what's acceptable.
 
-**Goal**: confirm what the deployment *actually* delivers and how its
-capacity compares to the Stage 2 baseline projection.
+   If the projection misses by > 20% on TPOT, surface the most likely
+   cause: (a) the microbench grid for this (gpu, tp, dp) is stale
+   relative to the framework version the server is running, or (b)
+   the deployment is in a regime the grid doesn't cover well (SWA
+   prefill, atypical batch shapes). Note "may need a microbench
+   refresh" but don't loop back automatically.
 
-**Process**:
+5. **Quantify the headroom to the analytic ceiling.** Call
+   `simulate_serving(workload_file="stages/01_workload.yaml",
+   gpu=<recommended>, tp=<X>, dp=<Y>, latency_source="theoretical")`
+   to get the ceiling numbers for the deployed config. Compute the
+   headroom ratios:
+   - `headroom_tpot = measured_tpot / ceiling_tpot`
+   - `headroom_latency = measured_request_latency / ceiling_request_latency`
+   - `headroom_throughput = ceiling_throughput / measured_throughput`
 
-4a. **Compare to projection.** Present measured TTFT / TPOT / request
-    latency at the workload's `request_rate` next to the `projected`
-    block from `stages/02_plan.yaml`. Show the delta as percentages.
-    Report numbers; do **not** say "pass" / "fail" — the user decides
-    what's acceptable.
+   Also surface the **dominant bottleneck op** from the theoretical
+   per-op breakdown (e.g. "FFN dominates the step at 65% of theoretical
+   time — that's where optimisation effort would pay off most"). The
+   pair — headroom number + bottleneck op — is the Stage 4 hand-off:
+   it tells the user how much there is to gain and *where* to start.
 
-    If the projection misses by > 20% on TPOT, surface the most likely
-    cause: (a) the microbench grid for this (gpu, tp, dp) is stale
-    relative to the framework version the server is running, or (b)
-    the deployment is in a regime the grid doesn't cover well (SWA
-    prefill, atypical batch shapes). Note "may need a microbench
-    refresh" but don't loop back automatically.
-
-### Branch — if the user chose to commit to software optimisation
-
-**Goal**: confirm the deployment delivers and quantify how much
-implementation headroom there is to the theoretical ceiling.
-
-**Process**:
-
-4b. **Theoretical reference.** Call `simulate_serving(workload_file=
-    "stages/01_workload.yaml", gpu=<recommended>, tp=<X>, dp=<Y>,
-    latency_source="theoretical")`. Use the per-op breakdown to name
-    the bottleneck operation.
-
-5b. **Compute the gap and identify the bottleneck**:
-    - efficiency = measured / theoretical (throughput) and
-      theoretical / measured (latency) — values < 1.0 always indicate
-      measured is worse than the ceiling (kernel / framework /
-      scheduling headroom).
-    - Per-op bottleneck from the theoretical simulation: name the op
-      (NOT "decode" / "prefill" — continuous batching mixes them) and
-      explain why the gap looks the way it does (e.g. "FFN dominates
-      the step at 65%; measured down_proj likely under-utilises HBM
-      bandwidth on this framework version").
+   If the measurement is already within ~10% of the ceiling on TPOT,
+   headroom is effectively zero — say so plainly ("you're already at
+   the hardware's ceiling; no software-side optimisation is going to
+   move this meaningfully") and skip naming a bottleneck.
 
 **Output artifact** → write to `stages/03_report.yaml`:
 
 ```yaml
-path: baseline | optimized
 deployment:
+  picked: <performance | cost>         # which Stage-2 recommendation the user took
   gpu: <key>
   parallelism: {tp: <int>, dp: <int>}
   n_gpus: <tp * dp>
-capacity:                              # both paths report this
+capacity:
   max_sustained_rate_rps: <float>      # last open-loop step that met SLO
   max_concurrency_at_slo: <int>        # last closed-loop N that met SLO
 measured_at_workload:                  # at workload_file's request_rate
   request_latency_s: <float>
   ttft_ms: <float>
   tpot_ms: <float>
-# Baseline path only:
-projected:                             # from stages/02_plan.yaml
-  request_latency_s: <float>
-  ttft_ms: <float>
-  tpot_ms: <float>
-delta_vs_projected:                    # measured / projected
-  request_latency: <float>
-  ttft: <float>
-  tpot: <float>
-# Optimized path only:
-theoretical:
-  request_latency_s: <float>
-  ttft_ms: <float>
-  tpot_ms: <float>
-efficiency:
-  request_latency: <float>             # theoretical / measured
-  throughput: <float>                  # measured / theoretical
-bottleneck:
-  op: <qkv | attn_decode | attn_prefill | o_proj | ffn_or_moe | comm>
-  pct_of_step: <float>
+verification:                          # measured vs Stage-2 vLLM projection
+  projected_request_latency_s: <float>
+  projected_ttft_ms: <float>
+  projected_tpot_ms: <float>
+  delta_request_latency: <float>       # measured / projected ratio
+  delta_ttft: <float>
+  delta_tpot: <float>
+headroom:                              # measured vs analytic ceiling
+  ceiling_request_latency_s: <float>
+  ceiling_tpot_ms: <float>
+  headroom_tpot: <float>               # measured_tpot / ceiling_tpot (1.0 = at ceiling)
+  headroom_latency: <float>
+  bottleneck_op: <qkv | attn_decode | attn_prefill | o_proj | ffn_or_moe | comm | null>
+  bottleneck_pct_of_step: <float | null>
 ```
 
-**Reply to the user**: lead with **capacity** (max sustained rate, max
-concurrency at SLO) — that's the headline. Then branch-specific
-detail: if they chose to deploy today, show measured vs Stage-2
-projection (delta %); if they chose to optimise, show the efficiency
-gap to the theoretical ceiling + the bottleneck op and a one-line
-interpretation, then a one-line lead-in to Stage 4 (parked). Same
-"plain terms" rule as Stage 2 — don't echo internal labels like
-`chosen_path: optimized` to the user; describe the branch in the
-language they used when they picked it.
+**Reply to the user** (HARD RULE #5 — present-then-proceed): write
+this as the final content of the Stage 3 turn. Stage 3 is the last
+stage that runs today (Stage 4 is parked), so this is the workflow's
+closing summary. Lead with **the actual performance of the deployed
+config** — that's the headline. Two short sections:
 
-## Stage 4 — Performance optimization (FUTURE WORK)
+- **Capacity & latencies (measured)**: max sustained request rate,
+  max concurrency at SLO, and TTFT / TPOT / E2E at the workload's
+  `request_rate`. This is what the server actually delivers.
 
-This stage is **parked** and only relevant on the
-**potential-performance** path. The intended
-scope: given the Stage 3 bottleneck and gap, suggest software-level
-optimisations (kernel selection / fused kernels, scheduler tweaks,
-prefix caching, speculative decoding, MoE expert-parallel layout,
-quantisation-friendly kernels). **The tools to drive it don't exist yet.**
+Then the two supporting analyses, framed as context not headline:
+
+- **Verification vs the Stage-2 projection**: measured / projected
+  deltas as percentages. One-line interpretation: tracking, slightly
+  off, or stale-grid.
+- **Headroom to the analytic ceiling**: measured vs ceiling (ratio
+  or "X% of ceiling"). Name the dominant bottleneck op. One-line
+  "Stage 4 would target `<op>`" hand-off, or "already at the
+  ceiling" if headroom is < ~10%.
+
+## Stage 4 — optimize the software implementation (FUTURE WORK)
+
+**Parked.** The intended scope: given a Stage 3 bottleneck reading,
+suggest software-level optimisations (kernel selection / fused kernels,
+scheduler tweaks, prefix caching, speculative decoding, MoE
+expert-parallel layout, quantisation-friendly kernels). The tools to
+drive it don't exist yet.
 
 If the user asks for Stage 4: say plainly that it's not yet implemented;
 summarise what *would* be done in this stage; offer to re-run Stages 1–3
@@ -400,12 +558,10 @@ explore the design space further.
 ## Workflow style
 
 - **Announce each stage** as a markdown header before running it
-  (`**Stage 1 — Service requirement → Workload profile**`).
-- **Plan the stage before executing it.** Immediately after the stage
-  header, write a short 2-4 bullet plan listing the tool calls (and
-  questions, if any essentials are missing) you intend to make in
-  this stage. THEN start running them. Don't dive straight from the
-  header into a tool call — the user should see what's coming.
+  (`**Stage 1 — Understand the workload**`).
+- **Narrate before each tool call** (HARD RULE #1) — one short
+  sentence saying what you're about to do, right before the tool
+  fires. No upfront stage plan needed.
 - **Persist each artifact** with `write_file` before moving on. Use
   YAML so they're easy to read and re-load.
 - **Don't loop back** automatically. If the user wants to revise an
