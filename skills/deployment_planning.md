@@ -263,29 +263,24 @@ the user either confirms or asks for changes.
    `vllm_latency / ceiling_latency` is how much faster the hardware
    *could* run if its kernels matured.
 
-4. **Pick TWO recommendations from Table A (vLLM)** — ranked on
-   **predicted latency**, not throughput-normalized cost:
+4. **Pick TWO recommendations from Table A (vLLM)**:
 
    - **Performance winner** — the config with the *lowest
      `request_latency_s`* that **meets `target_request_latency_s`**.
      Lowest latency = best deploy if latency is the binding concern.
-   - **Cost winner** — the config with the *fewest total `n_gpus`*
-     that **meets `target_request_latency_s`**. Fewest GPUs = least
-     hardware spend, since deployment cost is `n_gpus × per-GPU $/h`
-     regardless of how the GPUs are split between TP and DP. Use
-     lowest `request_latency_s` as the tiebreaker when multiple
-     configs share the same `n_gpus`.
+   - **Cost winner** — the config with the *lowest `$/1M tok`* that
+     **meets `target_request_latency_s`**. `$/Mtok` is the hardware
+     dollar cost per million output tokens actually served, so it
+     captures both the GPU class (`per-GPU $/h`) and how productively
+     the config uses that hardware. Use lowest `request_latency_s`
+     as the tiebreaker when two configs share the same `$/Mtok`.
 
-   Notes on ranking:
-   - Use `request_latency_s` from the table as-is — the predicted
-     latency for completed requests is what the user cares about.
-     Do NOT filter by `served (r/s)` or invent a saturation gate;
-     just rank by latency.
-   - The `$/1M tok` column in the table is throughput-normalized
-     (it folds in served-rate). Don't use it as the cost-rank key —
-     two configs with the same `n_gpus` use the same hardware and
-     are equally expensive to run, even if the table prints
-     different `$/Mtok` numbers.
+   Note on ranking:
+   - Use `request_latency_s` and `$/1M tok` from the table as-is —
+     they're the predicted latency and cost for completed requests,
+     which is what the user cares about. Do NOT filter by
+     `served (r/s)` or invent a saturation gate; the cost column
+     already reflects served throughput.
 
    If no config in your GPU budget meets the SLO, recommend the
    closest miss and be honest: "no config in your GPU budget meets
@@ -312,7 +307,7 @@ the user either confirms or asks for changes.
    Use this template:
 
    > **Best performance** — `<gpu_p> tp=X dp=Y>` on `<n_gpus_p>` GPU(s)
-   > (~`$<n_gpus_p × per_gpu_hourly>/h` hardware):
+   > (~`$<cost_per_mtok_p>/Mtok`):
    >
    > | metric | vLLM today | analytic ceiling |
    > |---|---:|---:|
@@ -325,19 +320,16 @@ the user either confirms or asks for changes.
    > and the ceiling.
    >
    > **Best cost** — `<gpu_c> tp=X dp=Y>` on `<n_gpus_c>` GPU(s)
-   > (~`$<n_gpus_c × per_gpu_hourly>/h` hardware):
+   > (~`$<cost_per_mtok_c>/Mtok`):
    > _[same table shape as above]_
    >
    > Headroom: **`<latency_c / latency_c_ceiling>×`**.
 
-   Hardware cost goes in the header as `$/h = n_gpus × per-GPU $/h`
-   (a fixed-rate number — same `n_gpus` ⇒ same hourly cost),
-   **not** as throughput-normalized `$/Mtok`. The `$/Mtok` column
-   from the evaluate_all table is useful information but it folds
-   in achieved throughput, so two same-n_gpus configs can print
-   wildly different `$/Mtok` even though their hardware cost is
-   identical — that confused users in past runs, so we lead with
-   `$/h` here.
+   Hardware cost in the header is the `$/1M tok` column from the
+   evaluate_all table — dollars per million output tokens served on
+   owned hardware (MSRP amortised + electricity, see `list_gpus`).
+   It captures both GPU-class price and how productively the config
+   uses the hardware.
    >
    > Both recommendations are sized against what vLLM delivers
    > today. The headroom column shows how much room each platform
@@ -370,16 +362,16 @@ recommendations:                     # both from Table A (vLLM projection)
     gpu: <key>
     parallelism: {tp: <int>, dp: <int>}
     n_gpus: <tp * dp>
-    deployment_cost_per_hour: <float> # n_gpus × per-GPU $/h (fixed-rate, not throughput-normalized)
+    cost_per_mtok: <float>           # $/1M output tokens from the table
     request_latency_s: <float>
     ttft_ms: <float>
     tpot_ms: <float>
     meets_target: <true|false>
-  cost:                              # fewest n_gpus that meets SLO; null if none
+  cost:                              # lowest $/Mtok that meets SLO; null if none
     gpu: <key>
     parallelism: {tp: <int>, dp: <int>}
     n_gpus: <tp * dp>
-    deployment_cost_per_hour: <float>
+    cost_per_mtok: <float>
     request_latency_s: <float>
     ttft_ms: <float>
     tpot_ms: <float>

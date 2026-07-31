@@ -268,10 +268,12 @@ def _attn_decode_ms(bundle: PredictorBundle, R: int, kv_tokens_total: int,
         raise RuntimeError(f"no attn_bf16 predictor for {bundle.gpu_name}")
     Sk = kv_tokens_total // max(R, 1)
     if roofline_only:
-        return bundle.attn_bf16.attn_roofline_ms(R=R, Sq=1, Sk=Sk,
-                                                  H=n_qo, H_kv=n_kv, D=head_dim)
-    return bundle.attn_bf16.attn_latency_ms(R=R, Sq=1, Sk=Sk,
-                                             H=n_qo, H_kv=n_kv, D=head_dim)
+        return bundle.attn_bf16.attn_roofline_ms(
+            n_req=R, q_len=1, kv_len=Sk,
+            n_heads=n_qo, n_kv_heads=n_kv, head_dim=head_dim)
+    return bundle.attn_bf16.attn_latency_ms(
+        n_req=R, q_len=1, kv_len=Sk,
+        n_heads=n_qo, n_kv_heads=n_kv, head_dim=head_dim)
 
 
 def _attn_prefill_ms(bundle: PredictorBundle, R: int, Sq: int, Sk: int,
@@ -284,13 +286,16 @@ def _attn_prefill_ms(bundle: PredictorBundle, R: int, Sq: int, Sk: int,
     # SWA prefill (Sq > window) is a grid coverage gap: always falls back
     # to the roofline regardless of mode.
     if sliding_window is not None and Sq > sliding_window:
-        return pred.attn_roofline_ms(R=R, Sq=Sq, Sk=sliding_window,
-                                      H=n_qo, H_kv=n_kv, D=head_dim)
+        return pred.attn_roofline_ms(
+            n_req=R, q_len=Sq, kv_len=sliding_window,
+            n_heads=n_qo, n_kv_heads=n_kv, head_dim=head_dim)
     if roofline_only:
-        return pred.attn_roofline_ms(R=R, Sq=Sq, Sk=Sk,
-                                      H=n_qo, H_kv=n_kv, D=head_dim)
-    return pred.attn_latency_ms(R=R, Sq=Sq, Sk=Sk,
-                                 H=n_qo, H_kv=n_kv, D=head_dim)
+        return pred.attn_roofline_ms(
+            n_req=R, q_len=Sq, kv_len=Sk,
+            n_heads=n_qo, n_kv_heads=n_kv, head_dim=head_dim)
+    return pred.attn_latency_ms(
+        n_req=R, q_len=Sq, kv_len=Sk,
+        n_heads=n_qo, n_kv_heads=n_kv, head_dim=head_dim)
 
 
 def _moe_ms(bundle: PredictorBundle, M: int, n_experts: int, top_k: int,
@@ -307,10 +312,11 @@ def _allreduce_ms(tp: int, M: int, hidden: int, act_bytes: float,
                   predictor: Predictor | None = None) -> float:
     """All-reduce wall time for one collective, in milliseconds.
 
-    When ``predictor`` carries measured (world_size, bytes) → latency
-    points, those are used directly via the predictor's bilinear log-log
-    interpolation. Otherwise falls back to a pure-bandwidth ring formula
-    against the GPU's peak unidirectional NVLink throughput.
+    When ``predictor`` carries measured all-reduce curves (per world size,
+    latency vs bytes), those are used directly via the predictor's
+    linear-in-bytes / linear-in-W interpolation. Otherwise falls back to a
+    pure-bandwidth ring formula against the GPU's peak unidirectional
+    NVLink throughput.
 
     Returns 0 for TP=1 (no comm) or when the fallback NVLink bandwidth
     is also 0 — the latter means the part has no fast inter-GPU link and
@@ -319,8 +325,8 @@ def _allreduce_ms(tp: int, M: int, hidden: int, act_bytes: float,
     if tp <= 1:
         return 0.0
     bytes_payload = int(M * hidden * act_bytes)
-    if predictor is not None and predictor.ar_lat_ms:
-        lat = predictor.allreduce_latency_ms(tp, bytes_payload)
+    if predictor is not None and predictor.ar_curves:
+        lat = predictor.allreduce_latency_ms(bytes_payload, tp)
         if lat == lat:               # NaN-safe
             return lat
     if nvlink_bw_gbps <= 0:
